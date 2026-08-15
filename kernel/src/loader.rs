@@ -401,6 +401,16 @@ static PIPETEST_ELF_BYTES: &[u8] = include_bytes!("../assets/pipetest.elf");
 /// pinned Rust toolchain + rust-lld), not hand-assembled.
 static ALTENTRY_TEST_ELF_BYTES: &[u8] = include_bytes!("../assets/testelf_altentry.elf");
 
+/// MILESTONE 51: real, externally-built ELF64 test payload exercising
+/// the new `malloc()`/`free()` added to libc.rs this milestone -- built
+/// the same way TEST_ELF_BYTES/PIPETEST_ELF_BYTES above are (this
+/// project's own pinned Rust toolchain + rust-lld, not hand-assembled),
+/// source in tools/malloctest_src/. See tools/malloctest_src/README.md
+/// for the exact build recipe and tools/malloctest_src/main.rs for the
+/// hand-computed predictions this program checks its own allocator's
+/// real behavior against.
+static MALLOCTEST_ELF_BYTES: &[u8] = include_bytes!("../assets/malloctest.elf");
+
 /// MILESTONE 40: the `seedpipetest` shell command's entry point --
 /// same reasoning as seed_test_elf() above, writes the real ELF bytes
 /// to disk so `runelf pipetest` (reusing run_elf() below unchanged,
@@ -503,6 +513,91 @@ pub fn self_test_elf_parse() {
         }
         Err(e) => {
             let _ = writeln!(serial(), "milestone 36: self-test FAILED -- elf::parse(embedded testelf.elf) returned Err: {e}");
+        }
+    }
+}
+
+/// MILESTONE 51: the `seedmalloctest` shell command's entry point --
+/// same reasoning as seed_pipetest_elf()/seed_test_elf() above, writes
+/// the real ELF bytes to disk so `runelf malloctest` can also load and
+/// run it interactively (this milestone's own boot-time self-test below
+/// runs it non-interactively too, straight from the embedded bytes, but
+/// keeping the disk-seeding path lets a human re-run it by hand exactly
+/// like every prior ELF test payload).
+pub fn seed_malloctest_elf() -> Result<usize, String> {
+    let len = MALLOCTEST_ELF_BYTES.len();
+    fs::write_file("malloctest", MALLOCTEST_ELF_BYTES).map_err(|e| format!("seedmalloctest: {e}"))?;
+    let _ = writeln!(
+        serial(),
+        "milestone 51: seedmalloctest -- wrote {len} real bytes (a genuine externally-built ELF64 executable exercising malloc()/free()) to 'malloctest' on the real on-disk filesystem"
+    );
+    Ok(len)
+}
+
+/// MILESTONE 51: a real, boot-time, non-interactive proof that
+/// malloc()/free() actually work -- same "sendkey is unreliable, run
+/// unattended instead" reasoning as every other self_test_* in this
+/// project. Unlike self_test_elf_parse() above (which only proves
+/// elf::parse() reads the file's structure correctly), this ACTUALLY
+/// LOADS AND RUNS the embedded ELF via process::load_and_run_elf() --
+/// the same real ring-3 execution path `runelf` uses interactively,
+/// the first time this project's own automated self-test suite has
+/// exercised that path non-interactively rather than only via a typed
+/// shell command. Safe to do here: Milestone 36's own disclosed
+/// "runelf/runfile intermittently page-faults if shell activity
+/// follows within ~1s" bug was root-caused and fixed (see the README's
+/// own "Fix the Milestone 36 page fault" entry) by making Milestone
+/// 25's background task scheduling opt-in, enabled only once, as the
+/// very last thing kernel_main does -- every self-test in this file
+/// (including this one) runs well before that point, so the actual
+/// racing mechanism that bug depended on cannot occur here.
+///
+/// The real pass/fail evidence for malloc()/free()'s own correctness
+/// is written directly to serial BY THE RING-3 PROGRAM ITSELF, via its
+/// own real write() syscalls (see tools/malloctest_src/main.rs's
+/// hand-computed predictions and its final "OVERALL=PASS/FAIL" line) --
+/// this kernel-side wrapper's own job is narrower and honest about it:
+/// confirm the ELF parses, confirm load_and_run_elf() returns Ok (no
+/// kernel panic, no double fault, no hang) rather than an Err or a
+/// crash, and confirm the kernel is still alive and responsive
+/// immediately afterward. Grep the serial log around this point for
+/// the program's own "milestone 51: malloctest" lines for the actual
+/// allocator-correctness evidence.
+pub fn self_test_malloc() {
+    let elf_image = match elf::parse(MALLOCTEST_ELF_BYTES) {
+        Ok(image) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 51: self-test -- parsed the embedded malloctest.elf: e_entry={:#x} (expected {:#x}), {} PT_LOAD segment(s)",
+                image.entry,
+                usertest::USER_CODE_ADDR,
+                image.segments.len()
+            );
+            image
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 51: self-test FAILED -- elf::parse(embedded malloctest.elf) returned Err: {e}");
+            return;
+        }
+    };
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let result = memory::with_frame_allocator(|frame_allocator| {
+        process::load_and_run_elf(frame_allocator, phys_mem_offset, MALLOCTEST_ELF_BYTES, &elf_image)
+    });
+
+    match result {
+        Some(Ok(())) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 51: self-test -- malloctest.elf ran to completion and returned to the kernel cleanly (no panic, no double fault) -- see the 'milestone 51: malloctest' lines above for the real allocator-correctness evidence written by the program itself"
+            );
+        }
+        Some(Err(e)) => {
+            let _ = writeln!(serial(), "milestone 51: self-test FAILED -- load_and_run_elf(malloctest.elf) returned Err: {e}");
+        }
+        None => {
+            let _ = writeln!(serial(), "milestone 51: self-test FAILED -- global frame allocator not installed yet (should never happen post-boot)");
         }
     }
 }

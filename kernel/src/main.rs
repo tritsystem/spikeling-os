@@ -634,6 +634,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // RFLAGS.IF=1 the same way top-level entry does) -- must run after
     // init_pics()/enable() too, not before.
     process::self_test_wait_status();
+    // MILESTONE 51: real malloc()/free() self-test -- same ordering
+    // requirement as self_test_signals()/self_test_wait_status() just
+    // above (this actually LOADS AND RUNS a real ELF via
+    // process::load_and_run_elf(), a genuine ring-3 entry that sets
+    // RFLAGS.IF=1 the same way every other ring-3 entry point does) --
+    // must run after init_pics()/enable() too, not before. Also must
+    // run before tasks::enable_background_scheduling() further down --
+    // see loader::self_test_malloc()'s own doc comment for the real,
+    // already-fixed reason (Milestone 25's background scheduler racing
+    // an ELF-loaded process's return) this ordering matters.
+    loader::self_test_malloc();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

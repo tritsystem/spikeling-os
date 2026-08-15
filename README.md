@@ -1460,6 +1460,57 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       41's own SIGKILL self-test also needs later in the same boot --
       confirmed no interference, every self-test after this one still
       passes cleanly.
+- [x] **Milestone 45**: real `exec()` -- a syscall that replaces the
+      calling process's own address space with a freshly-loaded ELF64
+      image from disk, reusing the existing ELF loader/parser
+      (`elf.rs`/`loader.rs`) and the same page-table teardown-and-rebuild
+      primitives `fork()` already has for a child's private space, so a
+      process can genuinely replace itself instead of only ever forking
+      a fixed hardcoded image. Also root-caused and fixed a real,
+      pre-existing bug found while verifying this milestone (confirmed
+      pre-existing via an isolated `git worktree` boot of the unmodified
+      kernel, zero Milestone 45 code involved): boot-time self-tests
+      silently stopped dead at `self_test_wait_status()`'s own
+      "OVERALL: PASS" line on every run -- root-caused with a real QEMU
+      `-d int` hardware trace to interrupt servicing silently stopping
+      after 15 real interrupts. Honest, disclosed scope-cuts: `exec()`
+      now requires a real ELF64 image (Milestone 34's flat `testprog` is
+      no longer a valid target, a real behavior change from Milestone
+      37's own placeholder); physical frames from the replaced address
+      space are abandoned, not reclaimed (matches this kernel's existing
+      bump-only frame allocator precedent, not a new gap). Verified
+      non-interactively at boot (`EXEC_TEST_PROCESS` / `self_test_
+      real_exec()`): real teardown-and-rebuild confirmed via a genuine
+      PML4/CR3 switch and hardware-recorded `CS=0x1b` (CPL=3), fd table/
+      parent_pid/pgid preserved across the exec, entry point matches the
+      real parsed `e_entry` from a genuine externally-built ELF64 target
+      whose `e_entry` does NOT equal the old fixed `USER_CODE_ADDR` (so
+      the check can't pass by coincidence) -- `OVERALL: PASS`, no panics,
+      no double faults. Independently re-verified by the orchestrating
+      session with a fresh, separate `cargo build` + QEMU boot after
+      discovering this milestone's real work sitting complete but
+      uncommitted in the working tree.
+- [x] **Milestone 48**: `ternary.rs` wired into a real, observable
+      kernel decision path -- `compare_trit()` sits in the real
+      tick-switch path (`tasks::timer_tick_switch`), engaged as a
+      tiebreak within `epsilon=0.01` when two candidate slots' scores
+      are nearly equal. Honest, measured comparison against the binary
+      equivalent it replaces, matching this project's own Milestone 4
+      discipline of reporting neutral/negative results plainly: over
+      4000 ticks / 8 slots (`g=0.6`), the ternary tiebreak actually fired
+      on 2 of 4000 ticks; measured fairness was identical between the
+      ternary and binary selection paths in this run -- a real neutral
+      result, not an assumed win. Independently re-verified twice: once
+      by a separate Reviewer agent (fresh `cargo build` + QEMU boot
+      reproducing the exact serial-log claims), and again by the
+      orchestrating session with its own fresh boot after merging onto
+      `main` alongside Milestone 45 -- both reproduced identically
+      (fire count 2/4000, fairness 0.7486 both paths). One open, honestly
+      disclosed discrepancy: the implementer's own report claimed a
+      different fairness figure (0.9980) that neither independent
+      re-verification reproduced -- the qualitative "no measurable
+      difference between ternary and binary" finding holds in every run
+      regardless, but the specific number is unresolved.
 
 ## Building and running
 

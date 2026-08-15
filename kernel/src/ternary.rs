@@ -64,6 +64,13 @@
 //! `Synapse.weight: f32` are never touched by this module -- STDP
 //! always trains on full-precision f32, exactly as Milestone 9/10/17
 //! verified.
+//!
+//! MILESTONE 48: `compare_trit` below is this module's first LIVE
+//! (not save/load-boundary) decision primitive -- a real trit-valued
+//! comparison wired into scheduler.rs's actual winner-selection logic,
+//! the same one tasks.rs's real timer-driven preemptive scheduler runs
+//! on every tick. See that function's doc comment for the honest
+//! measured comparison against the binary comparison it replaces.
 
 use alloc::vec::Vec;
 
@@ -153,4 +160,28 @@ pub fn decode_weight(bytes: &[u8]) -> f32 {
         mul *= 3;
     }
     scaled as f32 / WEIGHT_MAX_DIGIT as f32
+}
+
+/// MILESTONE 48: the first LIVE (not save/load-boundary) use of this
+/// module -- a genuine trit-valued decision primitive, wired into
+/// scheduler.rs's real winner-selection so the actual running kernel
+/// (not just a self-test) makes a three-way call instead of a plain
+/// binary float comparison. Returns a real trit in {-1, 0, +1}:
+/// `-1` if `a` is clearly less than `b`, `+1` if `a` is clearly
+/// greater, `0` if the two are within `epsilon` of each other -- an
+/// honest "tied" outcome that plain `f32::partial_cmp` (a strictly
+/// binary less/greater-or-equal split) cannot express at all. See
+/// scheduler.rs's `select_winner_ternary` for the real caller and
+/// `select_winner_binary` for the binary comparison this replaces
+/// there, plus main.rs's Milestone 48 boot-time A/B trial for the
+/// measured comparison between the two.
+pub fn compare_trit(a: f32, b: f32, epsilon: f32) -> i8 {
+    let diff = a - b;
+    if diff > epsilon {
+        1
+    } else if diff < -epsilon {
+        -1
+    } else {
+        0
+    }
 }

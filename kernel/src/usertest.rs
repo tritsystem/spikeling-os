@@ -433,6 +433,15 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
             let truncated = requested_len > MAX_WRITE_LEN;
             let len = if truncated { MAX_WRITE_LEN } else { requested_len } as usize;
 
+            // MILESTONE 44 self-test support: see
+            // process::LAST_WRITE_SYSCALL_PID's own doc comment -- real
+            // proof a process's ring-3 execution reached THIS syscall,
+            // independent of whether the excursion later returns cleanly
+            // (Milestone 41's page-fault handler resumes kernel context
+            // the same way a clean exit does, so "no panic" alone can't
+            // tell the two apart).
+            crate::process::LAST_WRITE_SYSCALL_PID.store(active, Ordering::SeqCst);
+
             if truncated {
                 let _ = writeln!(
                     serial(),

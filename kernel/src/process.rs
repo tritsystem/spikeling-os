@@ -888,6 +888,25 @@ static KERNEL_CR3_FLAGS_BITS: AtomicU64 = AtomicU64::new(0);
 /// resuming kernel code.
 pub(crate) static ACTIVE_PROCESS: AtomicU8 = AtomicU8::new(0);
 
+/// MILESTONE 44 self-test support: records which process id most
+/// recently reached syscall WRITE (rax=0) -- set unconditionally inside
+/// usertest.rs's syscall_dispatch WRITE arm, right alongside the
+/// `active` value it already reads. Exists purely so
+/// loader::self_test_altentry_elf() can assert REAL proof that ring-3
+/// execution reached the write syscall from inside the new, non-default
+/// entry point's own mapped page -- strictly stronger than "the kernel
+/// didn't panic", which (since Milestone 41's page-fault handler now
+/// gracefully terminates a faulting ring-3 process instead of
+/// panicking) can no longer by itself distinguish "really executed" from
+/// "faulted immediately and was cleanly recovered from". This
+/// milestone's own test ELF is deliberately built with its only mapped
+/// page three pages past `USER_CODE_ADDR`, so a regression to the old
+/// "entry forced to USER_CODE_ADDR" bug would jump into an UNMAPPED page
+/// and fault before ever reaching this syscall -- making "did WRITE ever
+/// run for this process id" a real, load-bearing check, not a redundant
+/// one.
+pub(crate) static LAST_WRITE_SYSCALL_PID: AtomicU8 = AtomicU8::new(0);
+
 /// MILESTONE 30: called once at boot, before any process's PML4 could
 /// ever be loaded into CR3, so there's always a known-good value to
 /// restore to on every process exit -- never inferred, never assumed
@@ -1810,7 +1829,7 @@ static LOADED_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 /// process's own message/heap, so any nonzero value works; 3 simply
 /// keeps the id space non-overlapping and gives the serial log a
 /// distinct, greppable number.
-const LOADED_PROCESS_ID: u8 = 3;
+pub(crate) const LOADED_PROCESS_ID: u8 = 3;
 
 /// MILESTONE 34: builds a fresh process from an arbitrary in-memory code
 /// image -- loader.rs's `runfile` is the only real caller, always AFTER

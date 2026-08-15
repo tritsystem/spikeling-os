@@ -73,6 +73,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::Ordering;
 
 /// MILESTONE 34: this milestone's own test payload -- proof-of-concept
 /// only, not something a real user would ever type. Reuses
@@ -505,4 +506,121 @@ pub fn self_test_elf_parse() {
             let _ = writeln!(serial(), "milestone 36: self-test FAILED -- elf::parse(embedded testelf.elf) returned Err: {e}");
         }
     }
+}
+
+/// MILESTONE 44's own real, boot-time, non-interactive proof that the
+/// generalized ELF loader genuinely ACCEPTS AND RUNS a non-
+/// `usertest::USER_CODE_ADDR` entry point -- not just that
+/// process::create_process_from_elf()'s old "entry MUST equal
+/// USER_CODE_ADDR" rejection was removed (see that function's own doc
+/// comment), but that a real ring-3 excursion actually reaches
+/// ALTENTRY_TEST_ELF_BYTES's own `alt_entry()`, three pages past
+/// USER_CODE_ADDR (see tools/testelf_altentry_src/), runs its write+exit
+/// syscalls, and returns cleanly to kernel context. Same "sendkey is
+/// unreliable, run unattended instead" reasoning as every other
+/// self_test_* in this codebase; must run from kernel_main AFTER
+/// interrupts::init_pics()/sti(), same real reason as
+/// process::self_test_signals()/self_test_wait_status() (this enters
+/// ring 3 for real, and Milestone 41's own hard-won PIC-ordering lesson
+/// applies here too).
+///
+/// Two real checks, both boolean, neither relying on eyeballing the
+/// serial log:
+///   1. elf::parse() on the embedded bytes reports an e_entry that does
+///      NOT equal usertest::USER_CODE_ADDR -- proves this test payload
+///      genuinely exercises the new code path rather than accidentally
+///      still using the old fixed address.
+///   2. AFTER running it for real through process::load_and_run_elf()
+///      (the EXACT function `runelf` itself calls, no test-only
+///      shortcut), process::LAST_WRITE_SYSCALL_PID -- set unconditionally
+///      inside the real syscall dispatcher; see that static's own doc
+///      comment -- is checked against process::LOADED_PROCESS_ID. This
+///      is deliberately NOT the same thing as "load_and_run_elf()
+///      returned Ok(())": since Milestone 41, a faulting ring-3 process
+///      is gracefully terminated and resumes kernel context the SAME way
+///      a clean exit does (usertest::terminate_faulted_process_and_resume_kernel()
+///      unwinds to the identical KERNEL_RSP anchor syscall 1/exit does),
+///      so `Ok(())` alone can no longer distinguish "the new entry point
+///      genuinely ran" from "the old bug regressed, IRETQ'd into the
+///      UNMAPPED USER_CODE_ADDR page (this test ELF's only PT_LOAD
+///      segment deliberately does NOT cover it), and immediately page-
+///      faulted" -- both return `Ok(())` with no panic either way.
+///      Checking LAST_WRITE_SYSCALL_PID closes that real gap: reaching
+///      the write syscall AT ALL is only possible if RIP genuinely
+///      started executing from inside the mapped page at the real,
+///      parsed e_entry -- exactly this milestone's own point.
+pub fn self_test_altentry_elf() {
+    let elf_image = match elf::parse(ALTENTRY_TEST_ELF_BYTES) {
+        Ok(img) => img,
+        Err(e) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 44: self-test FAILED -- elf::parse(embedded testelf_altentry.elf) returned Err: {e}"
+            );
+            return;
+        }
+    };
+
+    let entry_is_alt = elf_image.entry != usertest::USER_CODE_ADDR;
+    let _ = writeln!(
+        serial(),
+        "milestone 44: self-test -- parsed embedded testelf_altentry.elf: e_entry={:#x} (USER_CODE_ADDR={:#x}) -- {}",
+        elf_image.entry,
+        usertest::USER_CODE_ADDR,
+        if entry_is_alt {
+            "genuinely a non-default entry point"
+        } else {
+            "MATCHES USER_CODE_ADDR -- this test payload isn't exercising the new code path"
+        }
+    );
+    if !entry_is_alt {
+        let _ = writeln!(serial(), "milestone 44: self-test -- OVERALL: FAIL (test payload setup is wrong)");
+        return;
+    }
+
+    // Reset before running -- a stale value left over from an earlier
+    // boot-time self-test (e.g. PROCESS_A's own write syscalls, or a
+    // previous run of this very test) would otherwise make the
+    // post-run check below pass trivially without this run having
+    // reached the syscall at all.
+    process::LAST_WRITE_SYSCALL_PID.store(0, Ordering::SeqCst);
+
+    let _ = writeln!(
+        serial(),
+        "milestone 44: self-test -- running the alt-entry ELF via process::load_and_run_elf() (the SAME function `runelf` itself calls)..."
+    );
+    let phys_mem_offset = memory::phys_mem_offset();
+    let run_result = memory::with_frame_allocator(|frame_allocator| {
+        process::load_and_run_elf(frame_allocator, phys_mem_offset, ALTENTRY_TEST_ELF_BYTES, &elf_image)
+    });
+
+    let returned_ok = matches!(run_result, Some(Ok(())));
+    let _ = writeln!(
+        serial(),
+        "milestone 44: self-test -- load_and_run_elf() returned {} (no panic either way -- see this function's own doc comment for why that alone isn't the real proof)",
+        match &run_result {
+            Some(Ok(())) => String::from("Ok(())"),
+            Some(Err(e)) => format!("Err({e})"),
+            None => String::from("None (frame allocator not installed)"),
+        }
+    );
+
+    let last_write_pid = process::LAST_WRITE_SYSCALL_PID.load(Ordering::SeqCst);
+    let reached_write = last_write_pid == process::LOADED_PROCESS_ID;
+    let _ = writeln!(
+        serial(),
+        "milestone 44: self-test -- LAST_WRITE_SYSCALL_PID after running = {last_write_pid} (expected {}, LOADED_PROCESS_ID) -- {}",
+        process::LOADED_PROCESS_ID,
+        if reached_write {
+            "confirmed: ring-3 execution genuinely reached the write syscall from inside the new entry point's own mapped page"
+        } else {
+            "FAILED -- the write syscall was never reached for this process"
+        }
+    );
+
+    let _ = writeln!(
+        serial(),
+        "milestone 44: self-test -- OVERALL: {}",
+        if entry_is_alt && returned_ok && reached_write { "PASS" } else { "FAIL" }
+    );
 }

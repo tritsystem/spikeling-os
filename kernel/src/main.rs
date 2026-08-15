@@ -634,6 +634,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // RFLAGS.IF=1 the same way top-level entry does) -- must run after
     // init_pics()/enable() too, not before.
     process::self_test_wait_status();
+    // MILESTONE 44: same ordering requirement as the two self-tests just
+    // above (real ring-3 entry via process::load_and_run_elf() ->
+    // usertest::enter_ring3_now(entry), which sets RFLAGS.IF=1 the same
+    // way every other top-level entry does) -- must run after
+    // init_pics()/enable() too, not before.
+    loader::self_test_altentry_elf();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

@@ -366,6 +366,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // log immediately rather than only when someone remembers to test
     // it by hand.
     fs::self_test_disk_write();
+    // MILESTONE 46: same non-interactive-proof reasoning as the
+    // disk-write self-test just above, run against the NEW second
+    // backing store (an in-memory ramfs, reached through the exact same
+    // fs::write_file/read_file/list surface via a "ram/" path prefix) --
+    // proves the new trait/dispatch layer actually routes to a genuinely
+    // separate store, not just the disk under a different-looking path.
+    fs::self_test_ramfs();
     // MILESTONE 40: same non-interactive-proof reasoning as the
     // disk-write self-test just above -- pipe()/dup/dup2 mechanics
     // checked directly on every boot, no interactive shell command

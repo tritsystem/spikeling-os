@@ -1560,6 +1560,40 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       `seedaltentry, runexectest`), verified afterward with a combined
       fresh boot showing Milestones 4/41/42/43/45/46/47/48 all correct
       together, no panics.
+- [x] **Milestone 44 (completed)**: real, non-interactive proof the
+      generalized ELF loader (left in-progress at commit `a604426`)
+      genuinely accepts and runs a non-`USER_CODE_ADDR` entry point --
+      not just that the old "entry MUST equal `USER_CODE_ADDR`"
+      rejection was removed, but that a real ring-3 excursion actually
+      reaches the test ELF's own alternate entry point (three pages past
+      `USER_CODE_ADDR`), runs its write+exit syscalls, and returns
+      cleanly. Two real checks: `elf::parse()` confirms a genuinely
+      non-default `e_entry`; a new `LAST_WRITE_SYSCALL_PID` static (set
+      unconditionally inside the real syscall dispatcher) is checked
+      after running the ELF through `process::load_and_run_elf()` --
+      deliberately stronger than "returned `Ok(())`", since (per
+      Milestone 41) a faulting ring-3 process is gracefully terminated
+      the same way a clean exit is, so `Ok(())` alone can't distinguish
+      "genuinely ran" from "regressed to the old bug and immediately
+      faulted on the still-unmapped default address." Real, substantive
+      merge conflict with the already-merged Milestone 45 in
+      `kernel_main()`'s own self-test ordering, resolved by hand: this
+      self-test is ALSO a non-interactive ring-3 excursion, so
+      Milestone 45's own interrupt-re-enable fix (see that entry) had to
+      be placed downstream of BOTH self-tests, not sandwiched between
+      them -- placing it in between would have silently reintroduced the
+      exact IF=0 deadlock Milestone 45 root-caused. Independently
+      verified concretely, not just "didn't crash": the post-merge boot
+      shows 82 real timer interrupts observed and all three preemption-
+      demo tasks genuinely still running afterward, proving interrupts
+      genuinely stayed enabled through both ring-3 excursions. Assigned
+      by the orchestrating dispatcher as "Milestone 50 (waitpid
+      exit-status semantics)"; the real `claude` CLI subprocess read the
+      codebase first, found Milestone 44 genuinely incomplete, and used
+      its real budget completing that instead (no implementer report --
+      hit a real account usage-limit wall before writing one). Labeled
+      honestly here for what it actually is; the real, originally
+      assigned waitpid-semantics scope remains undone.
 
 ## Building and running
 

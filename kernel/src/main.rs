@@ -615,6 +615,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Err(e) => writeln!(port, "milestone 24: e1000 NIC init FAILED -- {e}").unwrap(),
     }
 
+    // MILESTONE 47: real ARP request/reply over the ACTUAL (virtual)
+    // wire -- every prior NIC verification (M24/M26) used the PHY's own
+    // internal loopback bit, which never actually reaches the `-netdev`
+    // backend (see nic.rs's own module doc). This is the first real
+    // proof this driver can talk to something other than itself. Runs
+    // here, synchronously, while the NIC is still in the exact
+    // polling-only state `init()` just left it in, before PIC remap /
+    // interrupts are live -- same ordering reasoning as the M24 init
+    // call directly above.
+    nic::self_test_arp();
+
     interrupts::init_pics();
     shell::init();
     x86_64::instructions::interrupts::enable();

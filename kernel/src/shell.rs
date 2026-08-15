@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -325,6 +325,20 @@ fn run_command(cmd: &str) {
                 "packet queued and TDT advanced, but DD bit never set within timeout -- transmission NOT confirmed\n",
             ),
             Err(e) => crate::console::write_str(&format!("sendpacket FAILED: {e}\n")),
+        },
+        "arp" => match crate::nic::arp_resolve(crate::nic::gateway_ip()) {
+            // MILESTONE 47: unlike sendpacket/recvpacket (PHY loopback,
+            // never actually leaves the box), arp_resolve() turns
+            // loopback OFF for the duration of the call -- a real reply
+            // here comes from QEMU's own slirp gateway over the actual
+            // netdev backend, not from this NIC talking to itself.
+            Ok(Some(reply)) => crate::console::write_str(&format!(
+                "ARP reply: {} is-at {} (real round trip over the emulated network, loopback OFF)\n",
+                crate::nic::format_ip(reply.sender_ip),
+                crate::nic::format_mac(reply.sender_mac)
+            )),
+            Ok(None) => crate::console::write_str("no ARP reply received within timeout\n"),
+            Err(e) => crate::console::write_str(&format!("arp FAILED: {e}\n")),
         },
         "recvpacket" => match crate::nic::recv_packet() {
             // MILESTONE 26: recv_packet() itself does one bounded poll

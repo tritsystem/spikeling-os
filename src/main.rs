@@ -80,6 +80,28 @@ fn main() {
             .arg(format!("tcp:127.0.0.1:{port},server,nowait"));
     }
 
+    // MILESTONE 47: an explicit user-mode ("slirp") netdev + e1000
+    // device, replacing what used to be an entirely IMPLICIT default NIC
+    // (every milestone through 26 never passed any -netdev/-device/-net
+    // flag at all -- QEMU's own "no networking flags given" default is
+    // what pci.rs's Milestone 20 enumeration actually found). Made
+    // explicit here for exactly one reason: `-object filter-dump` (real
+    // pcap capture, the same mechanism Milestone 24 used to independently
+    // verify on-wire bytes) needs a named netdev id to attach to --
+    // QEMU's own implicit default net has no id a filter-dump object can
+    // reference. Same backend (`user`, i.e. slirp) and same device model
+    // (`e1000`) as the implicit default already provided, so this is not
+    // a behavioral change for any prior milestone's own verification.
+    // Opt-in pcap capture, unset by default so ordinary `cargo run` is
+    // unaffected: set SPIKELING_QEMU_PCAP to a file path to capture every
+    // frame this NIC sends/receives to a real .pcap file.
+    cmd.arg("-netdev").arg("user,id=net0");
+    cmd.arg("-device").arg("e1000,netdev=net0");
+    if let Ok(pcap_path) = env::var("SPIKELING_QEMU_PCAP") {
+        cmd.arg("-object")
+            .arg(format!("filter-dump,id=dump0,netdev=net0,file={pcap_path}"));
+    }
+
     if uefi {
         let prebuilt =
             Prebuilt::fetch(Source::LATEST, "target/ovmf").expect("failed to fetch OVMF firmware");

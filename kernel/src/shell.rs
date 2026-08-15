@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest, seedmalloctest\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -542,6 +542,24 @@ fn run_command(cmd: &str) {
                     "runexectest: real exec() ran to completion -- see serial log for the real teardown-and-rebuild trace (new pml4, new real parsed entry point)\n",
                 ),
                 Err(e) => crate::console::write_str(&format!("runexectest FAILED: {e}\n")),
+            }
+        }
+        "seedmalloctest" => {
+            // MILESTONE 51: writes this milestone's REAL, externally-
+            // built ELF64 test executable (loader::MALLOCTEST_ELF_BYTES,
+            // built the same way TEST_ELF_BYTES/PIPETEST_ELF_BYTES are --
+            // rustc+rust-lld, not hand-assembled) to a real file
+            // ("malloctest") on the real on-disk filesystem, exercising
+            // the new malloc()/free() added to libc.rs this milestone.
+            // `runelf` (already generic over any path) is what actually
+            // runs it -- no new run-command needed. The boot-time
+            // self-test already runs the SAME embedded bytes
+            // non-interactively; this is the interactive re-run path.
+            match crate::loader::seed_malloctest_elf() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedmalloctest: wrote {len} real bytes to 'malloctest' on disk (a genuine ELF64 executable exercising malloc()/free(), not hand-assembled) -- try 'runelf malloctest'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedmalloctest FAILED: {e}\n")),
             }
         }
         "clear" => crate::console::clear_screen(),

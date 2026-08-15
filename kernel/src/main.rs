@@ -808,21 +808,30 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // that actually depends on interrupts being enabled (the timer-tick
     // count below).
     //
-    // MERGE NOTE (Milestones 45 + 44/50 combined): self_test_altentry_elf()
-    // below is ALSO a non-interactive ring-3 excursion (real entry via
-    // process::load_and_run_elf() -> usertest::enter_ring3_now()), so it
-    // is placed BEFORE this enable() call too, not after -- "downstream
-    // of every non-interactive ring-3 self-test" (this comment's own
-    // words, written for Milestone 45) applies to it exactly the same
-    // way it applies to self_test_real_exec() above. Placing it after
-    // this fix would silently reintroduce the identical IF=0 gap for
-    // whatever runs next.
-    // MILESTONE 44: same ordering requirement as the two self-tests just
+    // MERGE NOTE (Milestones 45 + 44/50 + 51 combined): self_test_altentry_elf()
+    // and self_test_malloc() below are BOTH ALSO non-interactive ring-3
+    // excursions (real entry via process::load_and_run_elf() ->
+    // usertest::enter_ring3_now()), so both are placed BEFORE this
+    // enable() call too, not after -- "downstream of every non-
+    // interactive ring-3 self-test" (this comment's own words, written
+    // for Milestone 45) applies to them exactly the same way it applies
+    // to self_test_real_exec() above. Placing either one after this fix
+    // would silently reintroduce the identical IF=0 gap for whatever
+    // runs next.
+    // MILESTONE 44: same ordering requirement as the self-tests just
     // above (real ring-3 entry via process::load_and_run_elf() ->
     // usertest::enter_ring3_now(entry), which sets RFLAGS.IF=1 the same
     // way every other top-level entry does) -- must run after
     // init_pics()/enable() too, not before.
     loader::self_test_altentry_elf();
+    // MILESTONE 51: real malloc()/free() self-test -- same ordering
+    // requirement (this actually LOADS AND RUNS a real ELF via
+    // process::load_and_run_elf(), a genuine ring-3 entry). Also must
+    // run before tasks::enable_background_scheduling() further down --
+    // see loader::self_test_malloc()'s own doc comment for the real,
+    // already-fixed reason (Milestone 25's background scheduler racing
+    // an ELF-loaded process's return) this ordering matters.
+    loader::self_test_malloc();
     x86_64::instructions::interrupts::enable();
 
     for _ in 0..80 {

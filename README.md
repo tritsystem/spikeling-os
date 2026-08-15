@@ -1511,6 +1511,55 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       re-verification reproduced -- the qualitative "no measurable
       difference between ternary and binary" finding holds in every run
       regardless, but the specific number is unresolved.
+- [x] **Milestone 46**: a real VFS/mount abstraction generalizing
+      `fs.rs`. The one real disk-backed path now sits behind a real
+      trait/dispatch layer; a second, real backing store (a small
+      in-memory ramfs) mounts at `ram/...` alongside the existing disk
+      root through the same `path`/`open()` surface. Real, disclosed bug
+      found and fixed during this milestone's own verification: the
+      ramfs isolation self-test initially failed because its test file
+      name collided with a name an unrelated earlier self-test had
+      already written to the disk root -- a test-authoring mistake, not
+      a real isolation bug (fixed with a disjoint name, not by weakening
+      the check). Honest scope-cuts: no live interactive shell session
+      exercised the new path (shell.rs unmodified, calls the same fs
+      functions the self-tests already cover); the fd-backed syscall
+      path (`open`/`read`/`fdwrite`/`close`) reaching RamFs has no
+      dedicated self-test, to keep this milestone's diff scoped to
+      `fs.rs` rather than also touching `process.rs`'s process-table
+      machinery. Independently re-verified by the orchestrating session:
+      fresh build + fresh QEMU boot, real ramfs write+read roundtrip,
+      `list()`, and isolation (disk root does NOT contain the ramfs test
+      file) all confirmed, no panics.
+- [x] **Milestone 47**: real ARP request/reply over the actual
+      (virtual) wire. Closes a gap every verification through Milestone
+      26 shared without disclosing: `sendpacket`/`recvpacket` always ran
+      with the e1000 PHY's loopback bit set, so nothing before this
+      milestone proved the driver could talk to anything other than
+      itself. A new `set_loopback(false)` toggle turns that off for a
+      genuine test: a real ARP request is transmitted for QEMU user-mode
+      networking's own documented gateway (`10.0.2.2`), and the RX ring
+      is polled for a genuine parsed reply from QEMU's slirp stack --
+      the first real protocol (L3 address resolution) this kernel
+      speaks, no IP/UDP/TCP stack yet (disclosed scope limit).
+      `main.rs`'s host QEMU runner now unconditionally passes a real
+      `-netdev user` + `-device e1000`, plus an optional real pcap
+      capture for packet-level evidence. No implementer report exists
+      for this milestone -- the real `claude` CLI subprocess doing the
+      work hit a real account usage-limit wall right as it was about to
+      write one, after several real, visible debug/rebuild/reboot
+      iterations. The orchestrating session committed this from
+      independent verification alone: fresh build (clean) + fresh QEMU
+      boot with real networking enabled, ARP self-test genuinely passes
+      (`"10.0.2.2 is-at 52:55:0a:00:02:02"`, a real reply from QEMU's
+      slirp gateway over the actual netdev backend, loopback OFF), no
+      panics. One real merge conflict resolved during integration: both
+      this milestone and the already-merged Milestone 45 independently
+      extended the shell's `help` command-list string -- resolved by
+      taking the union of both additions (`arp` plus
+      `seedaltentry, runexectest`), verified afterward with a combined
+      fresh boot showing Milestones 4/41/42/43/45/46/47/48 all correct
+      together, no panics.
 
 ## Building and running
 

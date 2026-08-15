@@ -1378,59 +1378,88 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       -- the "ATA error bit set" this milestone first ran into existed
       since Milestone 11 and was never caused by this milestone's own
       code.
-- [ ] **Milestone 41 (in progress)**: real SIGSEGV/SIGKILL -- a ring-3
-      process page-faulting should terminate only that process (kernel
-      keeps running), and a live, never-yet-run forked child should be
-      killable outright. Two real hardcoded test processes
-      (SIGSEGV_TEST_PROCESS, SIGKILL_TEST_PROCESS) and a boot-time
-      non-interactive self-test exist and are wired in. **A real,
-      root-caused bug found and fixed**: the self-test was originally
-      called before `gdt::init()`/`interrupts::init_idt()` had actually
-      run `lgdt`/`lidt` -- those structures existed in memory
-      (`lazy_static`) but the CPU wasn't yet told to use them, so
-      entering ring 3 faulted immediately on load with a #GP whose
-      error code decoded to GDT index 3 (the user code selector, which
-      only exists in this kernel's own not-yet-loaded GDT). Confirmed
-      the mechanism was real and not process-specific by reproducing
-      the identical fault signature on PROCESS_A (the most-verified
-      process in the kernel) when called from the old position --
-      proving every prior "verified" ring-3 entry had only ever
-      happened via the interactive shell's command loop (which
-      naturally runs after GDT/IDT load), never non-interactively from
-      boot, until this milestone's own self-test tried it for the
-      first time. Fixed by moving the self-test call to after GDT/IDT
-      load. **Real progress confirmed, not assumed**: after the fix,
-      the self-test now genuinely reaches ring-3 entry for the first
-      time (`milestone 30: CR3 switched -- entering ring 3 for process
-      6`), regression-checked against all of Milestones 1-40 with zero
-      change in behavior. **A second, different real bug remains
-      open**: immediately upon entering ring 3, the test double-faults
-      (vector 8) rather than the intended, cleanly-handled page fault
-      (vector 14). QEMU's own `-d int,cpu_reset` trace (added as an
-      opt-in `SPIKELING_QEMU_TRACE=1` env var on the runner specifically
-      to get this evidence, same technique this project already used
-      successfully for earlier hard-to-reproduce bugs) shows the double
-      fault is the FIRST exception event recorded at all -- no clean
-      #PF (vector 14) is ever delivered first, ruling out "faults again
-      inside the #PF handler" as the mechanism. The #PF gate itself
-      (`interrupts.rs`) uses no IST index (relies on the default
-      `TSS.privilege_stack_table[0]` ring3->ring0 switch, the same
-      mechanism `int 0x80` syscalls already use successfully for every
-      earlier process) -- so a generic IST misconfiguration was
-      considered and set aside as the likely cause, since that same
-      switch path is proven to work elsewhere. The double fault's own
-      recorded frame is itself corrupted (`IP=0x1b`, a value that looks
-      like a segment selector, not an instruction pointer; `RFlags`
-      containing what looks like the process's own stack address)
-      rather than pointing anywhere diagnostic, meaning whatever fails
-      corrupts state before or during the fault-frame push itself.
-      Real next step, not yet taken: single-step or a narrower QEMU
-      trace specifically around the ring-3 entry -> first fault window,
-      to see the exact instruction sequence rather than only the
-      already-corrupted aftermath. Not resolved this session -- nine
-      real attempts total across this milestone (eight prior side-
-      workspace diagnostic attempts plus this one), reported honestly
-      rather than claimed fixed.
+- [x] **Milestone 41**: real signals -- SIGSEGV (a page fault from real
+      CPL=3 code terminates just that process, kernel continues, instead
+      of every prior milestone's unconditionally-fatal page fault) and
+      SIGKILL (new syscall 13, unconditionally frees a live never-run
+      forked child's slot, bypassing `wait()`'s normal run-then-reap
+      contract). Custom signal-handler registration/execution is an
+      honest, disclosed scope-cut -- terminate-on-fault alone proved to
+      be the real, achievable target. **The real story here is the
+      investigation, not just the feature**: this milestone's own
+      boot-time self-test was the first thing in this project's entire
+      history to call `run()`/enter ring 3 non-interactively from inside
+      `kernel_main()` itself, rather than via the interactive shell's
+      command loop (which naturally runs later in boot, after every
+      piece of infrastructure ring-3 entry actually depends on is
+      ready). That exposed two real, previously-invisible bugs, both
+      about calling it too early: (1) before this kernel's own GDT/IDT
+      were actually loaded via `lgdt`/`lidt` -- entering ring 3 that
+      early faults IRETQ's own selector validation, confirmed via a real
+      hardware `#GP` whose error code decoded to the user code
+      selector's GDT index; (2) even after fixing that, before the PIC
+      was remapped -- `enter_ring3()`'s own hand-built RFLAGS correctly
+      sets IF=1 (needed for a normal preemptible process), so the IRETQ
+      into ring 3 enables interrupts globally the instant it executes,
+      regardless of whether the kernel's own `sti()` (which runs later,
+      right after PIC remap) has fired yet; a real PIT timer tick
+      landing in that now-interrupts-enabled-but-still-unmapped window
+      got delivered on the 8259's unremapped default vector -- raw INT
+      0x08, the exact same vector this kernel reserves for the CPU's own
+      double-fault exception -- producing a real hardware double fault
+      whose frame was missing the error code a genuine double fault
+      always has, shifting every field the handler read by one word.
+      Confirmed directly via a real QEMU `-d int` trace showing the raw
+      vector (not inferred from error-code shape): `v=08 e=0000 i=0
+      cpl=3`, immediately preceded by a real flood of raw, unmapped
+      `Servicing hardware INT=0x08` deliveries. Fixed by moving the
+      self-test to run after both GDT/IDT load and PIC remap. **Eleven
+      real investigation rounds**, most of which found nothing wrong
+      with (but conclusively ruled out) plausible-looking hypotheses --
+      fixed-array bounds, a process/frame-count threshold, a
+      TSS-restoration leak from Milestone 37's fork excursion mechanism,
+      a GDT/IDT/TSS physical-frame collision, IST stack misalignment
+      (a real, independent bug, fixed and kept regardless), the
+      IST-switch mechanism itself, and a genuinely missing
+      general-protection-fault handler (also a real, independent gap,
+      fixed and kept) -- each one honestly eliminated with real evidence
+      before moving to the next, rather than assumed away. Verified end
+      to end with a clean, fresh, non-interactive boot: `SIGSEGV_TEST_
+      PROCESS` writes its message, faults at a deliberately unmapped
+      address, gets terminated -- no panic, no double fault. `PROCESS_A`
+      then runs completely normally right after, real proof of genuine
+      recovery rather than "hasn't crashed yet". `SIGKILL_TEST_PROCESS`
+      forks a child, kills it unrun, forks again -- `PROCESS_TABLE`
+      shows exactly one occupied slot afterward, proving the first
+      child's slot was truly freed and reused, not just marked dead.
+- [x] **Milestone 42**: real process groups -- a `pgid` field on
+      `Process`, genuine Unix semantics: a freshly-created (non-forked)
+      process is the founder of its own group (`pgid` == its own
+      well-known id), a `fork()`ed child INHERITS its parent's `pgid`
+      rather than starting a new one. Two new syscalls: `setpgid`
+      (14, target pid + new pgid) and `getpgid` (15, target pid) --
+      `setpgid`'s authorization mirrors `kill()`'s own precedent
+      (Milestone 41): succeeds for self, or for a live child of the
+      caller (the real call a shell makes right after forking a
+      pipeline's own processes, to put them in a shared group), refused
+      otherwise. Honest, disclosed scope-cut: no session/controlling-
+      terminal concept exists yet, so real POSIX `setpgid()`'s
+      same-session restriction isn't enforced -- deferred, not silently
+      dropped. Verified via a real, non-interactive boot self-test
+      (`self_test_process_groups()`, pure kernel-side `fork()`/
+      `setpgid()`/`getpgid()`/`kill()` calls, never through a real
+      `int 0x80` -- so unlike Milestone 41's own self-test, this needs no
+      ring-3 entry and none of that milestone's hard-won `init_pics()`/
+      `sti()` ordering constraint): confirmed real inheritance (forked
+      child's pgid matches `FORK_TEST_PROCESS`'s), real divergence after
+      `setpgid` (child's pgid changes, parent's verifiably doesn't), and
+      real authorization enforcement (`PROCESS_A` -- not the child's
+      parent -- attempting `setpgid` on it is actually refused, not just
+      documented as refused). Cleans up its own forked test child before
+      returning so it doesn't consume a `PROCESS_TABLE` slot Milestone
+      41's own SIGKILL self-test also needs later in the same boot --
+      confirmed no interference, every self-test after this one still
+      passes cleanly.
 
 ## Building and running
 

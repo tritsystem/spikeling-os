@@ -79,16 +79,6 @@ fn main() {
         cmd.arg("-monitor")
             .arg(format!("tcp:127.0.0.1:{port},server,nowait"));
     }
-    // Diagnostic-only, opt-in via env var (same pattern as the monitor port
-    // above) -- full interrupt/exception cascade + CPU-reset trace to a
-    // file, and --no-reboot so a triple fault halts QEMU instead of
-    // silently rebooting past it. Same technique this project's own M41
-    // diagnostic history already used successfully.
-    if env::var("SPIKELING_QEMU_TRACE").is_ok() {
-        cmd.arg("-d").arg("int,cpu_reset");
-        cmd.arg("-D").arg("qemu_trace.log");
-        cmd.arg("--no-reboot");
-    }
 
     if uefi {
         let prebuilt =

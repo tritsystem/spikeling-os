@@ -586,6 +586,30 @@ pub struct Process {
     /// the ordinary `run()`/`run_loaded_process()`/`load_and_run_elf()`
     /// paths).
     pending_resume: Option<(u64, u64)>,
+    /// MILESTONE 42: this process's process group id (PGID) -- real Unix
+    /// job-control semantics: a freshly-created (non-forked) process is
+    /// the founder of its own group (its init_*_process() caller sets
+    /// this to its own well-known id right after construction, below);
+    /// a `fork()`-created child INHERITS its parent's pgid (see fork()'s
+    /// own handling) until an explicit `setpgid()` call moves it.
+    /// `0` here (from either shared constructor, create_process_from_image/
+    /// create_process_from_elf) is a real, never-otherwise-valid
+    /// "not yet assigned by the real owning caller" sentinel -- PIDs in
+    /// this kernel start at 1, so a live process reporting pgid 0 would
+    /// itself be a bug, not a legitimate group.
+    pgid: u8,
+    /// MILESTONE 44: the real virtual address ring-3 execution starts at
+    /// for THIS process -- `create_process_from_image()` always sets this
+    /// to `usertest::USER_CODE_ADDR` (every hand-assembled/flat-binary
+    /// program in this kernel's history is built to start there);
+    /// `create_process_from_elf()` sets this to the real, parsed `e_entry`
+    /// from the ELF itself, which no longer has to equal `USER_CODE_ADDR`
+    /// (Milestone 36's own deliberately-deferred restriction -- see that
+    /// milestone's module doc comment, now generalized). `run()`/
+    /// `load_and_run_elf()` read this back out and pass it to
+    /// `usertest::enter_ring3_now(entry)` instead of that function
+    /// hardcoding `USER_CODE_ADDR` itself.
+    entry: u64,
 }
 
 static PROCESS_A: Mutex<Option<Process>> = Mutex::new(None);
@@ -714,10 +738,32 @@ pub(crate) const SIGKILL_TEST_PROGRAM: [u8; 32] = [
 static SIGKILL_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 pub(crate) const SIGKILL_TEST_PROCESS_ID: u8 = 7;
 
+/// MILESTONE 43: a deliberately minimal program whose ENTIRE body is a
+/// real, deterministic `exit(42)` -- used purely as a fork() SOURCE
+/// (see self_test_wait_status()) so the forked CHILD's own code page,
+/// resumed from offset 0, genuinely executes this exact exit call with
+/// no ambiguity about what value rdi holds -- unlike forking from an
+/// already-complex program (FORK_TEST_PROGRAM/SIGKILL_TEST_PROGRAM)
+/// whose subsequent bytes weren't written with a deterministic exit
+/// code in mind.
+///
+///   offset  bytes                        instruction
+///    0      BF 2A 00 00 00               mov edi, 42  (real exit code)
+///    5      B8 01 00 00 00               mov eax, 1   (exit)
+///   10      CD 80                        int 0x80
+pub(crate) const WAITSTATUS_TEST_PROGRAM: [u8; 12] = [
+    0xBF, 0x2A, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80,
+];
+
+/// MILESTONE 43: an EIGHTH hardcoded, boot-time-created process slot --
+/// runs WAITSTATUS_TEST_PROGRAM. See that constant's own doc comment.
+static WAITSTATUS_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const WAITSTATUS_TEST_PROCESS_ID: u8 = 8;
+
 /// MILESTONE 37: real, dynamic PID allocation for `fork()`-created
-/// children. PIDs 1-9 stay permanently reserved for the five
+/// children. PIDs 1-9 stay permanently reserved for the six
 /// pre-existing hardcoded/loaded-file ids above (1/2/3/4/5, with 6-9
-/// held as headroom, of which Milestone 41 now uses 6 and 7) so a
+/// held as headroom, of which Milestones 41/43 now use 6, 7, and 8) so a
 /// forked child's PID can never collide with any of them;
 /// PROCESS_TABLE's own slot `i` is always PID `PID_TABLE_BASE + i`.
 pub(crate) const PID_TABLE_BASE: u8 = 10;
@@ -870,6 +916,10 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
         }
         SIGKILL_TEST_PROCESS_ID => {
             let mut guard = SIGKILL_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        WAITSTATUS_TEST_PROCESS_ID => {
+            let mut guard = WAITSTATUS_TEST_PROCESS.lock();
             Some(f(guard.as_mut()?))
         }
         id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
@@ -1301,6 +1351,16 @@ fn create_process_from_image(
         // None here uniformly; only fork() ever sets them.
         parent_pid: None,
         pending_resume: None,
+        // MILESTONE 42: real sentinel, see the field's own doc comment --
+        // this constructor doesn't know its own future id (assigned by
+        // the caller after this returns); fork()'s fork_build_child()
+        // caller overwrites this with the real inherited pgid right
+        // after construction, same as parent_pid/pending_resume above.
+        pgid: 0,
+        // MILESTONE 44: every flat-binary/hand-assembled program this
+        // kernel has ever run starts at the same fixed address -- see
+        // this field's own doc comment on the struct definition.
+        entry: usertest::USER_CODE_ADDR,
     })
 }
 
@@ -1343,7 +1403,7 @@ fn create_process(
 /// frame_allocator is conveniently already in scope in kernel_main.
 pub fn init_test_processes(frame_allocator: &mut impl FrameAllocator<Size4KiB>, phys_mem_offset: VirtAddr) -> Result<(), &'static str> {
     let _ = writeln!(serial(), "milestone 30: creating process A's private address space...");
-    let a = create_process(
+    let mut a = create_process(
         frame_allocator,
         phys_mem_offset,
         "A",
@@ -1357,10 +1417,15 @@ pub fn init_test_processes(frame_allocator: &mut impl FrameAllocator<Size4KiB>, 
         a.code_frame.start_address().as_u64(),
         a.stack_frame.start_address().as_u64()
     );
+    // MILESTONE 42: process A is the founder of its own group -- real
+    // Unix semantics, pgid == pid for a process nobody explicitly placed
+    // into an existing group.
+    a.pgid = 1;
+    let _ = writeln!(serial(), "milestone 42: process A -- pgid={} (founder of its own group)", a.pgid);
     *PROCESS_A.lock() = Some(a);
 
     let _ = writeln!(serial(), "milestone 30: creating process B's private address space...");
-    let b = create_process(
+    let mut b = create_process(
         frame_allocator,
         phys_mem_offset,
         "B",
@@ -1374,6 +1439,11 @@ pub fn init_test_processes(frame_allocator: &mut impl FrameAllocator<Size4KiB>, 
         b.code_frame.start_address().as_u64(),
         b.stack_frame.start_address().as_u64()
     );
+    // MILESTONE 42: process B is likewise the founder of its own,
+    // separate group -- distinct from process A's, real proof two
+    // independently-created processes don't accidentally share a pgid.
+    b.pgid = 2;
+    let _ = writeln!(serial(), "milestone 42: process B -- pgid={} (founder of its own group)", b.pgid);
     *PROCESS_B.lock() = Some(b);
 
     Ok(())
@@ -1394,7 +1464,7 @@ pub fn init_fdtest_process(
     image: &[u8],
 ) -> Result<(), &'static str> {
     let _ = writeln!(serial(), "milestone 35: creating FDTEST_PROCESS's private address space...");
-    let p = create_process_from_image(frame_allocator, phys_mem_offset, "fdtest", image)?;
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "fdtest", image)?;
     let _ = writeln!(
         serial(),
         "milestone 35: FDTEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
@@ -1402,6 +1472,8 @@ pub fn init_fdtest_process(
         p.code_frame.start_address().as_u64(),
         p.stack_frame.start_address().as_u64()
     );
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    p.pgid = FDTEST_PROCESS_ID;
     *FDTEST_PROCESS.lock() = Some(p);
     Ok(())
 }
@@ -1415,7 +1487,7 @@ pub fn init_fork_test_process(
     phys_mem_offset: VirtAddr,
 ) -> Result<(), &'static str> {
     let _ = writeln!(serial(), "milestone 37: creating FORK_TEST_PROCESS's private address space...");
-    let p = create_process_from_image(frame_allocator, phys_mem_offset, "fork-test", &FORK_TEST_PROGRAM)?;
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "fork-test", &FORK_TEST_PROGRAM)?;
     let _ = writeln!(
         serial(),
         "milestone 37: FORK_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
@@ -1423,6 +1495,10 @@ pub fn init_fork_test_process(
         p.code_frame.start_address().as_u64(),
         p.stack_frame.start_address().as_u64()
     );
+    // MILESTONE 42: founder of its own group -- also the process
+    // self_test_process_groups() below actually forks from, to prove
+    // real pgid inheritance.
+    p.pgid = FORK_TEST_PROCESS_ID;
     *FORK_TEST_PROCESS.lock() = Some(p);
     Ok(())
 }
@@ -1434,7 +1510,7 @@ pub fn init_sigsegv_test_process(
     phys_mem_offset: VirtAddr,
 ) -> Result<(), &'static str> {
     let _ = writeln!(serial(), "milestone 41: creating SIGSEGV_TEST_PROCESS's private address space...");
-    let p = create_process_from_image(frame_allocator, phys_mem_offset, "sigsegv-test", &SIGSEGV_TEST_PROGRAM)?;
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "sigsegv-test", &SIGSEGV_TEST_PROGRAM)?;
     let _ = writeln!(
         serial(),
         "milestone 41: SIGSEGV_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
@@ -1442,6 +1518,8 @@ pub fn init_sigsegv_test_process(
         p.code_frame.start_address().as_u64(),
         p.stack_frame.start_address().as_u64()
     );
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    p.pgid = SIGSEGV_TEST_PROCESS_ID;
     *SIGSEGV_TEST_PROCESS.lock() = Some(p);
     Ok(())
 }
@@ -1453,7 +1531,7 @@ pub fn init_sigkill_test_process(
     phys_mem_offset: VirtAddr,
 ) -> Result<(), &'static str> {
     let _ = writeln!(serial(), "milestone 41: creating SIGKILL_TEST_PROCESS's private address space...");
-    let p = create_process_from_image(frame_allocator, phys_mem_offset, "sigkill-test", &SIGKILL_TEST_PROGRAM)?;
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "sigkill-test", &SIGKILL_TEST_PROGRAM)?;
     let _ = writeln!(
         serial(),
         "milestone 41: SIGKILL_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
@@ -1461,7 +1539,34 @@ pub fn init_sigkill_test_process(
         p.code_frame.start_address().as_u64(),
         p.stack_frame.start_address().as_u64()
     );
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    p.pgid = SIGKILL_TEST_PROCESS_ID;
     *SIGKILL_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 43: creates WAITSTATUS_TEST_PROCESS -- see that static's
+/// own doc comment. Mirrors init_sigkill_test_process()'s exact
+/// pattern. This process is never `run()` directly as a top-level
+/// process by the self-test -- it exists purely as a fork() SOURCE,
+/// so its own code page (a copy of WAITSTATUS_TEST_PROGRAM) is what a
+/// forked CHILD actually executes.
+pub fn init_waitstatus_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 43: creating WAITSTATUS_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "waitstatus-test", &WAITSTATUS_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 43: WAITSTATUS_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    p.pgid = WAITSTATUS_TEST_PROCESS_ID;
+    *WAITSTATUS_TEST_PROCESS.lock() = Some(p);
     Ok(())
 }
 
@@ -1483,12 +1588,13 @@ pub fn run(id: u8) -> Result<(), &'static str> {
         FORK_TEST_PROCESS_ID => &FORK_TEST_PROCESS,
         SIGSEGV_TEST_PROCESS_ID => &SIGSEGV_TEST_PROCESS,
         SIGKILL_TEST_PROCESS_ID => &SIGKILL_TEST_PROCESS,
-        _ => return Err("no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), or 7 (SIGKILL_TEST_PROCESS_ID)"),
+        WAITSTATUS_TEST_PROCESS_ID => &WAITSTATUS_TEST_PROCESS,
+        _ => return Err("no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), 7 (SIGKILL_TEST_PROCESS_ID), or 8 (WAITSTATUS_TEST_PROCESS_ID)"),
     };
-    let (pml4_frame, label) = {
+    let (pml4_frame, label, entry) = {
         let guard = slot.lock();
         let proc = guard.as_ref().ok_or("process not initialized")?;
-        (proc.pml4_frame, proc.label)
+        (proc.pml4_frame, proc.label, proc.entry)
     };
 
     let _ = writeln!(
@@ -1502,11 +1608,15 @@ pub fn run(id: u8) -> Result<(), &'static str> {
     unsafe { Cr3::write(pml4_frame, flags) };
     let _ = writeln!(
         serial(),
+        // MILESTONE 44: real per-process entry now (was always
+        // USER_CODE_ADDR before this milestone; still is for every one
+        // of these six hardcoded processes -- see Process::entry's own
+        // doc comment).
         "milestone 30: CR3 switched -- entering ring 3 for process {id} at {:#x}",
-        usertest::USER_CODE_ADDR
+        entry
     );
 
-    usertest::enter_ring3_now();
+    usertest::enter_ring3_now(entry);
 
     let _ = writeln!(
         serial(),
@@ -1560,7 +1670,9 @@ pub fn create_loaded_process(
     phys_mem_offset: VirtAddr,
     image: &[u8],
 ) -> Result<(), &'static str> {
-    let proc = create_process_from_image(frame_allocator, phys_mem_offset, "loaded", image)?;
+    let mut proc = create_process_from_image(frame_allocator, phys_mem_offset, "loaded", image)?;
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    proc.pgid = LOADED_PROCESS_ID;
     *LOADED_PROCESS.lock() = Some(proc);
     Ok(())
 }
@@ -1617,7 +1729,12 @@ pub fn run_loaded_process() -> Result<(), &'static str> {
         usertest::USER_CODE_ADDR
     );
 
-    usertest::enter_ring3_now();
+    // MILESTONE 44: the flat-binary `runfile` path always loads at
+    // USER_CODE_ADDR (create_process_from_image() sets Process::entry
+    // to exactly that -- see its own doc comment) -- unaffected by this
+    // milestone, passed explicitly rather than reading it back out of
+    // LOADED_PROCESS a second time.
+    usertest::enter_ring3_now(usertest::USER_CODE_ADDR);
 
     let _ = writeln!(
         serial(),
@@ -1667,10 +1784,17 @@ const MAX_TOTAL_ELF_PAGES: u64 = 16;
 /// Real, disclosed limitations of THIS function specifically (elf.rs's
 /// parse() itself has none of these -- they're loading-side, not
 /// parsing-side):
-///   - `entry` MUST equal usertest::USER_CODE_ADDR exactly -- see this
-///     module's own MILESTONE 36 doc comment (top of file) for why this
-///     milestone chose that over making the ring-3 entry trampoline's
-///     jump target dynamic.
+///   - MILESTONE 44: `entry` no longer has to equal `USER_CODE_ADDR` --
+///     Milestone 36's own deliberate deferral (see this module's
+///     original MILESTONE 36 doc comment, still here for the real
+///     history) is now closed: `usertest::enter_ring3_now()` takes the
+///     real entry address as a parameter, so this function only needs
+///     `entry` to fall within a mapped PT_LOAD segment (checked below)
+///     and within this kernel's one fixed private-PML4 user-space
+///     region (also checked below, via `user_p4_index`) -- NOT a
+///     specific constant. `code_frame` is now whichever mapped page
+///     actually backs `entry`'s own page, not literally the page at
+///     `USER_CODE_ADDR`.
 ///   - every PT_LOAD segment's `p_vaddr` MUST be 4 KiB-page-aligned --
 ///     this loader maps whole pages at page-aligned addresses; a
 ///     segment starting mid-page (legal ELF, common in real Linux
@@ -1698,13 +1822,12 @@ fn create_process_from_elf(
     segments: &[elf::ProgramSegment],
     image: &[u8],
 ) -> Result<Process, &'static str> {
-    if entry != usertest::USER_CODE_ADDR {
-        return Err(
-            "elf: e_entry does not equal USER_CODE_ADDR -- this loader only runs ELFs specifically \
-             linked so their entry point lands exactly there (milestone 36 deliberately did not make \
-             the ring-3 entry trampoline's jump target dynamic -- see process.rs's module doc comment)",
-        );
-    }
+    // MILESTONE 44: the old "entry MUST equal USER_CODE_ADDR" rejection
+    // lived here -- removed. `entry`'s real validation is the
+    // `entry_in_segment` check below (a malformed ELF claiming an
+    // entry address no PT_LOAD segment actually covers is still
+    // rejected, same as before) plus the per-page `user_p4_index`
+    // check every segment page already goes through.
     if segments.is_empty() {
         return Err("elf: no PT_LOAD segments to map");
     }
@@ -1819,6 +1942,15 @@ fn create_process_from_elf(
     // before ever reaching the ring-3 entry below.
     let mut summary: Vec<(u64, u64, u64, u32)> = Vec::new();
 
+    // MILESTONE 44: which mapped page becomes `code_frame` is now the
+    // page that actually backs `entry` -- generalized from the old
+    // literal `page_va == usertest::USER_CODE_ADDR` check, which only
+    // ever worked because entry was forced to equal that constant.
+    // Page-aligned the same way every PT_LOAD page address already is
+    // in this loop (p_vaddr is checked page-aligned above; entry itself
+    // needn't be, so this rounds down to the page containing it).
+    let entry_page = entry & !(PAGE_SIZE as u64 - 1);
+
     for seg in segments {
         let pages = seg.p_memsz.div_ceil(PAGE_SIZE as u64);
         for i in 0..pages {
@@ -1860,7 +1992,7 @@ fn create_process_from_elf(
             };
             summary.push((page_va, frame.start_address().as_u64(), copied, seg.p_flags));
 
-            if page_va == usertest::USER_CODE_ADDR {
+            if page_va == entry_page {
                 code_frame = Some(frame);
             } else {
                 extra_frames.push(frame);
@@ -1875,7 +2007,7 @@ fn create_process_from_elf(
     );
 
     let code_frame = code_frame.ok_or(
-        "elf: internal error -- entry-containment check passed but no mapped page backs USER_CODE_ADDR",
+        "elf: internal error -- entry-containment check passed but no mapped page backs entry's own page",
     )?;
 
     let stack_frame = frame_allocator.allocate_frame().ok_or("out of physical frames (stack)")?;
@@ -1938,6 +2070,14 @@ fn create_process_from_elf(
         // see that function's own identical fields for the reasoning.
         parent_pid: None,
         pending_resume: None,
+        // MILESTONE 42: real sentinel, see the field's own doc comment --
+        // an ELF-loaded process is never itself a forked child (same
+        // reasoning as parent_pid above), and its caller (run_elf()) sets
+        // this to its own well-known id right after construction.
+        pgid: 0,
+        // MILESTONE 44: the real, parsed e_entry -- no longer forced to
+        // equal USER_CODE_ADDR. See Process::entry's own doc comment.
+        entry,
     })
 }
 
@@ -1959,7 +2099,7 @@ pub fn load_and_run_elf(
     image: &[u8],
     elf_image: &elf::ElfImage,
 ) -> Result<(), &'static str> {
-    let proc = create_process_from_elf(
+    let mut proc = create_process_from_elf(
         frame_allocator,
         phys_mem_offset,
         "elf-loaded",
@@ -1967,6 +2107,8 @@ pub fn load_and_run_elf(
         &elf_image.segments,
         image,
     )?;
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    proc.pgid = LOADED_PROCESS_ID;
     let pml4_frame = proc.pml4_frame;
     *LOADED_PROCESS.lock() = Some(proc);
 
@@ -1985,7 +2127,11 @@ pub fn load_and_run_elf(
         elf_image.entry
     );
 
-    usertest::enter_ring3_now();
+    // MILESTONE 44: the real point of this milestone -- entry no longer
+    // has to be USER_CODE_ADDR, and this is a genuinely different value
+    // for a real test ELF built with a different linker script entry
+    // point.
+    usertest::enter_ring3_now(elf_image.entry);
 
     let _ = writeln!(
         serial(),
@@ -2286,9 +2432,10 @@ pub(crate) fn fork(parent_id: u8, resume_rip: u64, resume_rsp: u64) -> Option<u8
         let fd2 = p.fds[2].clone();
         let fd3 = p.fds[3].clone();
         let label = p.label;
-        (code_frame, stack_frame, heap_frames, heap_used, [fd0, fd1, fd2, fd3], label)
+        let pgid = p.pgid;
+        (code_frame, stack_frame, heap_frames, heap_used, [fd0, fd1, fd2, fd3], label, pgid)
     })?;
-    let (parent_code, parent_stack, parent_heap_frames, parent_heap_used, parent_fds, parent_label) = snapshot;
+    let (parent_code, parent_stack, parent_heap_frames, parent_heap_used, parent_fds, parent_label, parent_pgid) = snapshot;
 
     let phys_mem_offset = memory::phys_mem_offset();
     let build_result = memory::with_frame_allocator(|frame_allocator| {
@@ -2330,6 +2477,11 @@ pub(crate) fn fork(parent_id: u8, resume_rip: u64, resume_rsp: u64) -> Option<u8
     }
     child.fds = parent_fds;
     child.parent_pid = Some(parent_id);
+    // MILESTONE 42: real Unix inheritance -- a forked child starts in
+    // the SAME process group as its parent, not a new one of its own.
+    // Callers that want it in its own group call setpgid() afterward,
+    // exactly like a real shell does after forking a new pipeline.
+    child.pgid = parent_pgid;
     child.pending_resume = Some((resume_rip, resume_rsp));
     let child_pml4 = child.pml4_frame;
     let child_code_frame = child.code_frame;
@@ -2409,6 +2561,35 @@ fn run_forked_child(child_pid: u8) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// MILESTONE 43: real, checkable wait() outcome -- distinguishes a
+/// child that ran to its own exit() from one that was SIGKILL-
+/// equivalent-terminated before it ever ran, closing the real gap
+/// M41 left open (wait_for_child() previously just returned the pid
+/// or None, with no way to tell "exited normally" from "was killed"
+/// from "never was my child at all").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// WIFEXITED-equivalent + WEXITSTATUS-equivalent: ran to its own
+    /// real exit() syscall, carrying the real status code it passed.
+    Exited(u8),
+    /// The child was kill()ed (M41) before it ever ran -- never
+    /// reached its own exit() at all.
+    Killed,
+}
+
+/// MILESTONE 43: side channel `kill()` populates so a LATER wait()
+/// call can still learn a child was killed, even though kill() itself
+/// (unchanged from M41, verified working, not touched here) frees the
+/// PROCESS_TABLE slot IMMEDIATELY for reuse -- by the time wait()
+/// might be called, the slot itself carries no trace the child ever
+/// existed. Deliberately separate from PROCESS_TABLE for exactly that
+/// reason: a real record that survives the slot being wiped/reused,
+/// without weakening kill()'s own already-verified "instantly
+/// reusable" contract (M41's self-test forks a SECOND child right
+/// after killing the first, with no wait() in between, and that must
+/// keep working unchanged).
+static LAST_KILLED: Mutex<Option<(u8, u8)>> = Mutex::new(None); // (child_pid, parent_id)
+
 /// MILESTONE 37: the `wait()` syscall's actual kernel-side
 /// implementation -- see this module's own top-of-file MILESTONE 37 doc
 /// comment for the real, honest semantics this implements. Real,
@@ -2422,13 +2603,18 @@ fn run_forked_child(child_pid: u8) -> Result<(), &'static str> {
 /// OWN in-flight int 0x80 to correctly resume into its own private code
 /// page afterward.
 ///
-/// Returns the reaped child's own pid on success (removing it from
+/// MILESTONE 43: returns `(child_pid, WaitOutcome)` on success --
+/// `WaitOutcome::Exited(code)` with the child's own real exit code if
+/// it ran to its own exit() and was reaped (removed from
 /// PROCESS_TABLE, freeing its PML4/frames via Drop, and freeing the
-/// slot for a later fork() to reuse), or `None` if `child_pid` doesn't
-/// name a live child OF `parent_id` specifically (a real ownership
-/// check: one process cannot wait() on another's child) or nesting
-/// depth would exceed this design's bound of 1.
-pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<u8> {
+/// slot for a later fork() to reuse), or `WaitOutcome::Killed` if it
+/// was kill()ed (M41) before it ever ran (nothing to reap, the slot
+/// was already freed by kill() itself). Returns `None` if `child_pid`
+/// doesn't name a live child OF `parent_id` specifically AND wasn't
+/// recently killed by `parent_id` either (a real ownership check: one
+/// process cannot wait() on another's child) or nesting depth would
+/// exceed this design's bound of 1.
+pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<(u8, WaitOutcome)> {
     if usertest::is_in_child_resume() {
         let _ = writeln!(
             serial(),
@@ -2442,6 +2628,24 @@ pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<u8> {
     let idx = (child_pid - PID_TABLE_BASE) as usize;
     if idx >= MAX_PROCESSES {
         return None;
+    }
+    // MILESTONE 43: check the kill side-channel FIRST -- if this exact
+    // (child_pid, parent_id) pair was kill()ed, the PROCESS_TABLE slot
+    // is already gone (possibly even reused by a new fork() since),
+    // so this is the ONLY place that information still exists. Real
+    // ownership check preserved: a parent can only learn about ITS
+    // OWN killed child, matching every other authorization check in
+    // this file.
+    {
+        let mut last_killed = LAST_KILLED.lock();
+        if *last_killed == Some((child_pid, parent_id)) {
+            *last_killed = None;
+            let _ = writeln!(
+                serial(),
+                "milestone 43: syscall WAIT (process {parent_id}) -- pid {child_pid} was killed before it ever ran, reporting WaitOutcome::Killed"
+            );
+            return Some((child_pid, WaitOutcome::Killed));
+        }
     }
     {
         let table = PROCESS_TABLE.lock();
@@ -2472,13 +2676,22 @@ pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<u8> {
         return None;
     }
 
+    // MILESTONE 43: real exit code, captured by usertest.rs's exit
+    // syscall arm the instant the child (just resumed above, via
+    // run_forked_child()) reached ITS OWN exit(). Safe to read here
+    // with no explicit reset needed: this design's nesting-depth-1
+    // bound (enforced by is_in_child_resume()'s check at the top of
+    // this function) means at most one child excursion is ever live,
+    // so nothing else could have overwritten it since.
+    let exit_code = usertest::take_last_child_exit_code();
+
     PROCESS_TABLE.lock()[idx] = None;
     let _ = writeln!(
         serial(),
-        "milestone 37: syscall WAIT (process {parent_id}) -- child pid {child_pid} ran to completion and was reaped, CR3 restored to parent's own pml4 {:#x}",
+        "milestone 43: syscall WAIT (process {parent_id}) -- child pid {child_pid} ran to completion and was reaped (real exit code {exit_code}), CR3 restored to parent's own pml4 {:#x}",
         parent_pml4.start_address().as_u64()
     );
-    Some(child_pid)
+    Some((child_pid, WaitOutcome::Exited(exit_code)))
 }
 
 /// MILESTONE 41: SIGKILL-equivalent -- unconditionally terminates a
@@ -2517,11 +2730,155 @@ pub(crate) fn kill(caller_id: u8, target_pid: u8) -> bool {
         return false;
     }
     table[idx] = None;
+    // MILESTONE 43: record this kill in the side channel BEFORE
+    // dropping the table lock, so a later wait() call can learn the
+    // real outcome even though the slot above is already free for a
+    // brand-new fork() to land in (unchanged M41 behavior -- this is
+    // additive, not a replacement).
+    *LAST_KILLED.lock() = Some((target_pid, caller_id));
     let _ = writeln!(
         serial(),
         "milestone 41: syscall KILL (process {caller_id}) -- pid {target_pid} terminated WITHOUT ever running (bypassed wait()'s normal run-then-reap contract), slot freed for reuse"
     );
     true
+}
+
+/// MILESTONE 42: real process-group assignment -- syscall 14. A process
+/// may set its OWN pgid (`target_pid == caller_id`, the common real-shell
+/// case: "put myself in a new/existing group right after forking"), or a
+/// live PARENT may set a live CHILD's pgid (same authorization check
+/// `kill()` already makes: `child.parent_pid == Some(caller_id)`) --
+/// mirroring how a real shell calls `setpgid()` on a just-forked child
+/// from the parent's own side too, so the group is established before a
+/// race with the child's own first instructions. Real, honest scope-cut:
+/// this kernel has no controlling-terminal/session concept yet, so there
+/// is no "only if this is the child's session leader's own session"
+/// restriction real POSIX setpgid() also enforces -- deferred, not
+/// silently dropped, same discipline as kill()'s own disclosed
+/// frame-reclamation gap just above.
+pub(crate) fn setpgid(caller_id: u8, target_pid: u8, new_pgid: u8) -> bool {
+    if new_pgid == 0 {
+        return false;
+    }
+    let authorized = if target_pid == caller_id {
+        true
+    } else if target_pid >= PID_TABLE_BASE && ((target_pid - PID_TABLE_BASE) as usize) < MAX_PROCESSES {
+        let table = PROCESS_TABLE.lock();
+        let idx = (target_pid - PID_TABLE_BASE) as usize;
+        matches!(table[idx].as_ref(), Some(child) if child.parent_pid == Some(caller_id))
+    } else {
+        false
+    };
+    if !authorized {
+        let _ = writeln!(
+            serial(),
+            "milestone 42: syscall SETPGID (process {caller_id}) -- REFUSED, pid {target_pid} is neither this process itself nor a live child OF it -- returning failure"
+        );
+        return false;
+    }
+    match with_process_mut(target_pid, |p| p.pgid = new_pgid) {
+        Some(()) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 42: syscall SETPGID (process {caller_id}) -- pid {target_pid}'s pgid set to {new_pgid}"
+            );
+            true
+        }
+        None => {
+            let _ = writeln!(
+                serial(),
+                "milestone 42: syscall SETPGID (process {caller_id}) -- FAILED, pid {target_pid} authorized but not actually a live process -- returning failure"
+            );
+            false
+        }
+    }
+}
+
+/// MILESTONE 42: real process-group query -- syscall 15. Returns
+/// `target_pid`'s current pgid, or `None` if `target_pid` doesn't name a
+/// live process. No authorization check -- a process's own pgid isn't
+/// sensitive information, matching real Unix `getpgid()`'s own
+/// unrestricted-read semantics.
+pub(crate) fn getpgid(target_pid: u8) -> Option<u8> {
+    with_process_mut(target_pid, |p| p.pgid)
+}
+
+/// MILESTONE 42: real, boot-time, non-interactive proof of process-group
+/// assignment/inheritance/reassignment -- pure kernel-side calls
+/// (fork()/setpgid()/getpgid()/kill(), all called directly, never via a
+/// real `int 0x80`), so unlike self_test_signals() below this needs no
+/// ring-3 entry at all and is safe to run EARLY, alongside
+/// self_test_pipe_mechanics()/fs::self_test_disk_write() before
+/// interrupts::init_pics()/sti() -- see Milestone 41's own hard-won
+/// lesson (main.rs) for why that ordering matters for any self-test that
+/// DOES enter ring 3, which this one deliberately avoids needing to.
+/// Cleans up its own forked child via kill() before returning, so it
+/// doesn't consume one of PROCESS_TABLE's MAX_PROCESSES=4 slots that
+/// self_test_signals()'s own later, real SIGKILL test also needs.
+pub fn self_test_process_groups() {
+    let parent_pgid_before = getpgid(FORK_TEST_PROCESS_ID);
+    let _ = writeln!(
+        serial(),
+        "milestone 42: self-test -- FORK_TEST_PROCESS's own pgid: {:?} (expected Some({FORK_TEST_PROCESS_ID}), founder of its own group)",
+        parent_pgid_before
+    );
+
+    let child_pid = match fork(FORK_TEST_PROCESS_ID, 0, 0) {
+        Some(pid) => pid,
+        None => {
+            let _ = writeln!(serial(), "milestone 42: self-test -- FAILED, fork() itself failed");
+            return;
+        }
+    };
+    let inherited = getpgid(child_pid);
+    let inheritance_ok = inherited == Some(FORK_TEST_PROCESS_ID);
+    let _ = writeln!(
+        serial(),
+        "milestone 42: self-test -- forked child pid {child_pid}, its pgid: {:?} (expected Some({FORK_TEST_PROCESS_ID}), real inheritance from the parent) -- {}",
+        inherited,
+        if inheritance_ok { "confirmed" } else { "MISMATCH" }
+    );
+
+    // Real proof this is genuine per-process state, not a shared/aliased
+    // value: move the CHILD into its own new group (parent-authorizes-
+    // child, the real setpgid() call site a shell makes right after
+    // fork()) and confirm the PARENT's own pgid is completely unaffected.
+    let moved = setpgid(FORK_TEST_PROCESS_ID, child_pid, child_pid);
+    let child_pgid_after = getpgid(child_pid);
+    let parent_pgid_after = getpgid(FORK_TEST_PROCESS_ID);
+    let divergence_ok = moved && child_pgid_after == Some(child_pid) && parent_pgid_after == parent_pgid_before;
+    let _ = writeln!(
+        serial(),
+        "milestone 42: self-test -- setpgid(child, child) result={moved}, child's pgid now {:?} (expected Some({child_pid})), parent's pgid still {:?} (expected unchanged {:?}) -- {}",
+        child_pgid_after,
+        parent_pgid_after,
+        parent_pgid_before,
+        if divergence_ok { "confirmed, real independent per-process state" } else { "MISMATCH" }
+    );
+
+    // Real proof the authorization rule actually rejects an unrelated
+    // caller, not just documented as a rule -- PROCESS_A (pgid 1) is
+    // neither this child's parent nor the child itself.
+    let unauthorized_refused = !setpgid(1, child_pid, 42);
+    let _ = writeln!(
+        serial(),
+        "milestone 42: self-test -- setpgid() from an unrelated process (PROCESS_A, not this child's parent) correctly refused: {unauthorized_refused}"
+    );
+
+    // Clean up: free the table slot for self_test_signals()'s own real
+    // SIGKILL test right after this.
+    let cleaned_up = kill(FORK_TEST_PROCESS_ID, child_pid);
+    let _ = writeln!(
+        serial(),
+        "milestone 42: self-test -- cleanup kill(child) result={cleaned_up} (frees the PROCESS_TABLE slot for later self-tests)"
+    );
+
+    let all_ok = inheritance_ok && divergence_ok && unauthorized_refused && cleaned_up;
+    let _ = writeln!(
+        serial(),
+        "milestone 42: self-test -- OVERALL: {}",
+        if all_ok { "PASS" } else { "FAIL" }
+    );
 }
 
 /// MILESTONE 41: real, boot-time, non-interactive proof of both new
@@ -2590,6 +2947,87 @@ pub fn self_test_signals() {
             let _ = writeln!(serial(), "milestone 41: self-test -- FAILED, SIGKILL_TEST_PROCESS run() errored: {e}");
         }
     }
+}
+
+/// MILESTONE 43: real, boot-time, non-interactive proof of both new
+/// WaitOutcome variants -- same "sendkey is unreliable, run unattended
+/// instead" reasoning as every other self_test_* in this file. Must
+/// run after interrupts::init_pics()/sti() in main.rs's boot sequence
+/// (same real reason as self_test_signals(): this enters ring 3 via
+/// wait_for_child() -> run_forked_child()).
+pub fn self_test_wait_status() {
+    // Part 1: a child that genuinely runs to its own real exit(42).
+    // Forked from WAITSTATUS_TEST_PROCESS (whose entire code page IS
+    // that exact exit call), resumed from offset 0 -- real, valid
+    // (resume_rip, resume_rsp), not the (0,0) placeholder M42's own
+    // self-test could get away with (that test kill()ed its child
+    // before ever running it; this one must actually run).
+    let stack_top = usertest::USER_STACK_ADDR + usertest::USER_STACK_SIZE;
+    let exited_child = fork(WAITSTATUS_TEST_PROCESS_ID, usertest::USER_CODE_ADDR, stack_top);
+    let exited_ok = match exited_child {
+        Some(pid) => match wait_for_child(WAITSTATUS_TEST_PROCESS_ID, pid) {
+            Some((reaped, WaitOutcome::Exited(code))) => {
+                let ok = reaped == pid && code == 42;
+                let _ = writeln!(
+                    serial(),
+                    "milestone 43: self-test -- forked+ran child pid {pid}, wait() reported Exited(reaped={reaped}, code={code}) (expected Exited({pid}, 42)) -- {}",
+                    if ok { "confirmed" } else { "MISMATCH" }
+                );
+                ok
+            }
+            Some((_, WaitOutcome::Killed)) => {
+                let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, wait() reported Killed for a child that should have exited normally");
+                false
+            }
+            None => {
+                let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, wait_for_child() itself returned None for the exit-status child");
+                false
+            }
+        },
+        None => {
+            let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, fork() itself failed for the exit-status child");
+            false
+        }
+    };
+
+    // Part 2: a child kill()ed before it ever runs -- real proof
+    // wait() distinguishes this from a normal exit, not just refuses.
+    // Dummy (0,0) resume point is genuinely fine here, same as M42's
+    // own self-test: this child is never run() at all.
+    let killed_ok = match fork(WAITSTATUS_TEST_PROCESS_ID, 0, 0) {
+        Some(pid) => {
+            let killed = kill(WAITSTATUS_TEST_PROCESS_ID, pid);
+            match wait_for_child(WAITSTATUS_TEST_PROCESS_ID, pid) {
+                Some((reaped, WaitOutcome::Killed)) => {
+                    let ok = killed && reaped == pid;
+                    let _ = writeln!(
+                        serial(),
+                        "milestone 43: self-test -- forked+killed child pid {pid}, wait() reported Killed(reaped={reaped}) -- {}",
+                        if ok { "confirmed" } else { "MISMATCH" }
+                    );
+                    ok
+                }
+                Some((_, WaitOutcome::Exited(code))) => {
+                    let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, wait() reported Exited({code}) for a child that was killed, never ran");
+                    false
+                }
+                None => {
+                    let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, wait_for_child() returned None for the killed child");
+                    false
+                }
+            }
+        }
+        None => {
+            let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, fork() itself failed for the killed child");
+            false
+        }
+    };
+
+    let _ = writeln!(
+        serial(),
+        "milestone 43: self-test -- OVERALL: {}",
+        if exited_ok && killed_ok { "PASS" } else { "FAIL" }
+    );
 }
 
 /// MILESTONE 37: the `exec()` syscall's actual kernel-side

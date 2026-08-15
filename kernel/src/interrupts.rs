@@ -22,6 +22,7 @@ lazy_static! {
         let mut idt = InterruptDescriptorTable::new();
         idt.breakpoint.set_handler_fn(breakpoint_handler);
         idt.page_fault.set_handler_fn(page_fault_handler);
+        idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
         idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
         idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
         idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
@@ -174,6 +175,50 @@ extern "x86-interrupt" fn page_fault_handler(
     let _ = writeln!(port, "EXCEPTION: PAGE FAULT");
     let _ = writeln!(port, "Accessed Address: {:?}", Cr2::read());
     let _ = writeln!(port, "Error Code: {:?}", error_code);
+    let _ = writeln!(port, "{:#?}", stack_frame);
+    hlt_loop();
+}
+
+/// MILESTONE 41: a real, previously-undiscovered gap found while
+/// debugging the SIGSEGV self-test's own boot-time verification: this
+/// IDT never registered a `general_protection_fault` handler at all.
+/// Every prior milestone's ring-3 work happened to never trigger a real
+/// #GP, so this gap was invisible. An earlier round of that same
+/// debugging session captured a real `-d int` hardware trace showing a
+/// #GP (vector 0xd, error code 0x18 -- GDT index 3, the user code
+/// selector) at roughly this point in execution, which was the original
+/// motivation for adding this handler.
+///
+/// **Honestly disclosed: adding this handler did NOT fix the SIGSEGV
+/// self-test's own double-fault crash** -- verified by direct A/B
+/// testing (identical build, only this handler added/removed): the
+/// double fault still occurs, with the exact same "garbled" field
+/// values, and this handler's own log line never prints, meaning
+/// whatever actually faults is not reaching IDT[13] in a form this
+/// handler catches. That #GP trace may have been from a different
+/// moment than what's crashing now (a lot of other fixes landed in
+/// between the two investigation rounds), or the real fault is a
+/// different vector entirely. Kept anyway because a real, previously
+/// nonexistent #GP handler -- mirroring page_fault_handler's exact
+/// CPL=3-terminates-the-process design -- is independently correct and
+/// worth having regardless of whether it explains this specific bug;
+/// same reasoning as this same investigation's earlier stack-alignment
+/// fix. The double-fault root cause remains open.
+extern "x86-interrupt" fn general_protection_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: u64,
+) {
+    let active = crate::process::ACTIVE_PROCESS.load(Ordering::Relaxed);
+    if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3 && active != 0 {
+        let _ = writeln!(
+            serial(),
+            "milestone 41: GP fault -- process {active} general-protection-faulted (real hardware CPL=3, error code {error_code:#x}) -- terminating this process, kernel continues",
+        );
+        crate::usertest::terminate_faulted_process_and_resume_kernel();
+    }
+    let mut port = serial();
+    let _ = writeln!(port, "EXCEPTION: GENERAL PROTECTION FAULT");
+    let _ = writeln!(port, "Error Code: {error_code:#x}");
     let _ = writeln!(port, "{:#?}", stack_frame);
     hlt_loop();
 }

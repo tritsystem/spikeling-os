@@ -394,6 +394,13 @@ static TEST_ELF_BYTES: &[u8] = include_bytes!("../assets/testelf.elf");
 /// tools/pipetest_src/pipetest.rs), not hand-assembled.
 static PIPETEST_ELF_BYTES: &[u8] = include_bytes!("../assets/pipetest.elf");
 
+/// MILESTONE 44: real, externally-built ELF64 test payload whose
+/// e_entry deliberately does NOT equal usertest::USER_CODE_ADDR -- see
+/// tools/testelf_altentry_src/ for the build recipe and linker script.
+/// Built the same way TEST_ELF_BYTES above is (this project's own
+/// pinned Rust toolchain + rust-lld), not hand-assembled.
+static ALTENTRY_TEST_ELF_BYTES: &[u8] = include_bytes!("../assets/testelf_altentry.elf");
+
 /// MILESTONE 40: the `seedpipetest` shell command's entry point --
 /// same reasoning as seed_test_elf() above, writes the real ELF bytes
 /// to disk so `runelf pipetest` (reusing run_elf() below unchanged,

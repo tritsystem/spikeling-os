@@ -21,12 +21,31 @@ use x86_64::structures::tss::TaskStateSegment;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// MILESTONE 41: a real, diagnosed bug fix -- `static mut STACK: [u8; N]`
+/// (this file's pre-existing pattern, used for every kernel stack below)
+/// has NO alignment guarantee beyond 1 byte in Rust; nothing here ever
+/// forced the linker to place it on a 16-byte boundary. x86-64 requires
+/// RSP to be 16-byte aligned at an interrupt/exception frame push --
+/// silently getting an unaligned stack from an IST entry doesn't fault
+/// immediately, it just shifts every field the CPU pushes by however
+/// many bytes off the intended alignment, which is INDISTINGUISHABLE
+/// from stack corruption once read back through `InterruptStackFrame`'s
+/// field layout (found the hard way: a double fault's own printed frame
+/// showed CS's real value sitting in the `instruction_pointer` field and
+/// SS's in `stack_pointer` -- a one-slot-early read, not garbage, which
+/// is exactly what a misaligned top-of-stack produces). Wrapping the
+/// backing array in a `#[repr(align(16))]` newtype forces the linker to
+/// actually honor 16-byte alignment for the computed stack-top address
+/// every one of these stacks hands to the CPU.
+#[repr(align(16))]
+struct AlignedStack<const N: usize>([u8; N]);
+
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 5;
-            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+            static mut STACK: AlignedStack<STACK_SIZE> = AlignedStack([0; STACK_SIZE]);
 
             let stack_start = VirtAddr::from_ptr(&raw const STACK);
             stack_start + STACK_SIZE as u64
@@ -41,7 +60,7 @@ lazy_static! {
         // (or kernel_main itself) is current.
         tss.privilege_stack_table[0] = {
             const STACK_SIZE: usize = 4096 * 5;
-            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+            static mut STACK: AlignedStack<STACK_SIZE> = AlignedStack([0; STACK_SIZE]);
 
             let stack_start = VirtAddr::from_ptr(&raw const STACK);
             stack_start + STACK_SIZE as u64
@@ -131,7 +150,12 @@ pub fn user_data_selector() -> SegmentSelector {
 /// an ACTUAL page fault (instruction fetch at VirtAddr(0x200)) during
 /// real QEMU testing, not guessed at.
 const CHILD_EXCURSION_STACK_SIZE: usize = 4096 * 5;
-static mut CHILD_EXCURSION_STACK: [u8; CHILD_EXCURSION_STACK_SIZE] = [0; CHILD_EXCURSION_STACK_SIZE];
+/// MILESTONE 41: same `#[repr(align(16))]` fix as the two TSS stacks
+/// above -- an unaligned stack-switch target is a real, silent bug, not
+/// just a theoretical one; fixing it here too rather than leaving this
+/// one stack as the sole unfixed instance of the identical pattern.
+static mut CHILD_EXCURSION_STACK: AlignedStack<CHILD_EXCURSION_STACK_SIZE> =
+    AlignedStack([0; CHILD_EXCURSION_STACK_SIZE]);
 
 /// The top-of-stack address for CHILD_EXCURSION_STACK above -- same
 /// `&raw const` + VirtAddr::from_ptr() pattern TSS's own two stacks use

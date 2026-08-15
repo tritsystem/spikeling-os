@@ -306,6 +306,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(()) => writeln!(port, "milestone 41: SIGKILL_TEST_PROCESS private address space created").unwrap(),
         Err(e) => writeln!(port, "milestone 41: FAILED to create SIGKILL_TEST_PROCESS -- {e}").unwrap(),
     }
+    // MILESTONE 43: an eighth hardcoded process slot, used purely as a
+    // fork() source for self_test_wait_status()'s real exit-code test
+    // -- same "frame_allocator/phys_mem_offset conveniently still in
+    // scope" reason as the others just above.
+    match process::init_waitstatus_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 43: WAITSTATUS_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 43: FAILED to create WAITSTATUS_TEST_PROCESS -- {e}").unwrap(),
+    }
 
     // MILESTONE 34: real general program loader. `frame_allocator`'s
     // last boot-time consumer was process::init_test_processes just
@@ -351,6 +359,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // checked directly on every boot, no interactive shell command
     // needed.
     process::self_test_pipe_mechanics();
+    // MILESTONE 42: same non-interactive-proof reasoning as the two
+    // self-tests just above -- process-group assignment/inheritance/
+    // reassignment checked directly on every boot. Unlike
+    // self_test_signals() below, this never enters ring 3 (fork()/
+    // setpgid()/getpgid()/kill() are all called directly, not via a real
+    // `int 0x80`), so it needs none of that self-test's hard-won
+    // ordering constraint relative to interrupts::init_pics()/sti() --
+    // safe to run here, this early.
+    process::self_test_process_groups();
 
     // MILESTONE 9: real LIF neuron network -- initialized before
     // interrupts are enabled (stage 5b, below) so it's ready the
@@ -495,7 +512,40 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // interactive shell's command loop (which naturally runs after this
     // point), never non-interactively from boot until this milestone's
     // own self-test tried it for the first time.
-    process::self_test_signals();
+    //
+    // SECOND real root-cause fix, found after the GDT/IDT-ordering fix
+    // above still left a real double fault: enter_ring3()'s own
+    // hand-built RFLAGS sets IF=1 (confirmed via a real QEMU `-d int`
+    // trace: RFL=00000202 at the moment of the fault) -- entirely
+    // correct and necessary for a normal, preemptible ring-3 process,
+    // but it means the IRETQ that performs the ring-3 transition
+    // enables interrupts globally the instant it executes, regardless
+    // of whether the kernel's own `sti` (below, after init_pics()) has
+    // run yet. Calling this self-test from its old position -- after
+    // GDT/IDT load but BEFORE interrupts::init_pics() remaps the 8259
+    // -- meant a real PIT timer tick (IRQ0) landing in that now-
+    // interrupts-enabled-but-still-unmapped window got delivered on the
+    // PIC's UNREMAPPED default vector, which is raw INT 0x08 -- the
+    // exact same vector this kernel's IDT reserves for the CPU's own
+    // double-fault exception. double_fault_handler's signature correctly
+    // expects a hardware-pushed error code (real double faults always
+    // have one), but an ordinary IRQ delivered this way never pushes
+    // one, so every field the handler read afterward -- instruction_
+    // pointer, cpu_flags, stack_pointer -- was really reading the NEXT
+    // field over, one word early: a consistent, reproducible one-word
+    // shift that survived over a dozen unrelated hypotheses (fixed-
+    // array bounds, process/frame-count thresholds, TSS-restoration
+    // leaks, GDT/IDT/TSS physical-frame collisions, IST stack
+    // misalignment, the IST-switch mechanism itself, a missing #GP
+    // handler) precisely because none of them were the real mechanism.
+    // Confirmed directly, not inferred: a real `-d int` trace's very
+    // next logged event after entering ring 3 is `v=08 e=0000 i=0
+    // cpl=3` -- a genuine hardware vector 8, not injected, immediately
+    // preceded by a real flood of `Servicing hardware INT=0x08` lines
+    // (the unmapped PIC's own raw IRQ0 delivery). Moved to run after
+    // interrupts::init_pics() + the real sti() below, so the PIC is
+    // correctly remapped before anything can ever reach ring 3 and
+    // globally enable interrupts.
 
     // MILESTONE 5, STAGE B: PIC remap + timer interrupt -- the real
     // preemption clock a future context switch will ride on. Verified
@@ -569,6 +619,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::init();
     x86_64::instructions::interrupts::enable();
     writeln!(port, "milestone 5b: PIC initialized, interrupts enabled").unwrap();
+
+    // MILESTONE 41: moved here from right after GDT/IDT load -- see the
+    // long comment further up (search "SECOND real root-cause fix") for
+    // the full real mechanism. Must run after init_pics() specifically,
+    // not just after sti(): entering ring 3 sets IF=1 in the process's
+    // own RFLAGS regardless of the kernel's own interrupt-enable state,
+    // so a real timer tick landing while the PIC is still unremapped is
+    // the actual danger window, not whether `enable()` above has run.
+    process::self_test_signals();
+    // MILESTONE 43: same ordering requirement as self_test_signals()
+    // just above (real ring-3 entry via wait_for_child() ->
+    // run_forked_child() -> enter_ring3_as_forked_child(), which sets
+    // RFLAGS.IF=1 the same way top-level entry does) -- must run after
+    // init_pics()/enable() too, not before.
+    process::self_test_wait_status();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

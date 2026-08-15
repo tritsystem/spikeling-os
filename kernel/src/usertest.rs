@@ -55,7 +55,7 @@
 use crate::gdt;
 use crate::serial;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use x86_64::VirtAddr;
 use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, PhysFrame, Size4KiB};
 
@@ -189,6 +189,21 @@ static CHILD_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
 /// require a SECOND, simultaneously-live nested anchor -- this design
 /// only has one.
 static IN_CHILD_RESUME: AtomicBool = AtomicBool::new(false);
+
+/// MILESTONE 43: real exit-status capture for a forked child's OWN
+/// exit() call, read out by process::wait_for_child() the instant
+/// run_forked_child() returns (before anything else can touch it --
+/// this design's existing nesting-depth-1 bound means at most one
+/// child excursion is ever live at a time, so a single slot is honest
+/// and sufficient, not a shortcut). The exit syscall's arm below only
+/// writes here when IN_CHILD_RESUME is true -- a top-level process's
+/// own exit() (PROCESS_A/B, the legacy path, etc.) has no parent
+/// wait()ing on it in this design and leaves this alone.
+static LAST_CHILD_EXIT_CODE: AtomicU8 = AtomicU8::new(0);
+
+pub(crate) fn take_last_child_exit_code() -> u8 {
+    LAST_CHILD_EXIT_CODE.load(Ordering::SeqCst)
+}
 
 /// MILESTONE 37: real, honest, ENFORCED nesting-depth check -- see
 /// IN_CHILD_RESUME's own doc comment. `pub(crate)` so process.rs's
@@ -476,6 +491,16 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
             }
         }
         1 => {
+            // MILESTONE 43: real exit-status capture -- rdi holds the
+            // caller's exit code (`mov edi, N` before `mov eax, 1`),
+            // same rdi-as-first-argument convention every other syscall
+            // in this dispatch already uses. Only meaningful -- and only
+            // read -- for a forked child's OWN exit() (IN_CHILD_RESUME
+            // true): a top-level process's exit() has no parent wait()ing
+            // on it in this design, so there's nothing to report it to.
+            if IN_CHILD_RESUME.load(Ordering::SeqCst) {
+                LAST_CHILD_EXIT_CODE.store(regs.rdi as u8, Ordering::SeqCst);
+            }
             let _ = writeln!(
                 serial(),
                 "milestone {}: syscall EXIT -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- discarding ring-3 context, resuming kernel context",
@@ -806,14 +831,36 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                     let _ = writeln!(serial(), "milestone 37: syscall WAIT (process {active}) -- pid argument {child_pid_arg} out of range -- returning u64::MAX");
                     regs.rax = u64::MAX;
                 } else {
+                    // MILESTONE 43: rax encoding for a successful wait()
+                    // -- bits 0-7 = reaped child pid, bits 8-15 = real
+                    // exit code (only meaningful if bit 16 is set),
+                    // bit 16 = 1 if the child ran to its own exit()
+                    // (WaitOutcome::Exited), 0 if it was killed before
+                    // ever running (WaitOutcome::Killed) -- documented
+                    // here AND in the hand-assembled test programs that
+                    // decode it, checked by hand against each other, not
+                    // assumed consistent.
                     match crate::process::wait_for_child(active, child_pid_arg as u8) {
-                        Some(reaped) => {
-                            let _ = writeln!(
-                                serial(),
-                                "milestone 37: syscall WAIT (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- reaped child pid {reaped}",
-                                regs.cs
-                            );
-                            regs.rax = reaped as u64;
+                        Some((reaped, outcome)) => {
+                            let encoded = match outcome {
+                                crate::process::WaitOutcome::Exited(code) => {
+                                    let _ = writeln!(
+                                        serial(),
+                                        "milestone 43: syscall WAIT (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- reaped child pid {reaped}, exited normally with code {code}",
+                                        regs.cs
+                                    );
+                                    (reaped as u64) | ((code as u64) << 8) | (1u64 << 16)
+                                }
+                                crate::process::WaitOutcome::Killed => {
+                                    let _ = writeln!(
+                                        serial(),
+                                        "milestone 43: syscall WAIT (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- child pid {reaped} was killed, never ran",
+                                        regs.cs
+                                    );
+                                    reaped as u64
+                                }
+                            };
+                            regs.rax = encoded;
                         }
                         None => {
                             let _ = writeln!(
@@ -1014,6 +1061,65 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 }
             }
         }
+        14 => {
+            // MILESTONE 42: setpgid(target_pid, new_pgid) -- rdi=target
+            // pid, rsi=new pgid. Returns 1 on success, 0 on failure, same
+            // convention as KILL just above. See process::setpgid()'s own
+            // doc comment for the real authorization rule (self or a live
+            // child) and its disclosed session-leader scope-cut.
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 42: syscall SETPGID called with no active process -- ignoring, returning 0");
+                regs.rax = 0;
+            } else {
+                let target_pid_arg = regs.rdi;
+                let new_pgid_arg = regs.rsi;
+                if target_pid_arg > u8::MAX as u64 || new_pgid_arg > u8::MAX as u64 {
+                    let _ = writeln!(serial(), "milestone 42: syscall SETPGID (process {active}) -- argument out of range -- returning 0");
+                    regs.rax = 0;
+                } else {
+                    let ok = crate::process::setpgid(active, target_pid_arg as u8, new_pgid_arg as u8);
+                    let _ = writeln!(
+                        serial(),
+                        "milestone 42: syscall SETPGID (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- target pid {target_pid_arg}, new pgid {new_pgid_arg}, result={ok}",
+                        regs.cs
+                    );
+                    regs.rax = if ok { 1 } else { 0 };
+                }
+            }
+        }
+        15 => {
+            // MILESTONE 42: getpgid(target_pid) -- rdi=target pid.
+            // Returns the real pgid on success, u64::MAX on failure (a
+            // real pgid is never u64::MAX, so this is an honest,
+            // unambiguous sentinel, matching DUP/DUP2's own convention
+            // rather than KILL/SETPGID's 0/1 one -- a pgid IS meaningful
+            // data being returned here, not just a yes/no result).
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 42: syscall GETPGID called with no active process -- ignoring, returning u64::MAX");
+                regs.rax = u64::MAX;
+            } else {
+                let target_pid_arg = regs.rdi;
+                if target_pid_arg > u8::MAX as u64 {
+                    let _ = writeln!(serial(), "milestone 42: syscall GETPGID (process {active}) -- pid argument {target_pid_arg} out of range -- returning u64::MAX");
+                    regs.rax = u64::MAX;
+                } else {
+                    match crate::process::getpgid(target_pid_arg as u8) {
+                        Some(pgid) => {
+                            let _ = writeln!(
+                                serial(),
+                                "milestone 42: syscall GETPGID (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- target pid {target_pid_arg}, pgid={pgid}",
+                                regs.cs
+                            );
+                            regs.rax = pgid as u64;
+                        }
+                        None => {
+                            let _ = writeln!(serial(), "milestone 42: syscall GETPGID (process {active}) -- FAILED, pid {target_pid_arg} not a live process -- returning u64::MAX");
+                            regs.rax = u64::MAX;
+                        }
+                    }
+                }
+            }
+        }
         other => {
             let _ = writeln!(
                 serial(),
@@ -1180,14 +1286,28 @@ pub fn run() -> Result<(), &'static str> {
 /// Reuses the same KERNEL_RSP slot as run() -- safe because the shell
 /// only ever runs one command (and therefore at most one ring-3
 /// excursion, `usertest` or `runproc`) at a time.
-pub(crate) fn enter_ring3_now() {
+///
+/// MILESTONE 44: takes the real entry address as a parameter now,
+/// instead of hardcoding `USER_CODE_ADDR` -- the underlying `enter_ring3`
+/// naked function was ALREADY fully parameterized by entry RIP (it's
+/// just its 3rd SysV argument, `rdx`); only this thin wrapper needed to
+/// stop hardcoding it. This is NOT the "deep surgery on the ring-3
+/// entry trampoline" Milestone 36 deliberately deferred -- the naked
+/// asm itself is untouched, byte-for-byte. Every existing caller that
+/// only ever ran flat-binary/hand-assembled programs (`process::run()`
+/// for PROCESS_A/B/FDTEST/FORK_TEST/SIGSEGV_TEST/SIGKILL_TEST,
+/// `run_loaded_process()` for the `runfile` path) now passes their own
+/// process's real `entry` field, which is `USER_CODE_ADDR` for every
+/// one of them -- zero behavior change. Only `load_and_run_elf()` now
+/// passes a genuinely different value, the ELF's own real `e_entry`.
+pub(crate) fn enter_ring3_now(entry: u64) {
     let user_cs = gdt::user_code_selector().0 as u64;
     let user_ss = gdt::user_data_selector().0 as u64;
     let user_stack_top = USER_STACK_ADDR + USER_STACK_SIZE;
     let rflags: u64 = 0x202;
 
     unsafe {
-        enter_ring3(KERNEL_RSP.as_ptr(), user_stack_top, USER_CODE_ADDR, user_cs, user_ss, rflags);
+        enter_ring3(KERNEL_RSP.as_ptr(), user_stack_top, entry, user_cs, user_ss, rflags);
     }
 }
 

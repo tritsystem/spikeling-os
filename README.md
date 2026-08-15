@@ -1594,6 +1594,37 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       hit a real account usage-limit wall before writing one). Labeled
       honestly here for what it actually is; the real, originally
       assigned waitpid-semantics scope remains undone.
+- [x] **Milestone 51**: real `malloc()`/`free()` on top of `sys_sbrk()`,
+      closing the "no heap allocator wired to sbrk() yet" gap `libc.rs`
+      disclosed back at Milestone 39. A real, minimal intrusive
+      free-list allocator: every block carries an 8-byte size header; a
+      free block's own payload doubles as the "next free" pointer.
+      `malloc()` walks the free list first-fit, splitting a block that
+      leaves a genuinely independently-usable remainder, falling back to
+      `sys_sbrk()` growth when nothing fits. Real, disclosed scope-cut:
+      no coalescing of adjacent freed blocks -- a real, present
+      limitation on the fixed 16 KiB per-process heap, not hidden.
+      Verified with a real, standalone ELF64 test program exercising 6
+      hand-computed-in-advance predictions against the allocator's real
+      live behavior (two fresh allocations at the exact predicted
+      offset, a freed-then-realloced same-size block reusing the exact
+      same address, a freed-then-smaller-realloc genuinely splitting
+      with the remainder at the exact predicted address) -- each
+      independently write/read verified for real memory isolation.
+      Real, substantive merge conflict with the already-merged
+      Milestone 44 completion (see above): both add a non-interactive
+      ring-3 self-test to `kernel_main()`'s own self-test block,
+      resolved by hand keeping both self-tests, with BOTH placed
+      upstream of Milestone 45's interrupt-re-enable fix (the same real
+      ordering hazard as the Milestone 44 conflict above -- three ring-3
+      self-tests now share that one fix). Independently re-verified by
+      the orchestrating session: fresh build + fresh QEMU boot,
+      hand-reconstructed every real hex pointer value from the
+      hardware-traced WRITE syscall log against the test program's own
+      documented predictions -- all 6 named checks plus `OVERALL` report
+      `PASS`; combined boot also re-confirmed 82 real timer interrupts
+      and genuine preemptive multitasking still functioning afterward,
+      proving the three-self-test interrupt ordering holds.
 
 ## Building and running
 

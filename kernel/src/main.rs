@@ -490,6 +490,76 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     )
     .unwrap();
 
+    // MILESTONE 48: ternary.rs wired into a REAL, observable kernel
+    // decision path -- scheduler.rs's step() (the exact function
+    // tasks.rs's real timer-driven preemptive scheduler calls every
+    // tick, not a copy) now picks its winner via ternary::compare_trit,
+    // a genuine three-way less/tied/greater decision, instead of a
+    // plain binary f32 comparison. Same "report honestly, don't assume"
+    // discipline as Milestone 4 just above: run the real ternary path
+    // and the kept-for-comparison binary path (scheduler::step_binary,
+    // NOT used anywhere in real scheduling) over identical dynamics --
+    // same slot count and coupling tasks.rs's own real
+    // run_preemption_demo() uses -- and report actual measured
+    // fire-count fairness for both, whichever way it comes out.
+    const M48_N_SLOTS: usize = 8; // matches tasks.rs's real MAX_TASKS cap
+    const M48_G: f32 = 0.6; // matches tasks.rs's real run_preemption_demo() coupling
+    const M48_TICKS: u32 = 4000;
+
+    fn run_scheduling_trial(g: f32, n: usize, ticks: u32, ternary: bool) -> (u32, u32, u32, u32) {
+        let mut sched = scheduler::TopologicalScheduler::new(n, g);
+        for _ in 0..ticks {
+            if ternary {
+                sched.step();
+            } else {
+                sched.step_binary();
+            }
+        }
+        let counts: Vec<u32> = sched.slots.iter().map(|s| s.fire_count).collect();
+        let min = *counts.iter().min().unwrap();
+        let max = *counts.iter().max().unwrap();
+        let total: u32 = counts.iter().sum();
+        (min, max, total, sched.ties_broken)
+    }
+
+    let (min_tern, max_tern, total_tern, ties_tern) = run_scheduling_trial(M48_G, M48_N_SLOTS, M48_TICKS, true);
+    let (min_bin, max_bin, total_bin, _) = run_scheduling_trial(M48_G, M48_N_SLOTS, M48_TICKS, false);
+
+    writeln!(
+        port,
+        "milestone 48: {M48_TICKS} ticks over {M48_N_SLOTS} slots (g={M48_G}, real tasks.rs coupling) -- ternary tiebreak (compare_trit within epsilon={}) actually fired on {ties_tern} of {M48_TICKS} ticks",
+        scheduler::TIE_EPSILON
+    )
+    .unwrap();
+    writeln!(
+        port,
+        "milestone 48: ternary selection  -- fire counts min={min_tern} max={max_tern} total={total_tern} fairness={:.4}",
+        min_tern as f32 / max_tern as f32
+    )
+    .unwrap();
+    writeln!(
+        port,
+        "milestone 48: binary   selection -- fire counts min={min_bin} max={max_bin} total={total_bin} fairness={:.4}",
+        min_bin as f32 / max_bin as f32
+    )
+    .unwrap();
+    let tern_fairer = (min_tern as f32 / max_tern as f32) > (min_bin as f32 / max_bin as f32);
+    let tern_equal = (min_tern as f32 / max_tern as f32 - min_bin as f32 / max_bin as f32).abs() < 1e-6;
+    writeln!(
+        port,
+        "milestone 48: result -- {}",
+        if ties_tern == 0 {
+            "ternary tiebreak never actually engaged in this run (no within-epsilon ties occurred) -- selection was numerically identical to the binary path, reporting honestly rather than claiming an untested advantage"
+        } else if tern_equal {
+            "ternary tiebreak engaged but made no measurable fairness difference here -- a real neutral result, not an assumed win"
+        } else if tern_fairer {
+            "ternary tiebreak's fairness rule (fewest fire_count wins a tie) measurably improved fire-count fairness over the binary path's arbitrary last-wins tie rule"
+        } else {
+            "ternary tiebreak measurably did NOT improve fairness here -- reporting honestly, not the assumed outcome, same discipline as milestone 4's own finding"
+        }
+    )
+    .unwrap();
+
     // MILESTONE 5, STAGE A: GDT+TSS (needed first: the double-fault
     // handler's separate IST stack) and a real IDT with CPU exception
     // handlers. Verified with an actual int3 breakpoint, not just "it

@@ -14,6 +14,16 @@
 //! is real, separate, future work -- this milestone proves the
 //! topological SELECTION policy itself, which is the piece "give it
 //! topological redundancy" was actually asking for.
+//!
+//! MILESTONE 48: step()'s winner-selection among slots tied (within
+//! TIE_EPSILON) for highest potential now uses ternary.rs's
+//! `compare_trit` -- a genuine three-way (less/tied/greater) decision
+//! -- instead of a plain binary float comparison, and breaks real ties
+//! by real fairness (fewest fire_count so far wins) instead of
+//! `max_by`'s arbitrary last-wins default. select_winner_binary() /
+//! step_binary() keep the old binary comparison alive, unused by the
+//! real scheduling path, purely so main.rs's boot-time trial can
+//! measure an honest before/after difference.
 
 use alloc::vec::Vec;
 
@@ -47,10 +57,28 @@ pub struct TopologicalScheduler {
     bias: f32,
     threshold: f32,
     g: f32, // MILESTONE 25: kept so add_slot() can recompute bonds for a grown bank
+    /// MILESTONE 48: real count of ticks where step()'s ternary
+    /// winner-selection actually hit a within-epsilon tie (trit 0) and
+    /// the fairness tiebreak (fewest fire_count wins) decided the
+    /// winner -- not incremented by step_binary(). Read directly by
+    /// main.rs's boot-time A/B trial as a genuine "did this logic path
+    /// even engage" count, not an assumed one.
+    pub ties_broken: u32,
 }
 
 const THRESHOLD: f32 = 1.0;
 const BIAS: f32 = 0.15;
+/// MILESTONE 48: how close two candidate slots' potentials must be to
+/// count as a ternary "tied" (trit 0) outcome rather than a clean win/
+/// loss. Chosen relative to this scheduler's own per-tick scale: BIAS
+/// alone advances a slot's potential by 0.15/tick, and the lateral
+/// coupling term is damped to 0.05 * bond * neighbor-potential (see
+/// step()'s own comment) -- so two slots landing within 0.01 of each
+/// other is a real near-coincidence produced by the coupled dynamics,
+/// not noise from an unrelated source, and is small enough that it
+/// won't swallow genuine, clearly-separated potential differences into
+/// spurious ties.
+pub(crate) const TIE_EPSILON: f32 = 0.01;
 
 impl TopologicalScheduler {
     pub fn new(n: usize, g: f32) -> Self {
@@ -67,6 +95,7 @@ impl TopologicalScheduler {
             bias: BIAS,
             threshold: THRESHOLD,
             g,
+            ties_broken: 0,
         }
     }
 
@@ -108,9 +137,12 @@ impl TopologicalScheduler {
         }
     }
 
-    /// Advances one tick. Returns the id of the task-slot selected to
-    /// run this round, or None if nothing crossed threshold yet.
-    pub fn step(&mut self) -> Option<usize> {
+    /// Grows every alive slot's potential by one tick's worth of bias +
+    /// damped lateral coupling from its alive neighbors. Shared by
+    /// step() and step_binary() (Milestone 48) -- the two differ ONLY
+    /// in how they pick a winner among slots that crossed threshold
+    /// this tick, not in how potentials accumulate.
+    fn accumulate(&mut self) {
         let n = self.slots.len();
         let snapshot: Vec<f32> = self.slots.iter().map(|s| s.potential).collect();
 
@@ -131,15 +163,92 @@ impl TopologicalScheduler {
             // signal, not the dominant term
             self.slots[i].potential += self.bias + 0.05 * coupling;
         }
+    }
 
-        let winner = self
-            .slots
+    /// MILESTONE 48: the BINARY equivalent this milestone's ternary
+    /// selection replaces in the real scheduling path -- a plain
+    /// `f32::partial_cmp` `max_by`. Kept ONLY so main.rs's boot-time A/B
+    /// trial (and step_binary() below) can measure a real, honest
+    /// difference against select_winner_ternary; nothing in tasks.rs's
+    /// actual timer-driven scheduler calls this. On an exact or
+    /// near-exact tie, `Iterator::max_by` returns the LAST equally-
+    /// maximum element -- an implicit, fairness-blind "highest slot
+    /// index wins" rule baked into ordinary binary comparison, not a
+    /// deliberate policy.
+    fn select_winner_binary(&self) -> Option<usize> {
+        self.slots
             .iter()
             .enumerate()
             .filter(|(_, s)| s.alive && s.potential >= self.threshold)
             .max_by(|(_, a), (_, b)| a.potential.partial_cmp(&b.potential).unwrap())
-            .map(|(i, _)| i);
+            .map(|(i, _)| i)
+    }
 
+    /// MILESTONE 48: the REAL winner-selection tasks.rs's timer-driven
+    /// preemptive scheduler runs on every tick. Walks eligible
+    /// (alive, above-threshold) slots pairwise against the current
+    /// best, using ternary.rs's `compare_trit` for a genuine three-way
+    /// decision instead of select_winner_binary's plain `>`: trit +1/-1
+    /// keep the clearly-larger candidate exactly like before, but trit
+    /// 0 (a real within-TIE_EPSILON tie, which plain float comparison
+    /// cannot even represent as a distinct outcome) is broken by a real
+    /// fairness rule -- the slot with FEWER total fires so far wins --
+    /// instead of max_by's arbitrary last-wins default. Returns the
+    /// winner plus whether a genuine tie was actually encountered and
+    /// decided this way.
+    fn select_winner_ternary(&self) -> (Option<usize>, bool) {
+        let mut best: Option<usize> = None;
+        let mut tie_used = false;
+        for i in 0..self.slots.len() {
+            if !self.slots[i].alive || self.slots[i].potential < self.threshold {
+                continue;
+            }
+            best = match best {
+                None => Some(i),
+                Some(b) => match crate::ternary::compare_trit(self.slots[i].potential, self.slots[b].potential, TIE_EPSILON) {
+                    1 => Some(i),
+                    -1 => Some(b),
+                    _ => {
+                        tie_used = true;
+                        if self.slots[i].fire_count < self.slots[b].fire_count {
+                            Some(i)
+                        } else {
+                            Some(b)
+                        }
+                    }
+                },
+            };
+        }
+        (best, tie_used)
+    }
+
+    /// Advances one tick using the REAL ternary winner-selection
+    /// (Milestone 48). Returns the id of the task-slot selected to run
+    /// this round, or None if nothing crossed threshold yet. This is
+    /// the function tasks.rs's timer_tick_switch() actually calls.
+    pub fn step(&mut self) -> Option<usize> {
+        self.accumulate();
+        let (winner, tie_used) = self.select_winner_ternary();
+        if tie_used {
+            self.ties_broken += 1;
+        }
+        if let Some(i) = winner {
+            self.slots[i].potential = 0.0;
+            self.slots[i].fire_count += 1;
+        }
+        winner
+    }
+
+    /// MILESTONE 48: identical to step() except winner-selection uses
+    /// select_winner_binary() -- the historical binary comparison --
+    /// instead of the real ternary path. Exists purely so main.rs's
+    /// boot-time trial can run the two selection policies side by side
+    /// over identical accumulated dynamics and report a real measured
+    /// difference, not an assumed one. Not called anywhere in the real
+    /// scheduling path (tasks.rs only ever calls step()).
+    pub fn step_binary(&mut self) -> Option<usize> {
+        self.accumulate();
+        let winner = self.select_winner_binary();
         if let Some(i) = winner {
             self.slots[i].potential = 0.0;
             self.slots[i].fire_count += 1;

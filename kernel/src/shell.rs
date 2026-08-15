@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -494,6 +494,40 @@ fn run_command(cmd: &str) {
                     "seedpipetest: wrote {len} real bytes to 'pipetest' on disk (a genuine ELF64 executable exercising pipe()/dup2(), not hand-assembled) -- try 'runelf pipetest'\n"
                 )),
                 Err(e) => crate::console::write_str(&format!("seedpipetest FAILED: {e}\n")),
+            }
+        }
+        "seedaltentry" => {
+            // MILESTONE 45: writes Milestone 44's staged, non-
+            // USER_CODE_ADDR-entry real ELF64 test executable
+            // (loader::ALTENTRY_TEST_ELF_BYTES) to a real file
+            // ("altentry") on the real on-disk filesystem -- same
+            // "genuine non-typeable bytes" reasoning as seedtestelf
+            // above. Also called directly, non-interactively, from
+            // kernel_main (process::self_test_real_exec()) -- this shell
+            // command exists so the SAME real exec() target can also be
+            // seeded/re-seeded interactively, e.g. to try `runexectest`
+            // again after a fresh boot without waiting on the self-test.
+            match crate::loader::seed_test_elf_altentry() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedaltentry: wrote {len} real bytes to 'altentry' on disk (a genuine ELF64 executable whose e_entry != USER_CODE_ADDR, not hand-assembled) -- try 'runexectest'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedaltentry FAILED: {e}\n")),
+            }
+        }
+        "runexectest" => {
+            // MILESTONE 45: runs EXEC_TEST_PROGRAM via process.rs's
+            // NINTH hardcoded process slot -- calls the real, rebuilt
+            // exec() syscall into "altentry" (seed with `seedaltentry`
+            // first). If real exec() works, the process's own address
+            // space is genuinely torn down and rebuilt mid-flight and
+            // execution resumes inside testelf_altentry.elf's own real,
+            // non-USER_CODE_ADDR entry point -- see serial log for the
+            // real "REAL teardown-and-rebuild complete" trace line.
+            match crate::process::run(crate::process::EXEC_TEST_PROCESS_ID) {
+                Ok(()) => crate::console::write_str(
+                    "runexectest: real exec() ran to completion -- see serial log for the real teardown-and-rebuild trace (new pml4, new real parsed entry point)\n",
+                ),
+                Err(e) => crate::console::write_str(&format!("runexectest FAILED: {e}\n")),
             }
         }
         "clear" => crate::console::clear_screen(),

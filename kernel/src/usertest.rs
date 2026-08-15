@@ -874,15 +874,39 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
             }
         }
         9 => {
-            // MILESTONE 37: exec(path_ptr, path_len) -- rdi=path_ptr,
-            // rsi=path_len, the same read-through-current-CR3 technique
-            // open() (syscall 3) already uses for its own path
-            // argument. On SUCCESS this call never reaches the bottom
-            // of this match arm at all -- exec_replace_and_enter()
-            // diverges (iretq's straight into the new program's entry),
-            // the same "never return, resume ring 3 directly" shape
-            // syscall 1 (exit) already established for resuming KERNEL
-            // context, applied here to resume RING-3 context instead.
+            // MILESTONE 37 (ABI) / MILESTONE 45 (real implementation):
+            // exec(path_ptr, path_len) -- rdi=path_ptr, rsi=path_len, the
+            // same read-through-current-CR3 technique open() (syscall 3)
+            // already uses for its own path argument -- the syscall's
+            // OWN calling convention is completely unchanged from
+            // Milestone 37. What runs underneath it is not: this reads
+            // the target file, parses it as a REAL ELF64 image
+            // (elf::parse(), the same parser `runelf` uses), and on a
+            // valid ELF hands it to process::exec_elf() -- the real
+            // teardown-and-rebuild implementation (see that function's
+            // own doc comment). On SUCCESS this call never reaches the
+            // bottom of this match arm at all -- exec_replace_and_enter()
+            // diverges (iretq's straight into the new program's real,
+            // parsed e_entry), the same "never return, resume ring 3
+            // directly" shape syscall 1 (exit) already established for
+            // resuming KERNEL context, applied here to resume RING-3
+            // context instead.
+            //
+            // MILESTONE 45, an honest, disclosed behavior change from
+            // Milestone 37: exec() now requires a real ELF64 image, the
+            // same format `runelf` has always required -- a flat,
+            // headerless binary (e.g. Milestone 34's `testprog`, built
+            // by `seedtestprog`) is no longer exec()-able; a real
+            // ELF64-vs-not check now runs where Milestone 37's own
+            // placeholder never checked the file's format at all (it
+            // just copied whatever bytes were there). This is the same
+            // real-world tradeoff execve() itself makes (ENOEXEC for a
+            // non-executable-format file) -- not a silently narrower
+            // feature, a genuinely stricter and more real one. Any
+            // caller relying on the old flat-binary target (e.g.
+            // FORK_TEST_PROGRAM's own child, which exec()s "testprog")
+            // now takes the SAME honest fallback path it already had for
+            // "file does not exist" -- degrades cleanly, does not crash.
             let path_ptr = regs.rdi;
             let requested_len = regs.rsi;
             let truncated = requested_len > MAX_PATH_LEN;
@@ -897,20 +921,30 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 }
                 match core::str::from_utf8(&path_bytes) {
                     Ok(path) => match crate::fs::read_file(path) {
-                        Ok(bytes) => match crate::process::exec_process(active, &bytes) {
-                            Ok(()) => {
-                                let _ = writeln!(
-                                    serial(),
-                                    "milestone 37: syscall EXEC (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- replaced code with '{path}' ({} real bytes read from the on-disk filesystem), jumping directly into the new program, never returning to the old one",
-                                    regs.cs,
-                                    bytes.len()
-                                );
-                                exec_replace_and_enter(USER_CODE_ADDR);
-                            }
+                        Ok(bytes) => match crate::elf::parse(&bytes) {
+                            Ok(elf_image) => match crate::process::exec_elf(active, &bytes, &elf_image) {
+                                Ok(new_entry) => {
+                                    let _ = writeln!(
+                                        serial(),
+                                        "milestone 45: syscall EXEC (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- REAL teardown-and-rebuild from '{path}' ({} real ELF bytes read from the on-disk filesystem), new address space, jumping directly into the real parsed entry {:#x}, never returning to the old one",
+                                        regs.cs,
+                                        bytes.len(),
+                                        new_entry
+                                    );
+                                    exec_replace_and_enter(new_entry);
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(
+                                        serial(),
+                                        "milestone 45: syscall EXEC (process {active}) -- FAILED, {e} -- returning u64::MAX, old program continues running"
+                                    );
+                                    regs.rax = u64::MAX;
+                                }
+                            },
                             Err(e) => {
                                 let _ = writeln!(
                                     serial(),
-                                    "milestone 37: syscall EXEC (process {active}) -- FAILED, {e} -- returning u64::MAX, old program continues running"
+                                    "milestone 45: syscall EXEC (process {active}) -- FAILED, '{path}' is not a valid ELF64 image ({e}) -- returning u64::MAX, old program continues running"
                                 );
                                 regs.rax = u64::MAX;
                             }
@@ -1390,14 +1424,21 @@ pub(crate) fn enter_ring3_as_forked_child(resume_rip: u64, resume_rsp: u64) {
 /// return, iretq directly" shape resume_kernel() already established
 /// for the exit syscall's "jump back to kernel" case, applied here to
 /// "jump into a NEWLY exec()'d program's entry" instead. This does NOT
-/// establish a new resume anchor because it doesn't need one: exec()
-/// replaces the CURRENTLY-running process's own code in place without
-/// changing which excursion (top-level or nested-child) is in flight --
+/// establish a new resume anchor because it doesn't need one: MILESTONE
+/// 45's real exec() replaces the CURRENTLY-running process's entire
+/// address space (new PML4, new physical frames, CR3 already switched
+/// by process::exec_elf() before this function is even called) without
+/// changing which EXCURSION (top-level or nested-child) is in flight --
 /// whichever anchor (KERNEL_RSP or CHILD_KERNEL_RSP) was already
 /// established when THIS process was originally entered is still the
 /// correct one for its EVENTUAL exit() (whenever the newly-exec()'d
 /// code calls it) to resume through, completely unaffected by exec()
-/// itself.
+/// itself -- that invariant held even under Milestone 37's old in-place
+/// code-frame-overwrite implementation, and still holds now that exec()
+/// genuinely tears down and rebuilds the address space instead: either
+/// way, it's the SAME process (same pid, same table slot), just with a
+/// new PML4/CR3 value and a new entry, and CR3/PML4 identity was never
+/// what KERNEL_RSP/CHILD_KERNEL_RSP anchor against in the first place.
 #[unsafe(naked)]
 unsafe extern "C" fn exec_into_ring3(_user_rsp: u64, _user_rip: u64, _user_cs: u64, _user_ss: u64, _rflags: u64) -> ! {
     core::arch::naked_asm!(
@@ -1410,17 +1451,21 @@ unsafe extern "C" fn exec_into_ring3(_user_rsp: u64, _user_rip: u64, _user_cs: u
     );
 }
 
-/// MILESTONE 37: the `exec()` syscall's own entry point into
-/// exec_into_ring3() -- called from syscall_dispatch's syscall-9 arm
-/// AFTER process::exec_process() has already replaced the process's own
-/// code frame contents, with `user_rip` = USER_CODE_ADDR (the new
-/// program's entry, exactly like every top-level process entry in this
-/// file already uses -- see this module's own MILESTONE 36 scoping note
-/// for why that address is fixed rather than dynamic). Always starts
+/// MILESTONE 37 (mechanism) / MILESTONE 45 (real caller): the `exec()`
+/// syscall's own entry point into exec_into_ring3() -- called from
+/// syscall_dispatch's syscall-9 arm AFTER process::exec_elf() has
+/// already torn down and rebuilt the process's ENTIRE address space
+/// (new PML4, new code/stack/heap frames, CR3 already switched) and
+/// returned the new program's REAL, parsed `e_entry` as `user_rip` --
+/// no longer hardcoded to USER_CODE_ADDR (that was Milestone 36's own
+/// deliberate, now-closed deferral -- Milestone 44 generalized
+/// `Process::entry`, and this is the first call site that ever hands
+/// this function a genuinely different value at runtime). Always starts
 /// the newly-exec()'d program at a FRESH top-of-stack (real exec()
 /// semantics: the old stack's contents are gone, replaced by the new
-/// program's own, exactly like a real process image replacement) rather
-/// than preserving whatever rsp value was in use before the exec() call.
+/// program's own private stack frame, exactly like a real process image
+/// replacement) rather than preserving whatever rsp value was in use
+/// before the exec() call.
 pub(crate) fn exec_replace_and_enter(user_rip: u64) -> ! {
     let user_cs = gdt::user_code_selector().0 as u64;
     let user_ss = gdt::user_data_selector().0 as u64;

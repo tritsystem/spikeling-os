@@ -415,6 +415,27 @@ pub fn seed_pipetest_elf() -> Result<usize, String> {
     Ok(len)
 }
 
+/// MILESTONE 45: the `seedaltentry` shell command's entry point --
+/// same reasoning as seed_pipetest_elf() above, writes ALTENTRY_TEST_ELF_
+/// BYTES (Milestone 44's staged, non-USER_CODE_ADDR-entry test payload,
+/// left unwired to any actual test until now) to the real on-disk
+/// filesystem at `process::EXEC_TEST_PATH` ("altentry"), the exact path
+/// process::EXEC_TEST_PROGRAM's own hand-assembled exec() call targets.
+/// Also called directly, non-interactively, from kernel_main (via
+/// process::self_test_real_exec()) so this milestone's own real exec()
+/// self-test needs no shell/keyboard interaction to have real content on
+/// disk to exec() into.
+pub fn seed_test_elf_altentry() -> Result<usize, String> {
+    let len = ALTENTRY_TEST_ELF_BYTES.len();
+    fs::write_file(crate::process::EXEC_TEST_PATH, ALTENTRY_TEST_ELF_BYTES).map_err(|e| format!("seedaltentry: {e}"))?;
+    let _ = writeln!(
+        serial(),
+        "milestone 45: seedaltentry -- wrote {len} real bytes (a genuine externally-built ELF64 executable whose e_entry does NOT equal USER_CODE_ADDR) to '{}' on the real on-disk filesystem",
+        crate::process::EXEC_TEST_PATH
+    );
+    Ok(len)
+}
+
 /// MILESTONE 36: writes TEST_ELF_BYTES to a real file ("testelf") on the
 /// real on-disk filesystem -- the `seedtestelf` shell command's entry
 /// point, mirroring seed_test_program()'s own reasoning above: this is

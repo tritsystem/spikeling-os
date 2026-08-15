@@ -314,6 +314,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(()) => writeln!(port, "milestone 43: WAITSTATUS_TEST_PROCESS private address space created").unwrap(),
         Err(e) => writeln!(port, "milestone 43: FAILED to create WAITSTATUS_TEST_PROCESS -- {e}").unwrap(),
     }
+    // MILESTONE 45: a ninth hardcoded process slot, used to verify the
+    // real, rebuilt exec() syscall non-interactively at boot -- same
+    // "frame_allocator/phys_mem_offset conveniently still in scope"
+    // reason as the others just above.
+    match process::init_exec_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 45: EXEC_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 45: FAILED to create EXEC_TEST_PROCESS -- {e}").unwrap(),
+    }
 
     // MILESTONE 34: real general program loader. `frame_allocator`'s
     // last boot-time consumer was process::init_test_processes just
@@ -345,6 +353,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // claims -- same "every boot's serial log carries direct proof"
     // reasoning as the self-tests just above.
     process::self_test_fork_test_program();
+    // MILESTONE 45: real, filesystem-independent proof that
+    // EXEC_TEST_PROGRAM's own byte layout matches what its doc comment
+    // claims -- same reasoning as the self-test just above.
+    process::self_test_exec_test_program();
     // Real, boot-time, non-interactive proof that fs::write_file()
     // actually reaches the disk -- every prior "verified" disk write in
     // this kernel's history relied on an interactive shell command
@@ -634,6 +646,80 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // RFLAGS.IF=1 the same way top-level entry does) -- must run after
     // init_pics()/enable() too, not before.
     process::self_test_wait_status();
+    // MILESTONE 45: same ordering requirement as self_test_signals()/
+    // self_test_wait_status() just above -- real ring-3 entry via
+    // process::run(EXEC_TEST_PROCESS_ID) sets RFLAGS.IF=1 immediately,
+    // same double-fault-avoidance reasoning, must run after
+    // init_pics()/enable(), not before. Seeds its own real ELF target
+    // to disk (loader::seed_test_elf_altentry()) internally, so no
+    // separate `seedaltentry` shell command is needed for this
+    // non-interactive boot-time proof.
+    process::self_test_real_exec();
+
+    // MILESTONE 45: a REAL, PRE-EXISTING bug found while verifying THIS
+    // milestone -- not introduced by it, confirmed by rebuilding and
+    // booting the unmodified pre-Milestone-45 kernel (commit a604426,
+    // via an isolated `git worktree`) and observing the IDENTICAL
+    // symptom with zero Milestone 45 code involved at all.
+    //
+    // Symptom: the boot's serial log always stopped dead at
+    // self_test_wait_status()'s own "OVERALL: PASS" line -- every
+    // single non-interactive boot, silently, for as long as
+    // self_test_signals() (Milestone 41) and self_test_wait_status()
+    // (Milestone 43) have existed. The kernel never panicked and QEMU
+    // never exited; `hlt()` genuinely never returned. Root-caused with a
+    // real QEMU `-d int` hardware trace (not guessed): after 15 real
+    // interrupts/exceptions (int3 breakpoint, page fault, and a dozen
+    // real `int 0x80` syscalls across SIGSEGV/SIGKILL/wait-status's own
+    // ring-3 excursions), NOT ONE MORE interrupt is ever serviced again
+    // -- not even the timer (IRQ0/vector 0x20), which had been firing
+    // every few hundred instructions throughout the trace up to that
+    // point. A CPU with RFLAGS.IF=0 cannot take a maskable interrupt at
+    // all, and `hlt()` with IF=0 blocks forever (only NMI, absent here,
+    // could ever wake it) -- exactly zero CPU time burned waiting,
+    // exactly matching the observed near-0% CPU usage during the "hang"
+    // (a real deadlocked busy-spin would instead peg a core at 100%).
+    //
+    // Real mechanism, traced through the actual code: `int 0x80`'s IDT
+    // gate is a genuine Interrupt Gate (x86_64 crate's own default,
+    // confirmed in its source -- interrupts.rs never opts out via
+    // `.disable_interrupts(false)`), so hardware clears IF=0 the instant
+    // ANY `int 0x80` is taken. Every ordinary syscall restores IF=1 for
+    // free on its own normal return (syscall_entry's own `iretq`, using
+    // the CPU's original hardware-pushed frame, whose saved RFLAGS still
+    // has IF=1 from ring 3). The exit syscall and the page-fault/SIGSEGV
+    // path are different: BOTH resume back into KERNEL context via
+    // `usertest::resume_kernel()`, which deliberately does a plain `ret`
+    // -- NO `iretq`, NO `sti` -- by design (see that function's own
+    // Milestone 27 doc comment: an unconditional `sti` there caused a
+    // real, previously-diagnosed deadlock when `run()` was called nested
+    // inside the keyboard ISR's own call chain, so `sti` was
+    // deliberately removed and left to whichever OUTER interrupt
+    // handler's own eventual `iretq` naturally restores IF -- which only
+    // exists if there IS one). Every subsequent `enter_ring3`-family
+    // call masks this for free too (its own iretq frame hardcodes
+    // RFLAGS=0x202, IF=1, unconditionally) -- so the gap is invisible
+    // AS LONG AS ANOTHER ring-3 excursion follows. Called from the
+    // INTERACTIVE shell (nested inside the keyboard ISR), this is
+    // exactly correct, by the original design. Called directly from
+    // `kernel_main()` -- true of EVERY non-interactive self-test in this
+    // block, and explicitly named as a SAFE case for `sti` in
+    // `resume_kernel()`'s own doc comment ("directly inside
+    // timer_interrupt_handler, or ordinary kernel_main code") -- there
+    // is no outer interrupt handler to restore it, so IF genuinely stays
+    // 0 forever after the LAST such excursion's exit/fault unwinds,
+    // silently disabling every interrupt (including the PIT) for the
+    // rest of this boot.
+    //
+    // Real, minimal, correctly-scoped fix: explicitly re-enable
+    // interrupts HERE, in kernel_main's own top-level, never-nested
+    // context -- not inside resume_kernel() itself (that would
+    // reintroduce the exact keyboard-ISR deadlock Milestone 27 already
+    // found and fixed). This is the ONE place downstream of every
+    // non-interactive ring-3 self-test and upstream of the first code
+    // that actually depends on interrupts being enabled (the timer-tick
+    // count below).
+    x86_64::instructions::interrupts::enable();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

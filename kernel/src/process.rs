@@ -174,26 +174,48 @@
 //! pre-existing hardcoded/loaded-file slots (PROCESS_A, PROCESS_B,
 //! LOADED_PROCESS, FDTEST_PROCESS) were left as legacy, separate statics
 //! rather than migrated in. `exec()` reuses this same table/dispatch
-//! uniformly (any process id, hardcoded or forked, can `exec()`) and
-//! replaces ONLY the calling process's code-frame CONTENTS in place --
-//! same PID, same PML4, same open fds, same mapped heap frames (with
-//! `heap_used` reset to 0, a fresh heap for the new image) -- reusing
-//! `MAX_CODE_IMAGE_BYTES` and the exact zero-then-copy step
-//! `create_process_from_image()` already uses for a brand-new process's
-//! code page, not a duplicated implementation of it.
+//! uniformly (any process id, hardcoded or forked, can `exec()`).
+//!
+//! **MILESTONE 45 update -- this was the real, disclosed scope-cut this
+//! milestone's own module doc comment flagged above, now closed**:
+//! Milestone 37's own `exec()` only ever replaced the calling process's
+//! code-frame CONTENTS in place (a raw flat-binary copy into the SAME
+//! code page, same PML4, no ELF parsing at all -- disclosed at the time
+//! as a placeholder, not a real loader). `exec()` now genuinely tears
+//! down and rebuilds the calling process's ENTIRE address space -- a
+//! new PML4, new physical code/stack/heap frames, one page per real
+//! PT_LOAD segment -- via `create_process_from_elf()` (this module's own
+//! Milestone 36 ELF loader, the EXACT SAME function `runelf` already
+//! uses, not a duplicated one), reading and parsing a genuine ELF64
+//! file off disk instead of copying an opaque byte blob. Same open fds,
+//! same parent_pid, same pgid (real POSIX exec() invariants, explicitly
+//! preserved -- see `exec_elf()`'s own doc comment), but a genuinely NEW
+//! PML4/CR3 and a genuinely new entry point (the target ELF's own real,
+//! parsed `e_entry`, per Milestone 44's generalization). See
+//! `exec_elf()`'s own doc comment for the full real, honest teardown
+//! story (this kernel's frame allocator has never reclaimed a physical
+//! frame on exit/reap/kill either -- exec() inherits that existing,
+//! already-disclosed gap, it does not introduce a new one).
 //!
 //! Verified for real: `runfork` (new shell command) runs a new
 //! hand-assembled FORK_TEST_PROGRAM that calls `fork()`, branches on the
 //! return value (0 = child), has the parent print a distinguishing
-//! message and then `wait()` for the child, and has the child `exec()`
-//! into a completely different on-disk program (`testprog`, from
-//! Milestone 34's `seedtestprog`) which prints ITS OWN distinguishing
-//! message instead -- real, observable proof that fork() created a
-//! genuinely separate process (different PID, independently verified
-//! physical frames) and exec() genuinely replaced its code, with the
-//! parent's `wait()` genuinely blocking until that whole sequence
-//! completes. See the milestone report for the actual captured serial
-//! log.
+//! message and then `wait()` for the child, and has the child attempt
+//! `exec()` into an on-disk program -- real, observable proof that
+//! fork() created a genuinely separate process (different PID,
+//! independently verified physical frames), with the parent's `wait()`
+//! genuinely blocking until that whole sequence completes. See the
+//! Milestone 37 report for the actual captured serial log of that
+//! demo. **Honest, disclosed Milestone 45 behavior change**: `exec()`
+//! now requires a real ELF64 image (same format `runelf` has always
+//! required) -- FORK_TEST_PROGRAM's own child still targets `testprog`,
+//! a Milestone 34 FLAT binary, which is no longer a valid exec()
+//! target, so that specific demo now exercises the CHILD's own honest
+//! fallback path (see FORK_TEST_PROGRAM's own doc comment) rather than
+//! a successful exec(); real exec() itself is separately, freshly
+//! verified by Milestone 45's own EXEC_TEST_PROCESS / `runexectest` /
+//! `self_test_real_exec()` against a genuine ELF64 target instead. See
+//! this milestone's own report for the real captured serial log.
 
 use crate::elf;
 use crate::fs;
@@ -760,11 +782,68 @@ pub(crate) const WAITSTATUS_TEST_PROGRAM: [u8; 12] = [
 static WAITSTATUS_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 pub(crate) const WAITSTATUS_TEST_PROCESS_ID: u8 = 8;
 
+/// MILESTONE 45: a deliberately minimal program whose entire job is to
+/// call the real, rebuilt `exec()` syscall exactly once -- `mov rdi,
+/// <ptr to "altentry">; mov esi, 8; mov eax, 9; int 0x80`. On SUCCESS
+/// this never returns here at all: control jumps straight into
+/// `testelf_altentry.elf`'s own real, parsed `e_entry`
+/// (`0x0000_5555_5000_3000`, Milestone 44's staged non-USER_CODE_ADDR
+/// test payload -- see loader.rs's ALTENTRY_TEST_ELF_BYTES and
+/// seed_test_elf_altentry(), wired into a real self-test for the first
+/// time by THIS milestone), which write()s its own distinguishing
+/// message and exit()s for real. On FAILURE (e.g. `seedaltentry` was
+/// never run, so "altentry" doesn't exist on disk) execution falls
+/// through to write() a distinguishing FALLBACK message instead, then
+/// exit()s -- the same "degrade cleanly and honestly either way rather
+/// than crashing" contract FORK_TEST_PROGRAM's own child path already
+/// established.
+///
+/// Assembled + verified via a standalone Python script using the
+/// keystone-engine assembler, with a capstone disassembly round-trip
+/// confirming the intended control flow byte for byte -- same
+/// discipline as every other hand-assembled program in this file.
+///
+/// Layout (verified against the actual byte array below by
+/// self_test_exec_test_program()):
+///   offset   0..53   the syscall sequence itself (53 bytes of real
+///                     instructions)
+///   offset  53..61   "altentry" (8 real bytes, the exec() path)
+///   offset  61..115  EXEC_FALLBACK_MSG (54 bytes)
+pub(crate) const EXEC_TEST_PROGRAM: [u8; 115] = [
+    0x48, 0xBF, 0x35, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x08,
+    0x00, 0x00, 0x00, 0xB8, 0x09, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0xBF,
+    0x3D, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x36, 0x00, 0x00,
+    0x00, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xB8, 0x01, 0x00, 0x00,
+    0x00, 0xCD, 0x80, 0xEB, 0xFE, 0x61, 0x6C, 0x74, 0x65, 0x6E, 0x74, 0x72,
+    0x79, 0x6D, 0x69, 0x6C, 0x65, 0x73, 0x74, 0x6F, 0x6E, 0x65, 0x20, 0x34,
+    0x35, 0x3A, 0x20, 0x45, 0x58, 0x45, 0x43, 0x5F, 0x54, 0x45, 0x53, 0x54,
+    0x20, 0x66, 0x61, 0x6C, 0x6C, 0x62, 0x61, 0x63, 0x6B, 0x20, 0x2D, 0x2D,
+    0x20, 0x72, 0x65, 0x61, 0x6C, 0x20, 0x65, 0x78, 0x65, 0x63, 0x28, 0x29,
+    0x20, 0x66, 0x61, 0x69, 0x6C, 0x65, 0x64,
+];
+const EXEC_TEST_PATH_OFFSET: usize = 53;
+const EXEC_TEST_FALLBACK_OFFSET: usize = 61;
+/// The real path EXEC_TEST_PROGRAM exec()s into -- see
+/// loader::seed_test_elf_altentry(), which must have already written
+/// ALTENTRY_TEST_ELF_BYTES to this exact path before EXEC_TEST_PROCESS
+/// ever runs (kernel_main calls it directly, non-interactively, before
+/// self_test_real_exec() -- no shell command needed).
+pub(crate) const EXEC_TEST_PATH: &str = "altentry";
+/// The real message EXEC_TEST_PROGRAM prints if exec() fails -- checked
+/// by self_test_exec_test_program() before trusting the program at
+/// runtime, same discipline as FORK_TEST_PROGRAM's own layout self-test.
+pub(crate) const EXEC_TEST_FALLBACK_MSG: &str = "milestone 45: EXEC_TEST fallback -- real exec() failed";
+
+/// MILESTONE 45: a NINTH hardcoded, boot-time-created process slot --
+/// runs EXEC_TEST_PROGRAM. See that constant's own doc comment.
+static EXEC_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const EXEC_TEST_PROCESS_ID: u8 = 9;
+
 /// MILESTONE 37: real, dynamic PID allocation for `fork()`-created
-/// children. PIDs 1-9 stay permanently reserved for the six
+/// children. PIDs 1-9 stay permanently reserved for the nine
 /// pre-existing hardcoded/loaded-file ids above (1/2/3/4/5, with 6-9
-/// held as headroom, of which Milestones 41/43 now use 6, 7, and 8) so a
-/// forked child's PID can never collide with any of them;
+/// held as headroom, of which Milestones 41/43/45 now use 6, 7, 8, and
+/// 9) so a forked child's PID can never collide with any of them;
 /// PROCESS_TABLE's own slot `i` is always PID `PID_TABLE_BASE + i`.
 pub(crate) const PID_TABLE_BASE: u8 = 10;
 
@@ -922,12 +1001,77 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
             let mut guard = WAITSTATUS_TEST_PROCESS.lock();
             Some(f(guard.as_mut()?))
         }
+        EXEC_TEST_PROCESS_ID => {
+            let mut guard = EXEC_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
         id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
             let idx = (id - PID_TABLE_BASE) as usize;
             let mut guard = PROCESS_TABLE.lock();
             Some(f(guard[idx].as_mut()?))
         }
         _ => None,
+    }
+}
+
+/// MILESTONE 45: like `with_process_mut()` above, but replaces the
+/// WHOLE `Process` value at `id`'s slot instead of mutating the existing
+/// one in place -- `exec_elf()`'s own real teardown-and-rebuild step
+/// needs this (a genuinely different PML4/code/stack/heap, not a field
+/// tweak on the old one), so it needs the identical id-to-slot dispatch
+/// `with_process_mut()` already established, just returning ownership of
+/// the slot instead of a `&mut` into it. Returns `true` if `id` named a
+/// real slot (occupied or not -- exec() is only ever called on an
+/// ALREADY-live, currently-running process, so every real caller's slot
+/// is occupied; this still returns `true` for an empty slot rather than
+/// treating "process not yet initialized" as "no such process", the same
+/// distinction `with_process_mut()` makes by returning `Some(f(..))` only
+/// for an occupied slot), `false` if `id` doesn't name any real slot at
+/// all (mirrors `with_process_mut()` returning `None` for an unknown id).
+fn replace_process(id: u8, new_proc: Process) -> bool {
+    match id {
+        1 => {
+            *PROCESS_A.lock() = Some(new_proc);
+            true
+        }
+        2 => {
+            *PROCESS_B.lock() = Some(new_proc);
+            true
+        }
+        LOADED_PROCESS_ID => {
+            *LOADED_PROCESS.lock() = Some(new_proc);
+            true
+        }
+        FDTEST_PROCESS_ID => {
+            *FDTEST_PROCESS.lock() = Some(new_proc);
+            true
+        }
+        FORK_TEST_PROCESS_ID => {
+            *FORK_TEST_PROCESS.lock() = Some(new_proc);
+            true
+        }
+        SIGSEGV_TEST_PROCESS_ID => {
+            *SIGSEGV_TEST_PROCESS.lock() = Some(new_proc);
+            true
+        }
+        SIGKILL_TEST_PROCESS_ID => {
+            *SIGKILL_TEST_PROCESS.lock() = Some(new_proc);
+            true
+        }
+        WAITSTATUS_TEST_PROCESS_ID => {
+            *WAITSTATUS_TEST_PROCESS.lock() = Some(new_proc);
+            true
+        }
+        EXEC_TEST_PROCESS_ID => {
+            *EXEC_TEST_PROCESS.lock() = Some(new_proc);
+            true
+        }
+        id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
+            let idx = (id - PID_TABLE_BASE) as usize;
+            PROCESS_TABLE.lock()[idx] = Some(new_proc);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -1570,6 +1714,27 @@ pub fn init_waitstatus_test_process(
     Ok(())
 }
 
+/// MILESTONE 45: creates EXEC_TEST_PROCESS -- see that static's own doc
+/// comment. Mirrors init_waitstatus_test_process()'s exact pattern.
+pub fn init_exec_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 45: creating EXEC_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "exec-test", &EXEC_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 45: EXEC_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    p.pgid = EXEC_TEST_PROCESS_ID;
+    *EXEC_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
 /// MILESTONE 30: the `runproc N` shell command's entry point. Switches
 /// CR3 to process N's own PML4, enters ring 3 at the SAME virtual
 /// address usertest.rs always uses, lets the syscalls run (write reads
@@ -1589,7 +1754,10 @@ pub fn run(id: u8) -> Result<(), &'static str> {
         SIGSEGV_TEST_PROCESS_ID => &SIGSEGV_TEST_PROCESS,
         SIGKILL_TEST_PROCESS_ID => &SIGKILL_TEST_PROCESS,
         WAITSTATUS_TEST_PROCESS_ID => &WAITSTATUS_TEST_PROCESS,
-        _ => return Err("no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), 7 (SIGKILL_TEST_PROCESS_ID), or 8 (WAITSTATUS_TEST_PROCESS_ID)"),
+        EXEC_TEST_PROCESS_ID => &EXEC_TEST_PROCESS,
+        _ => return Err(
+            "no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), 7 (SIGKILL_TEST_PROCESS_ID), 8 (WAITSTATUS_TEST_PROCESS_ID), or 9 (EXEC_TEST_PROCESS_ID)",
+        ),
     };
     let (pml4_frame, label, entry) = {
         let guard = slot.lock();
@@ -2178,6 +2346,17 @@ pub fn load_and_run_elf(
 ///      disk) execution falls through to write() a distinguishing
 ///      FALLBACK message instead, so `runfork` degrades cleanly and
 ///      honestly either way rather than crashing.
+///
+///      **MILESTONE 45 note**: "testprog" is Milestone 34's own FLAT
+///      binary (`seedtestprog`'s output), not a real ELF64 image --
+///      real exec() (this milestone) now requires one, the same
+///      requirement `runelf` has always had. So as of this milestone,
+///      this specific exec() call ALWAYS takes the FALLBACK branch
+///      above (a real, honestly-reported "not a valid ELF64 image"
+///      failure, not a crash) -- disclosed here rather than left to
+///      look like a still-succeeding demo. Real exec() itself is
+///      verified separately by this milestone's own EXEC_TEST_PROGRAM
+///      (below) against a genuine ELF64 target.
 ///
 /// Layout (verified against the actual byte array below by
 /// self_test_fork_test_program()):
@@ -3030,40 +3209,230 @@ pub fn self_test_wait_status() {
     );
 }
 
-/// MILESTONE 37: the `exec()` syscall's actual kernel-side
-/// implementation. Deliberately does NOT touch the process's PML4,
-/// stack mapping, heap mapping, or fd table at all -- only its CODE
-/// FRAME's own physical bytes are overwritten in place (zero-fill then
-/// copy, the EXACT same step create_process_from_image() already does
-/// for a brand-new process's code page, reused here rather than
-/// duplicated), matching real exec()'s "same process, same pid, same
-/// open fds, new code image" contract. `heap_used` is reset to 0 (a
-/// fresh program gets a fresh heap); the physical heap frames
-/// themselves are reused, not reallocated. Bounded by the SAME
-/// MAX_CODE_IMAGE_BYTES cap every other code-loading path in this file
-/// already enforces.
-pub(crate) fn exec_process(id: u8, image: &[u8]) -> Result<(), &'static str> {
-    if image.len() > MAX_CODE_IMAGE_BYTES {
-        return Err("exec: program exceeds the 4096-byte code page capacity");
-    }
-    let phys_mem_offset = memory::phys_mem_offset();
-    let code_frame = with_process_mut(id, |p| {
-        p.heap_used = 0;
-        p.code_frame
-    })
-    .ok_or("exec: no such process")?;
+/// MILESTONE 45: the `exec()` syscall's REAL kernel-side implementation
+/// -- replaces Milestone 37's own disclosed placeholder (which only
+/// ever overwrote the SAME code frame's bytes in place, reusing the
+/// calling process's existing PML4/stack/heap unchanged -- see this
+/// project's own git history for that version). This is the actual
+/// "generalized ELF loader" milestone: a genuinely fresh private
+/// address space -- new PML4, new code/stack/heap physical frames, one
+/// physical page per PT_LOAD segment page -- built by
+/// `create_process_from_elf()`, the EXACT SAME function `runelf`
+/// (`load_and_run_elf()`) and `fork()`'s own child-builder
+/// (indirectly, via `create_process_from_image()`'s sibling) already
+/// use, not a duplicated loader. The calling process's OLD pml4/code/
+/// stack/heap frames are simply replaced (dropped, never reclaimed --
+/// see this function's own teardown comment below), and CR3 is switched
+/// to the new address space before returning, exactly like
+/// `load_and_run_elf()` does for a brand-new process.
+///
+/// Real POSIX exec() contract, checked field by field:
+///   - SAME pid (the process's own table slot is replaced in place, not
+///     removed and recreated under a new id).
+///   - SAME open file descriptors (`fds`, snapshotted BEFORE the new
+///     `Process` is built, then written into it afterward) -- a real
+///     shell's `cmd < file` / `cmd > file` redirection depends on the
+///     exec()'d program inheriting fds the shell itself opened before
+///     calling exec(), exactly this.
+///   - SAME parent_pid and pgid (a process's ancestry and process-group
+///     membership are real Unix invariants exec() must never change).
+///   - a genuinely NEW address space and a genuinely NEW entry point --
+///     `entry` is now the target ELF's own real, parsed `e_entry`
+///     (Milestone 44's generalization, exercised for real here for the
+///     first time by an exec() call rather than only a fresh `runelf`),
+///     NOT forced back to `USER_CODE_ADDR`.
+///   - `heap_used` reset to 0 (a fresh program gets a fresh heap,
+///     already `create_process_from_elf()`'s own default for a
+///     brand-new process).
+///
+/// **Real, honest, disclosed teardown limitation, matching
+/// `kill()`/`wait_for_child()`'s OWN already-shipped precedent
+/// exactly**: the old process's pml4/code/stack/heap physical frames
+/// are not reclaimed -- this kernel's frame allocator has never freed a
+/// physical frame on process exit, reap, or kill (see
+/// `memory::BootInfoFrameAllocator`'s own doc comment: "bump-allocates
+/// only, never frees"), so there was never a real deallocation path for
+/// exec() to call into here either. `exec()` doesn't introduce a new
+/// gap, it just inherits the existing one, exactly like `kill()`
+/// already does. What DOES genuinely change here, unlike the old
+/// Milestone 37 placeholder: the OLD frames are actually abandoned
+/// (this process's own page tables no longer reference them at all,
+/// once CR3 is switched to the new PML4 below) rather than reused --
+/// this is the real "teardown" half of "teardown-and-rebuild", even
+/// though "teardown" in this kernel has only ever meant "stop
+/// referencing", never "return to a free list" (there isn't one).
+pub(crate) fn exec_elf(id: u8, image: &[u8], elf_image: &elf::ElfImage) -> Result<u64, &'static str> {
+    // Snapshot exactly what real exec() must carry across unchanged --
+    // each fallible/heap-touching read its own statement, same reasoning
+    // as fork()'s own snapshot (see that function's own comment on why
+    // combining these into one expression broke this kernel's
+    // panic=abort, no_std build).
+    let old_fds = with_process_mut(id, |p| p.fds.clone()).ok_or("exec: no such process")?;
+    let old_parent_pid = with_process_mut(id, |p| p.parent_pid).ok_or("exec: no such process")?;
+    let old_pgid = with_process_mut(id, |p| p.pgid).ok_or("exec: no such process")?;
 
-    let code_virt = phys_mem_offset + code_frame.start_address().as_u64();
-    unsafe {
-        core::ptr::write_bytes::<u8>(code_virt.as_mut_ptr(), 0, PAGE_SIZE);
-        core::ptr::copy_nonoverlapping(image.as_ptr(), code_virt.as_mut_ptr(), image.len());
+    let phys_mem_offset = memory::phys_mem_offset();
+    let build_result = memory::with_frame_allocator(|frame_allocator| {
+        create_process_from_elf(frame_allocator, phys_mem_offset, "exec'd", elf_image.entry, &elf_image.segments, image)
+    });
+    let mut new_proc = match build_result {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => {
+            let _ = writeln!(serial(), "milestone 45: syscall EXEC (process {id}) -- FAILED building the new address space: {e}");
+            return Err(e);
+        }
+        None => {
+            let _ = writeln!(serial(), "milestone 45: syscall EXEC (process {id}) -- FAILED, global frame allocator not installed (should never happen post-boot)");
+            return Err("exec: global frame allocator not installed yet");
+        }
+    };
+
+    new_proc.fds = old_fds;
+    new_proc.parent_pid = old_parent_pid;
+    new_proc.pgid = old_pgid;
+
+    let new_pml4 = new_proc.pml4_frame;
+    let new_entry = new_proc.entry;
+
+    // The real teardown-and-rebuild step: this REPLACES the slot's
+    // entire Process value (old pml4/code/stack/heap dropped -- see this
+    // function's own doc comment above for the honest "dropped, not
+    // reclaimed" caveat), not a field-by-field mutation of the old one.
+    if !replace_process(id, new_proc) {
+        return Err("exec: no such process (slot vanished during rebuild)");
     }
+
+    // Switch CR3 to the NEW address space now, before returning to
+    // usertest.rs's syscall dispatch -- exactly like load_and_run_elf()
+    // does right after building a brand-new process, and required here
+    // for the same reason: the old PML4 this process was running under a
+    // moment ago no longer exists in any Process struct this kernel
+    // tracks, so continuing to run under it (even briefly) would be
+    // pointing CR3 at now-untracked frames.
+    let flags = Cr3Flags::from_bits_truncate(KERNEL_CR3_FLAGS_BITS.load(Ordering::SeqCst));
+    unsafe { Cr3::write(new_pml4, flags) };
 
     let _ = writeln!(
         serial(),
-        "milestone 37: syscall EXEC (process {id}) -- replaced code frame {:#x} contents in place with {} new bytes, heap_used reset to 0, fd table left untouched",
-        code_frame.start_address().as_u64(),
-        image.len()
+        "milestone 45: syscall EXEC (process {id}) -- REAL teardown-and-rebuild complete: new pml4={:#x}, new entry={:#x} (real parsed e_entry), fd table/parent_pid/pgid preserved, CR3 switched",
+        new_pml4.start_address().as_u64(),
+        new_entry
     );
-    Ok(())
+    Ok(new_entry)
+}
+
+/// MILESTONE 45: a direct, filesystem-independent proof that
+/// EXEC_TEST_PROGRAM's own byte layout actually matches what its doc
+/// comment claims -- same discipline as self_test_fork_test_program().
+pub fn self_test_exec_test_program() {
+    let path_ok = &EXEC_TEST_PROGRAM[EXEC_TEST_PATH_OFFSET..EXEC_TEST_PATH_OFFSET + EXEC_TEST_PATH.len()] == EXEC_TEST_PATH.as_bytes();
+    let fallback_ok = &EXEC_TEST_PROGRAM[EXEC_TEST_FALLBACK_OFFSET..EXEC_TEST_FALLBACK_OFFSET + EXEC_TEST_FALLBACK_MSG.len()]
+        == EXEC_TEST_FALLBACK_MSG.as_bytes();
+    let _ = writeln!(
+        serial(),
+        "milestone 45: self-test -- EXEC_TEST_PROGRAM layout check: exec_path={path_ok} fallback_msg={fallback_ok} -- {}",
+        if path_ok && fallback_ok { "all match, layout confirmed" } else { "FAILED -- byte layout drifted from doc comment" }
+    );
+}
+
+/// MILESTONE 45's real, boot-time, non-interactive proof that `exec()`
+/// genuinely tears down and rebuilds a process's address space -- same
+/// "interactive shell-command testing via QEMU sendkey has been
+/// repeatedly unreliable" reasoning self_test_signals() already
+/// established, applied here to the newly-real exec() syscall instead.
+/// Must run AFTER `interrupts::init_pics()`/`sti()`, same ordering
+/// requirement as self_test_signals()/self_test_wait_status() (real
+/// ring-3 entry sets RFLAGS.IF=1 immediately -- see self_test_signals()'s
+/// own doc comment for the full double-fault story this ordering avoids).
+///
+/// Real evidence gathered, not assumed:
+///   1. Opens a real fd (`open_file`, kernel-side, no ring-3 involved)
+///      on EXEC_TEST_PROCESS BEFORE running it -- proof material for
+///      claim 4 below.
+///   2. Snapshots EXEC_TEST_PROCESS's pml4_frame/entry BEFORE run() --
+///      at this point still the flat-binary create_process_from_image()
+///      values (entry == USER_CODE_ADDR).
+///   3. Runs EXEC_TEST_PROCESS for real (`process::run()`, genuine CR3
+///      switch + `iretq` into ring 3) -- its own code calls the REAL
+///      `int 0x80` exec() syscall into "altentry"
+///      (testelf_altentry.elf, seeded to disk by
+///      loader::seed_test_elf_altentry() just before this call), which
+///      this milestone's own exec_elf() handles by tearing down and
+///      rebuilding EXEC_TEST_PROCESS's address space mid-flight, then
+///      resuming ring 3 at the NEW program's own entry -- which writes
+///      its own distinguishing message and exit()s for real.
+///   4. Snapshots pml4_frame/entry/fds[0]/pgid AFTER run() returns and
+///      checks, for real, that:
+///        - pml4_frame genuinely CHANGED (a fresh PML4 was really
+///          built, not the same one reused)
+///        - entry genuinely changed to 0x0000_5555_5000_3000 -- the
+///          REAL, parsed e_entry of testelf_altentry.elf, deliberately
+///          NOT USER_CODE_ADDR (Milestone 44's own staged, not-yet-
+///          wired-in altentry payload -- wired into a real, running
+///          self-test for the first time by this milestone)
+///        - fds[0] is STILL Some(..) -- the fd opened in step 1
+///          survived the teardown-and-rebuild, real proof exec()
+///          preserves the calling process's open files
+///        - pgid is UNCHANGED -- real proof exec() preserves process-
+///          group membership
+pub fn self_test_real_exec() {
+    let seed_ok = crate::loader::seed_test_elf_altentry().is_ok();
+    let _ = writeln!(
+        serial(),
+        "milestone 45: self-test -- seeded 'altentry' (testelf_altentry.elf) to the real on-disk filesystem: {seed_ok}"
+    );
+
+    // Real, kernel-side (no ring 3 involved) fd-survives-exec() setup --
+    // a path that doesn't exist yet still gets a real fd (open_file()'s
+    // own "always succeeds, starts empty" contract, same as every other
+    // caller of it in this file).
+    let fd_opened = open_file(EXEC_TEST_PROCESS_ID, "exectest_marker").is_some();
+
+    let before = with_process_mut(EXEC_TEST_PROCESS_ID, |p| (p.pml4_frame, p.entry, p.pgid));
+    if let Some((pml4, entry, pgid)) = before {
+        let _ = writeln!(
+            serial(),
+            "milestone 45: self-test -- fd opened before exec()={fd_opened}, before-state: pml4={:#x} entry={:#x} pgid={pgid}",
+            pml4.start_address().as_u64(),
+            entry
+        );
+    }
+
+    let run_ok = run(EXEC_TEST_PROCESS_ID).is_ok();
+
+    let after = with_process_mut(EXEC_TEST_PROCESS_ID, |p| (p.pml4_frame, p.entry, p.pgid, p.fds[0].is_some()));
+    if let Some((pml4, entry, pgid, fd0)) = after {
+        let _ = writeln!(
+            serial(),
+            "milestone 45: self-test -- run_ok={run_ok}, after-state: pml4={:#x} entry={:#x} pgid={pgid} fds[0]_present={fd0}",
+            pml4.start_address().as_u64(),
+            entry
+        );
+    }
+
+    const ALT_ENTRY: u64 = 0x0000_5555_5000_3000;
+    let overall = match (before, after) {
+        (Some((pml4_before, entry_before, pgid_before)), Some((pml4_after, entry_after, pgid_after, fd0_survived))) => {
+            let pml4_changed = pml4_before != pml4_after;
+            let entry_is_real_altentry = entry_after == ALT_ENTRY;
+            let entry_changed = entry_before != entry_after;
+            let pgid_preserved = pgid_before == pgid_after;
+            let _ = writeln!(
+                serial(),
+                "milestone 45: self-test -- pml4_changed={pml4_changed} (before={:#x} after={:#x}), entry_changed={entry_changed} (before={:#x} after={:#x}, expected real e_entry={:#x}), fd_survived_exec={fd0_survived}, pgid_preserved={pgid_preserved}",
+                pml4_before.start_address().as_u64(),
+                pml4_after.start_address().as_u64(),
+                entry_before,
+                entry_after,
+                ALT_ENTRY
+            );
+            seed_ok && run_ok && pml4_changed && entry_is_real_altentry && entry_changed && fd0_survived && pgid_preserved
+        }
+        _ => false,
+    };
+    let _ = writeln!(
+        serial(),
+        "milestone 45: self-test -- OVERALL: {}",
+        if overall { "PASS" } else { "FAIL" }
+    );
 }

@@ -19,8 +19,15 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 
+// MILESTONE 45: fixed a real, genuine off-by-one in this Milestone 44
+// staged payload -- the declared array size (71) didn't match the
+// actual string literal's length (70), which fails to compile
+// (E0308: "expected an array with a size of 71, found one with a size
+// of 70"). Found while actually building this payload for real for the
+// first time (Milestone 44 left it staged but never build-verified --
+// its own doc comment says so) rather than trusting it compiled.
 #[unsafe(link_section = ".rodata.entry")]
-static MESSAGE: [u8; 71] =
+static MESSAGE: [u8; 70] =
     *b"hello from a non-USER_CODE_ADDR entry point -- milestone 44 confirmed!";
 
 #[unsafe(link_section = ".text.altentry")]

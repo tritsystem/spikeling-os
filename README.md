@@ -1661,6 +1661,52 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       and a fresh QEMU boot on the merged tree (persist disk attached):
       milestones 42/43/44/45/53 all self-report `OVERALL: PASS`, zero
       panics, boot reaches the interactive shell normally.
+- [x] **Milestone 54**: real physical frame reclamation on process
+      teardown. Closes `memory.rs`'s own disclosed "bump-allocates only,
+      never frees" limitation -- `BootInfoFrameAllocator` gains a real
+      LIFO free list, checked before ever bumping `next` further;
+      `reclaim_process_frames()` returns a dead process's frames to it,
+      wired into `kill()`, both `wait_for_child()` reap paths, and
+      `replace_process()` (`exec()`'s teardown-and-rebuild step) --
+      closing the identical gap each of those three had separately
+      disclosed since Milestones 37/41/45. Also reclaims the PRIVATE
+      P3/P2/P1 page-table frames `map_to()` allocates on demand while
+      building a process's address space, found missing only by actually
+      running the self-test on real hardware, not by inspection: a
+      second forked child needed more real physical frames than the
+      leaf-only version (pml4/code/stack/heap) had freed.
+      This self-test earned its own honest, undisclosed-nowhere-else
+      history: three real failures in sequence on three separate QEMU
+      boots, each one a genuine finding, none hidden or quietly patched
+      over --
+      (1) hardcoded "+3 frames," wrong: `fork()` eagerly maps a private
+      4-page heap for every child, not lazily via `sbrk()`, so the real
+      leaf count is 7;
+      (2) leaf count fixed, but asserted a second fork() reused the
+      exact freed frame SET -- wrong again: `map_to()` allocates its own
+      private P3/P2/P1 table frames on demand, which the leaf-only
+      reclaim never freed, so a second process needs strictly more real
+      frames than 7;
+      (3) page-table reclaim implemented and independently count-
+      verified via a read-only walk (`count_private_page_tables()`,
+      deliberately kept separate from the freeing walker so the test
+      isn't just trusting the code path it exists to check), but STILL
+      asserted the second fork()'s LEAF frames matched the freed LEAF
+      set specifically -- wrong a third time: leaf and page-table
+      `allocate_frame()` calls are interleaved during construction (pml4,
+      code, stack, then on-demand P3/P2/P1, then each heap page followed
+      immediately by its own `map_to()`), so the LIFO free list's pop
+      order doesn't hand leaf frames back to the leaf fields alone.
+      Final, actually-passing design tests the TOTAL instead: a second,
+      symmetric fork() from the same source independently re-derives the
+      identical real frame cost (proving determinism, not assumed) and
+      drains the free list to exactly zero building itself -- simpler
+      than field-level address matching and strictly stronger proof of
+      real reuse. Re-verified end to end on the merged `main` after a
+      clean fast-forward merge: fresh build, fresh QEMU boot with the
+      persist disk attached, milestones 42/43/44/45/53/54 all
+      self-report `OVERALL: PASS`, zero panics, boot reaches the
+      interactive shell normally.
 
 ## Building and running
 

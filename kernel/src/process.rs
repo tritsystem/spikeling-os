@@ -839,13 +839,43 @@ pub(crate) const EXEC_TEST_FALLBACK_MSG: &str = "milestone 45: EXEC_TEST fallbac
 static EXEC_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 pub(crate) const EXEC_TEST_PROCESS_ID: u8 = 9;
 
+/// MILESTONE 53: a deliberately minimal program whose ENTIRE body
+/// dereferences a definitely-unmapped address -- same unmapped target
+/// (0x0000_1234_5678_0000) M41's own SIGSEGV_TEST_PROGRAM already uses,
+/// deliberately reused rather than picked fresh: it's already proven
+/// unmapped by that milestone's own self-test. Unlike SIGSEGV_TEST_
+/// PROGRAM, this one skips the write-a-message-first preamble entirely
+/// (WAITSTATUS_TEST_PROGRAM's own "deterministic, nothing-else-going-on"
+/// reasoning applies here too) -- this program exists purely as a
+/// fork() SOURCE for self_test_fault_status() below, so the forked
+/// CHILD resumed from offset 0 faults on literally its first
+/// instruction, with no ambiguity about what ran before it.
+///
+///   offset  bytes                                    instruction
+///    0      48 BB 00 00 78 56 34 12 00 00             mov rbx, imm64   (0x0000_1234_5678_0000, unmapped)
+///   10      48 8B 03                                  mov rax, [rbx]   -- FAULTS HERE
+///   13      EB FE                                     jmp $            (unreachable safety net)
+pub(crate) const FAULT_TEST_PROGRAM: [u8; 15] = [
+    0x48, 0xBB, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x48, 0x8B, 0x03, 0xEB, 0xFE,
+];
+
+/// MILESTONE 53: a TENTH hardcoded, boot-time-created process slot --
+/// runs FAULT_TEST_PROGRAM. See that constant's own doc comment; mirrors
+/// WAITSTATUS_TEST_PROCESS's own "never run() directly, exists purely as
+/// a fork() source" pattern exactly. PID 10 (not 9 -- this branch was
+/// started before Milestone 45 claimed 9 for EXEC_TEST_PROCESS_ID; real
+/// collision found and resolved at merge time, not by original design).
+static FAULT_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const FAULT_TEST_PROCESS_ID: u8 = 10;
+
 /// MILESTONE 37: real, dynamic PID allocation for `fork()`-created
-/// children. PIDs 1-9 stay permanently reserved for the nine
-/// pre-existing hardcoded/loaded-file ids above (1/2/3/4/5, with 6-9
-/// held as headroom, of which Milestones 41/43/45 now use 6, 7, 8, and
-/// 9) so a forked child's PID can never collide with any of them;
-/// PROCESS_TABLE's own slot `i` is always PID `PID_TABLE_BASE + i`.
-pub(crate) const PID_TABLE_BASE: u8 = 10;
+/// children. PIDs 1-10 stay permanently reserved for the ten
+/// pre-existing hardcoded/loaded-file ids above (1/2/3/4/5, with 6-10 now
+/// ALL used: Milestones 41/43/45/53 claim 6, 7, 8, 9, and 10 respectively
+/// -- no more headroom left in this range) so a forked child's PID can
+/// never collide with any of them; PROCESS_TABLE's own slot `i` is
+/// always PID `PID_TABLE_BASE + i`.
+pub(crate) const PID_TABLE_BASE: u8 = 11;
 
 /// MILESTONE 37: real, honest, small bound on concurrently-live forked
 /// processes -- same "small fixed cap, not full generality" spirit as
@@ -1022,6 +1052,10 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
         }
         EXEC_TEST_PROCESS_ID => {
             let mut guard = EXEC_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        FAULT_TEST_PROCESS_ID => {
+            let mut guard = FAULT_TEST_PROCESS.lock();
             Some(f(guard.as_mut()?))
         }
         id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
@@ -1754,6 +1788,29 @@ pub fn init_exec_test_process(
     Ok(())
 }
 
+/// MILESTONE 53: creates FAULT_TEST_PROCESS -- see that static's own
+/// doc comment. Mirrors init_waitstatus_test_process()'s exact pattern:
+/// never `run()` directly as a top-level process, exists purely as a
+/// fork() SOURCE for self_test_fault_status() below.
+pub fn init_fault_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 53: creating FAULT_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "fault-test", &FAULT_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 53: FAULT_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    // MILESTONE 42: founder of its own group, same reasoning as A/B.
+    p.pgid = FAULT_TEST_PROCESS_ID;
+    *FAULT_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
 /// MILESTONE 30: the `runproc N` shell command's entry point. Switches
 /// CR3 to process N's own PML4, enters ring 3 at the SAME virtual
 /// address usertest.rs always uses, lets the syscalls run (write reads
@@ -1774,9 +1831,12 @@ pub fn run(id: u8) -> Result<(), &'static str> {
         SIGKILL_TEST_PROCESS_ID => &SIGKILL_TEST_PROCESS,
         WAITSTATUS_TEST_PROCESS_ID => &WAITSTATUS_TEST_PROCESS,
         EXEC_TEST_PROCESS_ID => &EXEC_TEST_PROCESS,
-        _ => return Err(
-            "no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), 7 (SIGKILL_TEST_PROCESS_ID), 8 (WAITSTATUS_TEST_PROCESS_ID), or 9 (EXEC_TEST_PROCESS_ID)",
-        ),
+        FAULT_TEST_PROCESS_ID => &FAULT_TEST_PROCESS,
+        _ => {
+            return Err(
+                "no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), 7 (SIGKILL_TEST_PROCESS_ID), 8 (WAITSTATUS_TEST_PROCESS_ID), 9 (EXEC_TEST_PROCESS_ID), or 10 (FAULT_TEST_PROCESS_ID)",
+            );
+        }
     };
     let (pml4_frame, label, entry) = {
         let guard = slot.lock();
@@ -2773,6 +2833,19 @@ pub enum WaitOutcome {
     /// The child was kill()ed (M41) before it ever ran -- never
     /// reached its own exit() at all.
     Killed,
+    /// MILESTONE 53: WIFSIGNALED-equivalent -- the child actually ran
+    /// (unlike `Killed`, which is pre-run only) and was terminated by a
+    /// real hardware fault (SIGSEGV-equivalent page fault, or a #GP)
+    /// instead of reaching its own exit(). Closes the real gap this
+    /// milestone found: wait_for_child() previously had no way to tell
+    /// this case apart from `Exited` at all, and reported a STALE exit
+    /// code left over from a completely different, earlier child as if
+    /// this one had genuinely exited normally. Honest scope-cut, same
+    /// as M41's own: this doesn't distinguish page fault from #GP, or
+    /// carry a real signal number -- both fault types funnel through
+    /// the identical `terminate_faulted_process_and_resume_kernel()`
+    /// path and this design has no signal-number concept yet.
+    Signaled,
 }
 
 /// MILESTONE 43: side channel `kill()` populates so a LATER wait()
@@ -2874,13 +2947,32 @@ pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<(u8, WaitOu
         return None;
     }
 
+    // MILESTONE 53: check the fault flag BEFORE reading the exit code --
+    // run_forked_child() returns Ok(()) identically whether the child
+    // reached its own real exit() OR was fault-terminated mid-execution
+    // (both funnel through resume_kernel() the same way), so this flag
+    // is the ONLY thing that tells the two apart. See
+    // usertest::CHILD_FAULTED's own doc comment for the real,
+    // previously-silent misreport this closes.
+    if usertest::take_child_faulted() {
+        PROCESS_TABLE.lock()[idx] = None;
+        let _ = writeln!(
+            serial(),
+            "milestone 53: syscall WAIT (process {parent_id}) -- child pid {child_pid} was signal-terminated (real hardware fault, not its own exit()) and was reaped, CR3 restored to parent's own pml4 {:#x}",
+            parent_pml4.start_address().as_u64()
+        );
+        return Some((child_pid, WaitOutcome::Signaled));
+    }
+
     // MILESTONE 43: real exit code, captured by usertest.rs's exit
     // syscall arm the instant the child (just resumed above, via
     // run_forked_child()) reached ITS OWN exit(). Safe to read here
     // with no explicit reset needed: this design's nesting-depth-1
     // bound (enforced by is_in_child_resume()'s check at the top of
     // this function) means at most one child excursion is ever live,
-    // so nothing else could have overwritten it since.
+    // so nothing else could have overwritten it since -- and the
+    // MILESTONE 53 check just above already ruled out the one other
+    // case (a fault) that could otherwise have left this stale.
     let exit_code = usertest::take_last_child_exit_code();
 
     PROCESS_TABLE.lock()[idx] = None;
@@ -3177,6 +3269,10 @@ pub fn self_test_wait_status() {
                 let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, wait() reported Killed for a child that should have exited normally");
                 false
             }
+            Some((_, WaitOutcome::Signaled)) => {
+                let _ = writeln!(serial(), "milestone 53: self-test -- FAILED, wait() reported Signaled for a child that should have exited normally (no fault in WAITSTATUS_TEST_PROGRAM)");
+                false
+            }
             None => {
                 let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, wait_for_child() itself returned None for the exit-status child");
                 false
@@ -3207,6 +3303,10 @@ pub fn self_test_wait_status() {
                 }
                 Some((_, WaitOutcome::Exited(code))) => {
                     let _ = writeln!(serial(), "milestone 43: self-test -- FAILED, wait() reported Exited({code}) for a child that was killed, never ran");
+                    false
+                }
+                Some((_, WaitOutcome::Signaled)) => {
+                    let _ = writeln!(serial(), "milestone 53: self-test -- FAILED, wait() reported Signaled for a child that was killed pre-run, never actually ran to fault");
                     false
                 }
                 None => {
@@ -3338,6 +3438,135 @@ pub(crate) fn exec_elf(id: u8, image: &[u8], elf_image: &elf::ElfImage) -> Resul
         new_entry
     );
     Ok(new_entry)
+}
+
+/// MILESTONE 53: real, boot-time, non-interactive proof of the new
+/// `WaitOutcome::Signaled` variant -- same "sendkey is unreliable, run
+/// unattended instead" reasoning as every other self_test_* in this
+/// file. Must run after interrupts::init_pics()/sti() in main.rs's boot
+/// sequence, same real reason as self_test_signals()/self_test_wait_
+/// status(): this enters ring 3 via wait_for_child() -> run_forked_
+/// child() -> enter_ring3_as_forked_child(), which sets RFLAGS.IF=1 the
+/// same way top-level entry does.
+///
+/// The real bug this closes, found by direct code inspection while
+/// finishing Milestone 44 (generalized ELF entry) and re-reading
+/// wait_for_child() for MILESTONE 53's own dependency-chain check:
+/// before this milestone, a forked child that page-faulted (or
+/// #GP-faulted) instead of calling its own exit() left LAST_CHILD_
+/// EXIT_CODE completely untouched -- run_forked_child() returns Ok(())
+/// identically either way, since both a real exit() and a real fault
+/// funnel through resume_kernel() the same way -- so wait_for_child()
+/// silently read out whatever STALE exit code an earlier, unrelated
+/// child's real exit() last wrote (or the AtomicU8 default, 0, on the
+/// very first wait() of a boot) and reported `WaitOutcome::Exited
+/// (stale_code)`, mislabeling a crashed child as one that exited
+/// normally. This self-test is what actually PROVES the fix, not just
+/// the code review that found the gap: it deliberately forks a child
+/// whose entire program is a single faulting instruction (no exit()
+/// call anywhere in it) and checks wait() reports `Signaled`, not
+/// `Exited` with a leftover code from a completely different child.
+pub fn self_test_fault_status() {
+    let stack_top = usertest::USER_STACK_ADDR + usertest::USER_STACK_SIZE;
+
+    let _ = writeln!(
+        serial(),
+        "milestone 53: self-test -- forking FAULT_TEST_PROCESS's child (its entire code page is a single faulting instruction, no exit() anywhere), expecting wait() to report Signaled, not a stale Exited..."
+    );
+    let faulted_ok = match fork(FAULT_TEST_PROCESS_ID, usertest::USER_CODE_ADDR, stack_top) {
+        Some(pid) => match wait_for_child(FAULT_TEST_PROCESS_ID, pid) {
+            Some((reaped, WaitOutcome::Signaled)) => {
+                let ok = reaped == pid;
+                let _ = writeln!(
+                    serial(),
+                    "milestone 53: self-test -- forked+faulted child pid {pid}, wait() reported Signaled(reaped={reaped}) -- {}",
+                    if ok { "confirmed" } else { "MISMATCH" }
+                );
+                ok
+            }
+            Some((reaped, WaitOutcome::Exited(code))) => {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 53: self-test -- FAILED, wait() reported Exited(reaped={reaped}, code={code}) for a child that never called exit() at all -- this is EXACTLY the stale-exit-code bug this milestone exists to fix"
+                );
+                false
+            }
+            Some((_, WaitOutcome::Killed)) => {
+                let _ = writeln!(serial(), "milestone 53: self-test -- FAILED, wait() reported Killed for a child that actually ran (and faulted), not one killed pre-run");
+                false
+            }
+            None => {
+                let _ = writeln!(serial(), "milestone 53: self-test -- FAILED, wait_for_child() itself returned None for the faulted child");
+                false
+            }
+        },
+        None => {
+            let _ = writeln!(serial(), "milestone 53: self-test -- FAILED, fork() itself failed for the faulted child");
+            false
+        }
+    };
+
+    // Real proof of genuine recovery, not just "hasn't crashed yet" --
+    // same discipline as M41's own SIGSEGV self-test: run an entirely
+    // unrelated top-level process (PROCESS_A) right after and confirm
+    // it's unaffected by the fault-during-wait() path above.
+    let _ = writeln!(
+        serial(),
+        "milestone 53: self-test -- running PROCESS_A right after, real proof the kernel genuinely recovered from a fault inside a nested wait() excursion specifically (not just a top-level fault, which M41 already covers)..."
+    );
+    let recovery_ok = match run(1) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 53: self-test -- PROCESS_A ran normally after the nested-wait() fault -- kernel genuinely recovered");
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 53: self-test -- FAILED, PROCESS_A could not run after the fault: {e}");
+            false
+        }
+    };
+
+    // Real proof the PROCESS_TABLE slot was actually freed by the
+    // Signaled reap above, not just reported correctly -- fork a SECOND
+    // child from the same source and confirm the slot is reusable, same
+    // "fork again to prove reuse" discipline as M41's own SIGKILL
+    // self-test. Dummy (0,0) resume point + immediate kill() is
+    // deliberate here (same M42/M43 precedent): the point is slot
+    // bookkeeping, not a second real ring-3 excursion.
+    //
+    // Checks only THIS test's own slot, not that PROCESS_TABLE is
+    // globally empty -- M41's own SIGKILL_TEST_PROCESS self-test
+    // (process.rs, ~line 3026) deliberately leaves its own second
+    // forked child permanently unreaped in slot 0 for the rest of the
+    // boot ("expected exactly [0]"), so asserting global emptiness here
+    // was a real, false assumption about unrelated earlier-milestone
+    // state, not a genuine slot-reuse bug -- caught via an actual QEMU
+    // boot (occupied=[0] every run), not by inspection.
+    let reuse_ok = match fork(FAULT_TEST_PROCESS_ID, 0, 0) {
+        Some(second_pid) => {
+            let killed = kill(FAULT_TEST_PROCESS_ID, second_pid);
+            let own_idx = (second_pid - PID_TABLE_BASE) as usize;
+            let table = PROCESS_TABLE.lock();
+            let occupied: alloc::vec::Vec<usize> = table.iter().enumerate().filter(|(_, p)| p.is_some()).map(|(i, _)| i).collect();
+            drop(table);
+            let own_slot_freed = !occupied.contains(&own_idx);
+            let _ = writeln!(
+                serial(),
+                "milestone 53: self-test -- second fork() from FAULT_TEST_PROCESS_ID succeeded (pid {second_pid}, killed={killed}) -- real proof the first faulted child's slot was genuinely freed, not just marked. PROCESS_TABLE occupied slots after cleanup: {:?}, own slot {own_idx} freed={own_slot_freed} (other slots may be legitimately occupied by unrelated earlier milestones' own self-tests, e.g. M41's SIGKILL_TEST_PROCESS)",
+                occupied
+            );
+            killed && own_slot_freed
+        }
+        None => {
+            let _ = writeln!(serial(), "milestone 53: self-test -- FAILED, second fork() from FAULT_TEST_PROCESS_ID did not succeed -- the first faulted child's slot may not have been freed");
+            false
+        }
+    };
+
+    let _ = writeln!(
+        serial(),
+        "milestone 53: self-test -- OVERALL: {}",
+        if faulted_ok && recovery_ok && reuse_ok { "PASS" } else { "FAIL" }
+    );
 }
 
 /// MILESTONE 45: a direct, filesystem-independent proof that

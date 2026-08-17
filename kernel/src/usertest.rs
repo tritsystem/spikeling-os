@@ -205,6 +205,33 @@ pub(crate) fn take_last_child_exit_code() -> u8 {
     LAST_CHILD_EXIT_CODE.load(Ordering::SeqCst)
 }
 
+/// MILESTONE 53: real signal-terminated status for a forked child --
+/// set by terminate_faulted_process_and_resume_kernel() below when a
+/// real hardware fault (page fault / #GP, both funnel through that one
+/// function) kills a process WHILE `IN_CHILD_RESUME` is true, i.e. the
+/// faulting process is a forked child currently being driven by
+/// process::wait_for_child()'s own nested excursion. Closes a real gap
+/// left open since M41/M43: before this milestone, a forked child that
+/// page-faulted instead of calling its own exit() left
+/// LAST_CHILD_EXIT_CODE completely untouched, so wait_for_child() read
+/// out whatever STALE code an earlier, unrelated child's real exit()
+/// last wrote (or the 0 default, on the very first wait() of a boot) and
+/// reported it as `WaitOutcome::Exited(stale_code)` -- a real, silent
+/// misreport that a crashed child ran to completion normally. `take_*()`
+/// consumes (loads AND resets) in one atomic op, unlike
+/// take_last_child_exit_code() above: that field only ever needs to be
+/// read when a real exit() JUST wrote it fresh in this same excursion
+/// (nesting-depth-1 bound), so staleness there was never actually
+/// reachable; this flag has no such freshness guarantee -- it stays
+/// `true` forever once ANY forked child ever faults unless explicitly
+/// consumed, silently mislabeling every later child (even ones that
+/// genuinely exit normally) as signaled if left un-reset.
+static CHILD_FAULTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn take_child_faulted() -> bool {
+    CHILD_FAULTED.swap(false, Ordering::SeqCst)
+}
+
 /// MILESTONE 37: real, honest, ENFORCED nesting-depth check -- see
 /// IN_CHILD_RESUME's own doc comment. `pub(crate)` so process.rs's
 /// fork()/wait_for_child() can check it directly before ever attempting
@@ -849,6 +876,22 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                     // here AND in the hand-assembled test programs that
                     // decode it, checked by hand against each other, not
                     // assumed consistent.
+                    //
+                    // MILESTONE 53: bit 17 = 1 if the child actually ran
+                    // but was signal-terminated by a real hardware fault
+                    // instead of reaching its own exit()
+                    // (WaitOutcome::Signaled) -- a real third state M43's
+                    // original two-bit-16-values-only scheme (0=Killed,
+                    // 1=Exited) had no room for. Mutually exclusive with
+                    // bit 16 by construction (the match below sets
+                    // exactly one of the three encodings), so no existing
+                    // decoder that only ever checked bit 16 -- e.g. this
+                    // milestone deliberately did NOT touch WAITSTATUS_
+                    // TEST_PROGRAM's own decode logic -- misreads a
+                    // Signaled child as Exited; it would see bit 16 = 0
+                    // and correctly-if-incompletely read that as "not a
+                    // normal exit", the same as it already does for
+                    // Killed today.
                     match crate::process::wait_for_child(active, child_pid_arg as u8) {
                         Some((reaped, outcome)) => {
                             let encoded = match outcome {
@@ -867,6 +910,14 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                                         regs.cs
                                     );
                                     reaped as u64
+                                }
+                                crate::process::WaitOutcome::Signaled => {
+                                    let _ = writeln!(
+                                        serial(),
+                                        "milestone 53: syscall WAIT (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- child pid {reaped} was signal-terminated (real hardware fault) after actually running",
+                                        regs.cs
+                                    );
+                                    (reaped as u64) | (1u64 << 17)
                                 }
                             };
                             regs.rax = encoded;
@@ -1272,7 +1323,16 @@ unsafe extern "C" fn resume_kernel(_saved_rsp: u64) -> ! {
 pub(crate) fn terminate_faulted_process_and_resume_kernel() -> ! {
     crate::process::restore_kernel_cr3();
     crate::process::ACTIVE_PROCESS.store(0, Ordering::SeqCst);
-    let saved = if IN_CHILD_RESUME.load(Ordering::SeqCst) {
+    let in_child = IN_CHILD_RESUME.load(Ordering::SeqCst);
+    // MILESTONE 53: record that THIS excursion's child was signal-
+    // terminated, not exited -- mirrors the exit syscall arm's own
+    // `if IN_CHILD_RESUME { LAST_CHILD_EXIT_CODE.store(...) }` gate
+    // immediately below, same reasoning: only meaningful (and only set)
+    // when a forked child, not a top-level process, is what just faulted.
+    if in_child {
+        CHILD_FAULTED.store(true, Ordering::SeqCst);
+    }
+    let saved = if in_child {
         CHILD_KERNEL_RSP.load(Ordering::SeqCst)
     } else {
         KERNEL_RSP.load(Ordering::SeqCst)

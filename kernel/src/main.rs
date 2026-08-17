@@ -322,6 +322,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(()) => writeln!(port, "milestone 45: EXEC_TEST_PROCESS private address space created").unwrap(),
         Err(e) => writeln!(port, "milestone 45: FAILED to create EXEC_TEST_PROCESS -- {e}").unwrap(),
     }
+    // MILESTONE 53: a tenth hardcoded process slot, used purely as a
+    // fork() source for self_test_fault_status()'s real signal-status
+    // test -- same "frame_allocator/phys_mem_offset conveniently still
+    // in scope" reason as the others just above. PID 10, not 9 (see
+    // process.rs's FAULT_TEST_PROCESS_ID doc comment -- a real PID
+    // collision with Milestone 45's EXEC_TEST_PROCESS_ID(9), found and
+    // resolved at merge time).
+    match process::init_fault_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 53: FAULT_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 53: FAILED to create FAULT_TEST_PROCESS -- {e}").unwrap(),
+    }
 
     // MILESTONE 34: real general program loader. `frame_allocator`'s
     // last boot-time consumer was process::init_test_processes just
@@ -832,6 +843,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // already-fixed reason (Milestone 25's background scheduler racing
     // an ELF-loaded process's return) this ordering matters.
     loader::self_test_malloc();
+    // MILESTONE 53: same ordering requirement as self_test_signals()/
+    // self_test_wait_status() just above -- real ring-3 entry via
+    // wait_for_child() -> run_forked_child() -> enter_ring3_as_forked_
+    // child(), which sets RFLAGS.IF=1 the same way top-level entry does
+    // -- must run after init_pics()/enable() too, not before. Placed
+    // here (same "MERGE NOTE" reasoning documented above for Milestones
+    // 44/51): stays downstream of every non-interactive ring-3 self-test
+    // and upstream of this same enable() call.
+    process::self_test_fault_status();
     x86_64::instructions::interrupts::enable();
 
     for _ in 0..80 {

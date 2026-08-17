@@ -1707,6 +1707,34 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       persist disk attached, milestones 42/43/44/45/53/54 all
       self-report `OVERALL: PASS`, zero panics, boot reaches the
       interactive shell normally.
+- [x] **Milestone 55**: real ICMP echo request/reply (`ping`), the first
+      IP-layer protocol this kernel speaks -- closes the gap Milestone
+      47's own doc comment explicitly disclosed as future work ("no IP/
+      UDP/TCP layer exists on top of this yet"), built directly on that
+      milestone's real ARP resolution. Adds a real IPv4 header + ICMP
+      echo request/reply frame builder, a shared Internet checksum
+      (RFC 1071, one real implementation used for both the IP and ICMP
+      checksums rather than two independently-trusted copies), and
+      `icmp_ping()`: ARP-resolves the target's MAC first (ICMP needs a
+      real unicast destination, unlike ARP's own broadcast), then a real
+      echo request/reply round trip. Deliberately calls
+      `send_arp_request()`/`recv_arp_reply()` directly rather than the
+      public `arp_resolve()` wrapper -- `arp_resolve()` restores loopback
+      to ON at its own end, which would silently divert the ping frame
+      back to this NIC's own RX ring instead of the real wire if called
+      from inside an already-loopback-off caller; loopback control stays
+      owned by one function for the whole real round trip. New `ping`
+      shell command mirrors `arp`. Boot-time self-test pings QEMU
+      slirp's own gateway (10.0.2.2) with loopback OFF and checks the
+      reply's `sender_ip`/`id`/`seq` all match what was actually sent,
+      not just that some reply arrived. First real QEMU boot passed
+      outright -- a genuine echo reply from slirp's real stack, its
+      checksums validated on the other end (not just a packet coming
+      back), no bugs found this time. Clean fast-forward merge into
+      `main` (no conflicts); re-verified end to end afterward: fresh
+      build, fresh QEMU boot with the persist disk attached, milestones
+      42/43/44/45/47/53/54/55 all pass, zero panics, boot reaches the
+      interactive shell normally.
 
 ## Building and running
 

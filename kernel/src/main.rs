@@ -314,6 +314,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(()) => writeln!(port, "milestone 43: WAITSTATUS_TEST_PROCESS private address space created").unwrap(),
         Err(e) => writeln!(port, "milestone 43: FAILED to create WAITSTATUS_TEST_PROCESS -- {e}").unwrap(),
     }
+    // MILESTONE 53: a ninth hardcoded process slot, used purely as a
+    // fork() source for self_test_fault_status()'s real signal-status
+    // test -- same "frame_allocator/phys_mem_offset conveniently still
+    // in scope" reason as the others just above.
+    match process::init_fault_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 53: FAULT_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 53: FAILED to create FAULT_TEST_PROCESS -- {e}").unwrap(),
+    }
 
     // MILESTONE 34: real general program loader. `frame_allocator`'s
     // last boot-time consumer was process::init_test_processes just
@@ -634,6 +642,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // RFLAGS.IF=1 the same way top-level entry does) -- must run after
     // init_pics()/enable() too, not before.
     process::self_test_wait_status();
+    // MILESTONE 53: same ordering requirement as self_test_signals()/
+    // self_test_wait_status() just above -- real ring-3 entry via
+    // wait_for_child() -> run_forked_child() -> enter_ring3_as_forked_
+    // child(), which sets RFLAGS.IF=1 the same way top-level entry does
+    // -- must run after init_pics()/enable() too, not before.
+    process::self_test_fault_status();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

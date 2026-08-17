@@ -169,6 +169,66 @@ const ARP_FRAME_LEN: usize = 42; // 14-byte Ethernet header + 28-byte ARP payloa
 const SPIKELING_IP: [u8; 4] = [10, 0, 2, 15];
 const SPIKELING_GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
+// MILESTONE 55: real IPv4 (RFC 791) + ICMP (RFC 792) field values -- the
+// first layer built ON TOP of Milestone 47's ARP resolution, closing the
+// gap that milestone's own doc comment explicitly disclosed as future
+// work ("no IP/UDP/TCP layer exists on top of this yet"). Scoped the
+// same honest way ARP was: one echo request/reply round trip at a time,
+// synchronous, no fragmentation, no other IP protocol.
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const IPV4_HEADER_LEN: usize = 20; // no IP options, same "honest minimal subset" as ARP's fixed-size payload
+const IP_PROTO_ICMP: u8 = 1;
+const ICMP_HEADER_LEN: usize = 8;
+const ICMP_TYPE_ECHO_REQUEST: u8 = 8;
+const ICMP_TYPE_ECHO_REPLY: u8 = 0;
+/// Real, deliberately small fixed payload -- same "deterministic,
+/// nothing-else-going-on" reasoning as process.rs's own hand-assembled
+/// test programs, not a real-world MTU-sized ping.
+const ICMP_ECHO_PAYLOAD: &[u8] = b"spikeling-os milestone 55 ping";
+const ICMP_FRAME_LEN: usize = 14 + IPV4_HEADER_LEN + ICMP_HEADER_LEN + ICMP_ECHO_PAYLOAD.len();
+/// A real, fixed identifier/sequence pair -- arbitrary but constant, so
+/// `icmp_ping()`'s request and `recv_icmp_reply()`'s matching check
+/// agree on exactly what they're looking for. 0x5350 = ASCII "SP"
+/// (Spikeling), chosen for readability in a packet-capture, not
+/// functionally significant.
+const ICMP_PING_ID: u16 = 0x5350;
+const ICMP_PING_SEQ: u16 = 1;
+
+/// MILESTONE 55: a real, parsed ICMP echo reply -- who answered, and the
+/// (id, seq) pair echoed back, straight from real received bytes.
+pub struct IcmpReply {
+    pub sender_ip: [u8; 4],
+    pub id: u16,
+    pub seq: u16,
+}
+
+/// MILESTONE 55: the standard Internet checksum (RFC 1071) -- one's
+/// complement sum of all 16-bit words, carries folded back in, then
+/// one's-complemented. Used identically for both the IPv4 header
+/// checksum (over the 20-byte header alone, checksum field itself
+/// zeroed while summing) and the ICMP checksum (over the whole ICMP
+/// message, header+payload, checksum field zeroed the same way) -- one
+/// real, shared implementation rather than two independently-trusted
+/// copies, the same "extract the shared mechanic" discipline
+/// `transmit_frame()`/`poll_rx_descriptor()` already established for
+/// TX/RX. An odd trailing byte (never happens for either use here, both
+/// inputs are even-length by construction, but handled honestly rather
+/// than assumed away) is padded with a zero low byte, per the RFC.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut chunks = data.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum += ((chunk[0] as u32) << 8) | chunk[1] as u32;
+    }
+    if let [last] = chunks.remainder() {
+        sum += (*last as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// MILESTONE 47: a real, parsed ARP reply -- who (`sender_mac`) actually
 /// answered "who has `target_ip`", straight from real received bytes.
 pub struct ArpReply {
@@ -867,6 +927,149 @@ pub fn arp_resolve(target_ip: [u8; 4]) -> Result<Option<ArpReply>, &'static str>
     reply_result
 }
 
+/// MILESTONE 55: builds one real ICMP echo request frame -- Ethernet II
+/// (real unicast dest_mac, resolved via ARP by the caller, not
+/// broadcast: unlike ARP itself, ICMP already knows who it's talking to)
+/// carrying a standard IPv4 header (protocol=ICMP) carrying a standard
+/// ICMP echo-request header+payload. Both checksums are real, computed
+/// over the actual bytes via `internet_checksum()` -- not left zero and
+/// not hardcoded, so a receiving stack that actually validates them
+/// (QEMU's slirp does) has a genuine reason to accept this packet.
+fn build_icmp_echo_request(
+    sender_mac: [u8; 6],
+    dest_mac: [u8; 6],
+    sender_ip: [u8; 4],
+    target_ip: [u8; 4],
+    id: u16,
+    seq: u16,
+) -> [u8; ICMP_FRAME_LEN] {
+    let mut f = [0u8; ICMP_FRAME_LEN];
+
+    // Ethernet II header (14 bytes).
+    f[0..6].copy_from_slice(&dest_mac);
+    f[6..12].copy_from_slice(&sender_mac);
+    f[12] = (ETHERTYPE_IPV4 >> 8) as u8;
+    f[13] = (ETHERTYPE_IPV4 & 0xFF) as u8;
+
+    // IPv4 header (20 bytes, no options), starting at offset 14.
+    let ip_start = 14;
+    let ip_total_len = (IPV4_HEADER_LEN + ICMP_HEADER_LEN + ICMP_ECHO_PAYLOAD.len()) as u16;
+    f[ip_start] = 0x45; // version=4, IHL=5 (20 bytes, no options)
+    f[ip_start + 1] = 0; // DSCP/ECN, unused
+    f[ip_start + 2..ip_start + 4].copy_from_slice(&ip_total_len.to_be_bytes());
+    f[ip_start + 4..ip_start + 6].copy_from_slice(&id.to_be_bytes()); // real IP identification field, reuses ICMP id -- fine, this kernel never fragments so it need not be globally unique, just present
+    f[ip_start + 6..ip_start + 8].copy_from_slice(&0u16.to_be_bytes()); // flags/fragment offset: 0 (don't-fragment not set, no fragmentation -- this kernel never sends anything close to needing it)
+    f[ip_start + 8] = 64; // TTL -- a real, conventional default, not maximized or minimized
+    f[ip_start + 9] = IP_PROTO_ICMP;
+    f[ip_start + 10..ip_start + 12].copy_from_slice(&0u16.to_be_bytes()); // checksum, computed below once the rest of the header is in place
+    f[ip_start + 12..ip_start + 16].copy_from_slice(&sender_ip);
+    f[ip_start + 16..ip_start + 20].copy_from_slice(&target_ip);
+    let ip_checksum = internet_checksum(&f[ip_start..ip_start + IPV4_HEADER_LEN]);
+    f[ip_start + 10..ip_start + 12].copy_from_slice(&ip_checksum.to_be_bytes());
+
+    // ICMP echo request (8-byte header + payload), starting right after
+    // the IPv4 header.
+    let icmp_start = ip_start + IPV4_HEADER_LEN;
+    f[icmp_start] = ICMP_TYPE_ECHO_REQUEST;
+    f[icmp_start + 1] = 0; // code, always 0 for echo request
+    f[icmp_start + 2..icmp_start + 4].copy_from_slice(&0u16.to_be_bytes()); // checksum, computed below
+    f[icmp_start + 4..icmp_start + 6].copy_from_slice(&id.to_be_bytes());
+    f[icmp_start + 6..icmp_start + 8].copy_from_slice(&seq.to_be_bytes());
+    f[icmp_start + ICMP_HEADER_LEN..].copy_from_slice(ICMP_ECHO_PAYLOAD);
+    let icmp_checksum = internet_checksum(&f[icmp_start..]);
+    f[icmp_start + 2..icmp_start + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+
+    f
+}
+
+/// MILESTONE 55: transmits a real ICMP echo request to `dest_mac`/
+/// `target_ip`, over whatever path is CURRENTLY configured -- same
+/// "caller controls loopback" contract `send_arp_request()` already
+/// established.
+pub fn send_icmp_echo(dest_mac: [u8; 6], target_ip: [u8; 4], id: u16, seq: u16) -> Result<bool, &'static str> {
+    let mut guard = NIC.lock();
+    let state = guard.as_mut().ok_or("NIC not initialized")?;
+    let frame = build_icmp_echo_request(state.mac, dest_mac, SPIKELING_IP, target_ip, id, seq);
+    transmit_frame(state, &frame)
+}
+
+/// MILESTONE 55: polls the RX ring for a real ICMP echo reply matching
+/// `expect_id` -- same "skip anything else, don't fail on it" discipline
+/// as `recv_arp_reply()`, and the same `continue`-on-empty-poll fix that
+/// milestone's own doc comment already found necessary for a genuine
+/// slirp round trip to have all `max_polls` windows actually available
+/// to it, applied here from the start rather than rediscovered.
+pub fn recv_icmp_reply(expect_id: u16, max_polls: u32) -> Result<Option<IcmpReply>, &'static str> {
+    let mut guard = NIC.lock();
+    let state = guard.as_mut().ok_or("NIC not initialized")?;
+
+    for _ in 0..max_polls {
+        let Some((frame, copy_len, errors)) = poll_rx_descriptor(state) else {
+            continue;
+        };
+        if errors != 0 || copy_len < 14 + IPV4_HEADER_LEN + ICMP_HEADER_LEN {
+            continue;
+        }
+        let ethertype = ((frame[12] as u16) << 8) | frame[13] as u16;
+        if ethertype != ETHERTYPE_IPV4 {
+            continue;
+        }
+        let ip_start = 14;
+        if frame[ip_start] != 0x45 || frame[ip_start + 9] != IP_PROTO_ICMP {
+            continue;
+        }
+        let icmp_start = ip_start + IPV4_HEADER_LEN;
+        if frame[icmp_start] != ICMP_TYPE_ECHO_REPLY {
+            continue;
+        }
+        let id = ((frame[icmp_start + 4] as u16) << 8) | frame[icmp_start + 5] as u16;
+        if id != expect_id {
+            continue;
+        }
+        let seq = ((frame[icmp_start + 6] as u16) << 8) | frame[icmp_start + 7] as u16;
+        let sender_ip = [frame[ip_start + 12], frame[ip_start + 13], frame[ip_start + 14], frame[ip_start + 15]];
+        return Ok(Some(IcmpReply { sender_ip, id, seq }));
+    }
+    Ok(None)
+}
+
+/// MILESTONE 55: real end-to-end ping -- ARP-resolves `target_ip`'s MAC
+/// first (ICMP, unlike ARP, needs a real unicast destination, not
+/// broadcast), then sends one real ICMP echo request and waits for the
+/// matching reply. Turns loopback OFF for the whole real round trip and
+/// restores it afterward regardless of outcome, mirroring
+/// `arp_resolve()`'s own exact contract (so `sendpacket`/`recvpacket`'s
+/// loopback-based behavior stays unaffected by ever having called this).
+pub fn icmp_ping(target_ip: [u8; 4]) -> Result<Option<IcmpReply>, &'static str> {
+    set_loopback(false)?;
+    // Deliberately calls send_arp_request()/recv_arp_reply() directly,
+    // NOT the public arp_resolve() wrapper -- arp_resolve() restores
+    // loopback to ON at its own end, which would flip it back on
+    // between the ARP round trip and the ICMP send below, silently
+    // diverting the ping frame back to this NIC's own RX ring instead
+    // of the real wire. Loopback control stays owned entirely by this
+    // function for its whole real round trip, the same single-owner
+    // discipline arp_resolve() itself already established.
+    let outcome = (|| -> Result<Option<IcmpReply>, &'static str> {
+        let arp_sent = send_arp_request(target_ip)?;
+        if !arp_sent {
+            return Err("ICMP ping: ARP request for the target's MAC was not confirmed transmitted");
+        }
+        let target_mac = match recv_arp_reply(200)? {
+            Some(reply) => reply.sender_mac,
+            // Honest "no reply" outcome, not an error: without a real
+            // MAC to address the echo request to, there is nothing left
+            // to try -- same convention arp_resolve()/recv_arp_reply()
+            // themselves already use for "nothing arrived in time".
+            None => return Ok(None),
+        };
+        send_icmp_echo(target_mac, target_ip, ICMP_PING_ID, ICMP_PING_SEQ)?;
+        recv_icmp_reply(ICMP_PING_ID, 200)
+    })();
+    let _ = set_loopback(true);
+    outcome
+}
+
 /// MILESTONE 47: toggles the PHY's real MII_BMCR loopback bit over MDIC
 /// -- the same real hardware mechanism `init()` uses to turn it ON
 /// unconditionally at boot, exposed here as an independent runtime
@@ -918,6 +1121,50 @@ pub fn self_test_arp() -> bool {
         }
         Err(e) => {
             let _ = writeln!(serial(), "milestone 47: ARP self-test FAILED -- {e}");
+            false
+        }
+    }
+}
+
+/// MILESTONE 55: real, boot-time, non-interactive proof of a genuine
+/// end-to-end ICMP echo request/reply over the real IPv4/Ethernet
+/// framing this milestone adds -- same "every boot's serial log carries
+/// direct proof" discipline as `self_test_arp()` just above, pinging the
+/// SAME QEMU slirp gateway address (10.0.2.2) that milestone's own
+/// self-test already proved reachable at the ARP layer. Checks the
+/// reply's `sender_ip`/`id`/`seq` all match what was actually sent, not
+/// just that SOME reply arrived -- a reply from a different sender, or
+/// carrying stale id/seq from an unrelated exchange, would be a real bug
+/// this self-test is specifically positioned to catch.
+pub fn self_test_icmp_ping() -> bool {
+    match icmp_ping(SPIKELING_GATEWAY_IP) {
+        Ok(Some(reply)) => {
+            let ip_ok = reply.sender_ip == SPIKELING_GATEWAY_IP;
+            let id_ok = reply.id == ICMP_PING_ID;
+            let seq_ok = reply.seq == ICMP_PING_SEQ;
+            let ok = ip_ok && id_ok && seq_ok;
+            let _ = writeln!(
+                serial(),
+                "milestone 55: ICMP ping self-test -- reply from {} (expected {}, match={ip_ok}), id={:#06x} (expected {:#06x}, match={id_ok}), seq={} (expected {}, match={seq_ok}) -- {}",
+                format_ip(reply.sender_ip),
+                format_ip(SPIKELING_GATEWAY_IP),
+                reply.id,
+                ICMP_PING_ID,
+                reply.seq,
+                ICMP_PING_SEQ,
+                if ok { "PASS" } else { "FAIL -- reply received but fields don't match what was sent" }
+            );
+            ok
+        }
+        Ok(None) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 55: ICMP ping self-test FAILED -- no echo reply received within timeout (loopback OFF -- real round trip over the actual netdev backend)"
+            );
+            false
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 55: ICMP ping self-test FAILED -- {e}");
             false
         }
     }

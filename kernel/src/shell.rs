@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest, seedmalloctest\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, ping, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest, seedmalloctest\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -339,6 +339,21 @@ fn run_command(cmd: &str) {
             )),
             Ok(None) => crate::console::write_str("no ARP reply received within timeout\n"),
             Err(e) => crate::console::write_str(&format!("arp FAILED: {e}\n")),
+        },
+        "ping" => match crate::nic::icmp_ping(crate::nic::gateway_ip()) {
+            // MILESTONE 55: real ICMP echo request/reply -- ARP-resolves
+            // the gateway's MAC first, then a real IPv4/ICMP round trip
+            // over the actual netdev backend, loopback OFF the whole
+            // time (icmp_ping() owns that toggle directly, not via
+            // arp_resolve(), so it can't get restored ON mid-exchange).
+            Ok(Some(reply)) => crate::console::write_str(&format!(
+                "ICMP echo reply from {} (id={:#06x} seq={}, real round trip over the emulated network, loopback OFF)\n",
+                crate::nic::format_ip(reply.sender_ip),
+                reply.id,
+                reply.seq
+            )),
+            Ok(None) => crate::console::write_str("no ICMP echo reply received within timeout\n"),
+            Err(e) => crate::console::write_str(&format!("ping FAILED: {e}\n")),
         },
         "recvpacket" => match crate::nic::recv_packet() {
             // MILESTONE 26: recv_packet() itself does one bounded poll

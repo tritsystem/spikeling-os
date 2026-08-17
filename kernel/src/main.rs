@@ -725,6 +725,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // interrupts are live -- same ordering reasoning as the M24 init
     // call directly above.
     nic::self_test_arp();
+    // MILESTONE 55: real ICMP echo request/reply, built on top of
+    // Milestone 47's ARP resolution -- same ordering reasoning (still
+    // polling-only, before PIC remap/interrupts), and the first real
+    // IP-layer protocol this kernel speaks, closing the gap M47's own
+    // doc comment explicitly disclosed as future work.
+    nic::self_test_icmp_ping();
 
     interrupts::init_pics();
     shell::init();

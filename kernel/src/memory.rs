@@ -17,13 +17,14 @@
 //! kernel_main right after the last boot-time consumer is done with
 //! them.
 
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegionKind, MemoryRegions};
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use x86_64::{
     PhysAddr, VirtAddr,
     registers::control::Cr3,
-    structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
+    structures::paging::{FrameAllocator, FrameDeallocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
 };
 
 /// Builds an OffsetPageTable from the currently active level-4 page
@@ -52,12 +53,19 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 
 /// A frame allocator that returns usable frames from the bootloader's
 /// memory map -- real physical memory the firmware reported as free,
-/// not a synthetic pool. Bump-allocates only (never frees); fine for
-/// milestone 3's fixed-size heap, revisit if/when frames need to be
-/// reclaimed.
+/// not a synthetic pool. Bump-allocates from `next` for genuinely new
+/// frames, but MILESTONE 54 adds a real free list checked FIRST: a
+/// process that exits/is killed/is exec()'d over now actually returns
+/// its old PML4/code/stack/heap/extra frames here (see process.rs's
+/// `reclaim_process_frames()`), and a later allocation reuses them
+/// before ever bumping `next` further. LIFO (`Vec::pop()`), not that it
+/// matters for correctness -- any free frame is as good as any other,
+/// this just avoids a separate front/back-pointer structure for no
+/// real benefit.
 pub struct BootInfoFrameAllocator {
     memory_regions: &'static MemoryRegions,
     next: usize,
+    free_list: Vec<PhysFrame<Size4KiB>>,
 }
 
 impl BootInfoFrameAllocator {
@@ -71,6 +79,7 @@ impl BootInfoFrameAllocator {
         BootInfoFrameAllocator {
             memory_regions,
             next: 0,
+            free_list: Vec::new(),
         }
     }
 
@@ -82,13 +91,45 @@ impl BootInfoFrameAllocator {
             .flat_map(|r| r.step_by(4096))
             .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
+
+    /// MILESTONE 54: real count of frames currently sitting on the free
+    /// list, waiting to be reused -- exposed so a self-test can prove
+    /// reclamation actually happened (a real count change), not just
+    /// that `deallocate_frame()` was called without erroring.
+    pub fn free_list_len(&self) -> usize {
+        self.free_list.len()
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        // MILESTONE 54: check the free list first -- a real reclaimed
+        // frame is exactly as usable as a never-before-allocated one,
+        // and preferring it keeps physical memory usage bounded across
+        // repeated fork()/exit()/exec() cycles instead of only ever
+        // growing.
+        if let Some(frame) = self.free_list.pop() {
+            return Some(frame);
+        }
         let frame = self.usable_frames().nth(self.next);
         self.next += 1;
         frame
+    }
+}
+
+impl FrameDeallocator<Size4KiB> for BootInfoFrameAllocator {
+    /// # Safety
+    /// Caller must guarantee `frame` is no longer referenced by ANY
+    /// live page table -- freeing a frame still mapped somewhere would
+    /// let a later allocation hand out the same physical memory twice
+    /// to two genuinely different, simultaneously-live owners.
+    /// process.rs's `reclaim_process_frames()` only ever calls this on
+    /// a `Process` value it has just taken full ownership of (via
+    /// `Option::take()`/`Mutex::replace()`), after that process's own
+    /// slot is already gone from every table this kernel tracks, so no
+    /// other code path can still be pointing at these frames.
+    unsafe fn deallocate_frame(&mut self, frame: PhysFrame<Size4KiB>) {
+        self.free_list.push(frame);
     }
 }
 

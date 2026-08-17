@@ -854,6 +854,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     process::self_test_fault_status();
     x86_64::instructions::interrupts::enable();
 
+    // MILESTONE 54: real physical frame reclamation self-test -- no
+    // ordering constraint like the ones above (the dummy (0,0) resume
+    // point + immediate kill() pattern it reuses from Milestone 53's own
+    // reuse_ok check never actually enters ring 3, so RFLAGS.IF is never
+    // touched), but placed right after self_test_fault_status() since it
+    // reuses the exact same FAULT_TEST_PROCESS_ID fork source.
+    process::self_test_frame_reclaim();
+
     for _ in 0..80 {
         x86_64::instructions::hlt();
     }

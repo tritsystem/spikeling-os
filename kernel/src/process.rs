@@ -230,7 +230,7 @@ use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use spin::Mutex;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::page_table::PageTableIndex;
-use x86_64::structures::paging::{FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
 
 const PAGE_SIZE: usize = 4096;
@@ -1067,6 +1067,155 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
     }
 }
 
+/// MILESTONE 54: walks and frees the PRIVATE P3/P2/P1 page-table frames
+/// backing `pml4_frame`'s own USER_CODE_ADDR-range mapping -- the
+/// intermediate frames `map_to()` allocates on demand while building a
+/// process's address space (see create_process_from_image()'s own
+/// `map_to()` calls, which pass the SAME frame_allocator through for
+/// exactly this reason). `reclaim_process_frames()`'s first version only
+/// freed the LEAF data frames (pml4/code/stack/heap/extra) and missed
+/// these entirely -- found via an actual QEMU boot, not by inspection:
+/// this milestone's own real-physical-reuse self-test failed on its
+/// first honest run because a second fork() needed more real frames
+/// than the leaf-only version had freed, and the missing count matched
+/// exactly one P3 + one P2 + one P1 table.
+///
+/// Safe to walk and free EVERY present entry found this way: only
+/// `user_p4_index` (a single PML4 slot -- see create_process_from_image()'s
+/// own doc comment on the "share the ENTRY, not the hierarchy" design)
+/// is ever populated by process-private `map_to()` calls in this kernel.
+/// Every other PML4 slot is a raw copy of the KERNEL's own PML4 entry,
+/// pointing at page-table frames the kernel owns permanently -- this
+/// function only ever reads `pml4[user_p4_index]` and walks downward
+/// from there, so it can never reach (let alone free) a kernel-owned
+/// table. Never frees the LEAF data frames the P1 entries point at
+/// (those are code_frame/stack_frame/heap_frames/extra_frames, freed
+/// separately by their own tracked fields in `reclaim_process_frames()`
+/// below) -- only the P3/P2/P1 TABLE frames themselves. No huge pages
+/// exist anywhere in this kernel (every `map_to()` call in this file
+/// uses `Size4KiB`), so a PRESENT P2 entry is always a real P1 table,
+/// never a 2MB leaf mapping.
+fn reclaim_private_page_tables(pml4_frame: PhysFrame<Size4KiB>, phys_mem_offset: VirtAddr, fa: &mut memory::BootInfoFrameAllocator) -> usize {
+    let user_p4_index = VirtAddr::new(usertest::USER_CODE_ADDR).p4_index();
+    let pml4_ptr: *const PageTable = (phys_mem_offset + pml4_frame.start_address().as_u64()).as_ptr();
+    let pml4: &PageTable = unsafe { &*pml4_ptr };
+    let p3_frame = match pml4[user_p4_index].frame() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+
+    let mut freed = 0usize;
+    let p3_ptr: *const PageTable = (phys_mem_offset + p3_frame.start_address().as_u64()).as_ptr();
+    let p3: &PageTable = unsafe { &*p3_ptr };
+    for p3_entry in p3.iter() {
+        let p2_frame = match p3_entry.frame() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let p2_ptr: *const PageTable = (phys_mem_offset + p2_frame.start_address().as_u64()).as_ptr();
+        let p2: &PageTable = unsafe { &*p2_ptr };
+        for p2_entry in p2.iter() {
+            if let Ok(p1_frame) = p2_entry.frame() {
+                unsafe { fa.deallocate_frame(p1_frame) };
+                freed += 1;
+            }
+        }
+        unsafe { fa.deallocate_frame(p2_frame) };
+        freed += 1;
+    }
+    unsafe { fa.deallocate_frame(p3_frame) };
+    freed += 1;
+    freed
+}
+
+/// MILESTONE 54: read-only twin of `reclaim_private_page_tables()` above
+/// -- counts the same PRESENT P3/P2/P1 entries without freeing anything.
+/// Exists ONLY for `self_test_frame_reclaim()`'s own independent
+/// verification: the self-test needs to predict the TRUE expected
+/// free-list delta before a kill/reap happens, and computing that by
+/// calling the exact same code path being tested would prove nothing
+/// (a bug shared by both the walker and its own prediction would still
+/// "match"). Deliberately kept structurally identical to the real
+/// walker's traversal logic (same PRESENT check, same three-level walk)
+/// -- only what happens at each node differs (count vs. free).
+fn count_private_page_tables(pml4_frame: PhysFrame<Size4KiB>, phys_mem_offset: VirtAddr) -> usize {
+    let user_p4_index = VirtAddr::new(usertest::USER_CODE_ADDR).p4_index();
+    let pml4_ptr: *const PageTable = (phys_mem_offset + pml4_frame.start_address().as_u64()).as_ptr();
+    let pml4: &PageTable = unsafe { &*pml4_ptr };
+    let p3_frame = match pml4[user_p4_index].frame() {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+
+    let mut count = 0usize;
+    let p3_ptr: *const PageTable = (phys_mem_offset + p3_frame.start_address().as_u64()).as_ptr();
+    let p3: &PageTable = unsafe { &*p3_ptr };
+    for p3_entry in p3.iter() {
+        let p2_frame = match p3_entry.frame() {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let p2_ptr: *const PageTable = (phys_mem_offset + p2_frame.start_address().as_u64()).as_ptr();
+        let p2: &PageTable = unsafe { &*p2_ptr };
+        for p2_entry in p2.iter() {
+            if p2_entry.frame().is_ok() {
+                count += 1;
+            }
+        }
+        count += 1;
+    }
+    count + 1
+}
+
+/// MILESTONE 54: real physical frame reclamation -- returns a dead
+/// process's PML4/code/stack/heap/extra frames to the global frame
+/// allocator's free list (see memory.rs's `BootInfoFrameAllocator`),
+/// closing the gap `kill()`/`wait_for_child()`/`exec_elf()` have each
+/// disclosed since Milestones 37/41/45: this kernel's frame allocator
+/// used to only ever bump-allocate, never free, so every dead process's
+/// frames were permanently abandoned (not corrupted, just never
+/// reusable again) for the rest of the boot. `heap_frames` and
+/// `extra_frames` existed as real, tracked per-process state since
+/// Milestones 33/36 specifically so a future reclaim path would have
+/// something to free -- this is that path, finally reading them back
+/// out instead of only ever writing them.
+///
+/// Takes `p` by value (full ownership), not `&Process` -- the whole
+/// point is that NOTHING else can still be holding a reference to these
+/// frames once this runs, and taking ownership is what makes that a
+/// compile-time guarantee rather than a caller convention to trust.
+/// Safe to call unconditionally: every one of these frames was
+/// allocated through `memory::with_frame_allocator()` in the first
+/// place (see `create_process_from_image()`/`create_process_from_elf()`),
+/// so returning them to that same allocator is always well-formed.
+fn reclaim_process_frames(p: Process) {
+    let phys_mem_offset = memory::phys_mem_offset();
+    let freed = memory::with_frame_allocator(|fa| {
+        let mut n = reclaim_private_page_tables(p.pml4_frame, phys_mem_offset, fa);
+        unsafe {
+            fa.deallocate_frame(p.pml4_frame);
+            fa.deallocate_frame(p.code_frame);
+            fa.deallocate_frame(p.stack_frame);
+        }
+        n += 3;
+        for frame in p.heap_frames.iter().copied() {
+            unsafe { fa.deallocate_frame(frame) };
+            n += 1;
+        }
+        for frame in p.extra_frames.iter().copied() {
+            unsafe { fa.deallocate_frame(frame) };
+            n += 1;
+        }
+        n
+    });
+    let _ = writeln!(
+        serial(),
+        "milestone 54: reclaim_process_frames('{}') -- freed {} physical frame(s) back to the allocator's free list",
+        p.label,
+        freed.unwrap_or(0)
+    );
+}
+
 /// MILESTONE 45: like `with_process_mut()` above, but replaces the
 /// WHOLE `Process` value at `id`'s slot instead of mutating the existing
 /// one in place -- `exec_elf()`'s own real teardown-and-rebuild step
@@ -1082,50 +1231,31 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
 /// for an occupied slot), `false` if `id` doesn't name any real slot at
 /// all (mirrors `with_process_mut()` returning `None` for an unknown id).
 fn replace_process(id: u8, new_proc: Process) -> bool {
-    match id {
-        1 => {
-            *PROCESS_A.lock() = Some(new_proc);
-            true
-        }
-        2 => {
-            *PROCESS_B.lock() = Some(new_proc);
-            true
-        }
-        LOADED_PROCESS_ID => {
-            *LOADED_PROCESS.lock() = Some(new_proc);
-            true
-        }
-        FDTEST_PROCESS_ID => {
-            *FDTEST_PROCESS.lock() = Some(new_proc);
-            true
-        }
-        FORK_TEST_PROCESS_ID => {
-            *FORK_TEST_PROCESS.lock() = Some(new_proc);
-            true
-        }
-        SIGSEGV_TEST_PROCESS_ID => {
-            *SIGSEGV_TEST_PROCESS.lock() = Some(new_proc);
-            true
-        }
-        SIGKILL_TEST_PROCESS_ID => {
-            *SIGKILL_TEST_PROCESS.lock() = Some(new_proc);
-            true
-        }
-        WAITSTATUS_TEST_PROCESS_ID => {
-            *WAITSTATUS_TEST_PROCESS.lock() = Some(new_proc);
-            true
-        }
-        EXEC_TEST_PROCESS_ID => {
-            *EXEC_TEST_PROCESS.lock() = Some(new_proc);
-            true
-        }
+    // MILESTONE 54: `.replace()` (not a plain assignment) so the OLD
+    // value is captured rather than silently dropped -- exec()'s own
+    // "dropped, never reclaimed" limitation, disclosed on exec_elf()'s
+    // own doc comment, ends here: the old process's frames are real
+    // reusable memory again the instant this returns.
+    let old = match id {
+        1 => PROCESS_A.lock().replace(new_proc),
+        2 => PROCESS_B.lock().replace(new_proc),
+        LOADED_PROCESS_ID => LOADED_PROCESS.lock().replace(new_proc),
+        FDTEST_PROCESS_ID => FDTEST_PROCESS.lock().replace(new_proc),
+        FORK_TEST_PROCESS_ID => FORK_TEST_PROCESS.lock().replace(new_proc),
+        SIGSEGV_TEST_PROCESS_ID => SIGSEGV_TEST_PROCESS.lock().replace(new_proc),
+        SIGKILL_TEST_PROCESS_ID => SIGKILL_TEST_PROCESS.lock().replace(new_proc),
+        WAITSTATUS_TEST_PROCESS_ID => WAITSTATUS_TEST_PROCESS.lock().replace(new_proc),
+        EXEC_TEST_PROCESS_ID => EXEC_TEST_PROCESS.lock().replace(new_proc),
         id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
             let idx = (id - PID_TABLE_BASE) as usize;
-            PROCESS_TABLE.lock()[idx] = Some(new_proc);
-            true
+            PROCESS_TABLE.lock()[idx].replace(new_proc)
         }
-        _ => false,
+        _ => return false,
+    };
+    if let Some(old_proc) = old {
+        reclaim_process_frames(old_proc);
     }
+    true
 }
 
 /// MILESTONE 35: the `open` syscall's kernel-side implementation. `path`
@@ -2955,7 +3085,14 @@ pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<(u8, WaitOu
     // usertest::CHILD_FAULTED's own doc comment for the real,
     // previously-silent misreport this closes.
     if usertest::take_child_faulted() {
-        PROCESS_TABLE.lock()[idx] = None;
+        // MILESTONE 54: `.take()` instead of `= None` -- see kill()'s
+        // identical change just below in this file for the real reason
+        // (captures the dead child so its frames can be reclaimed,
+        // rather than silently dropping them).
+        let old_proc = PROCESS_TABLE.lock()[idx].take();
+        if let Some(p) = old_proc {
+            reclaim_process_frames(p);
+        }
         let _ = writeln!(
             serial(),
             "milestone 53: syscall WAIT (process {parent_id}) -- child pid {child_pid} was signal-terminated (real hardware fault, not its own exit()) and was reaped, CR3 restored to parent's own pml4 {:#x}",
@@ -2975,7 +3112,11 @@ pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<(u8, WaitOu
     // case (a fault) that could otherwise have left this stale.
     let exit_code = usertest::take_last_child_exit_code();
 
-    PROCESS_TABLE.lock()[idx] = None;
+    // MILESTONE 54: same reclamation as the Signaled arm just above.
+    let old_proc = PROCESS_TABLE.lock()[idx].take();
+    if let Some(p) = old_proc {
+        reclaim_process_frames(p);
+    }
     let _ = writeln!(
         serial(),
         "milestone 43: syscall WAIT (process {parent_id}) -- child pid {child_pid} ran to completion and was reaped (real exit code {exit_code}), CR3 restored to parent's own pml4 {:#x}",
@@ -2995,13 +3136,13 @@ pub(crate) fn wait_for_child(parent_id: u8, child_pid: u8) -> Option<(u8, WaitOu
 /// is no separate "already ran, not yet reaped" case to guard against
 /// here.
 ///
-/// **Real, honest, disclosed limitation, matching wait_for_child()'s
-/// OWN precedent exactly**: frees the PROCESS_TABLE slot for reuse but
-/// does not reclaim the child's physical frames (PML4/code/stack/heap).
-/// This kernel has never reclaimed frames on process exit or reap
-/// either -- MAX_PROCESSES=4 total, ever, made that an acceptable,
-/// already-shipped simplification well before this milestone; kill()
-/// does not introduce a new gap, it just inherits the existing one.
+/// **MILESTONE 54 update**: this used to disclose a real limitation
+/// here -- frees the PROCESS_TABLE slot for reuse but does NOT reclaim
+/// the child's physical frames (PML4/code/stack/heap), matching
+/// wait_for_child()'s own identical, then-also-unfixed gap. As of
+/// Milestone 54 both now actually call `reclaim_process_frames()`
+/// before dropping the slot -- the frames go back to the global
+/// allocator's free list for real reuse, not just a freed table index.
 pub(crate) fn kill(caller_id: u8, target_pid: u8) -> bool {
     if target_pid < PID_TABLE_BASE {
         return false;
@@ -3019,13 +3160,22 @@ pub(crate) fn kill(caller_id: u8, target_pid: u8) -> bool {
         );
         return false;
     }
-    table[idx] = None;
+    // MILESTONE 54: `.take()` instead of `= None` -- captures the dead
+    // child's Process value so its frames can actually be reclaimed
+    // below, closing this function's own previously-disclosed
+    // limitation (see its doc comment above, now out of date -- frames
+    // ARE reclaimed as of this milestone).
+    let old_proc = table[idx].take();
     // MILESTONE 43: record this kill in the side channel BEFORE
     // dropping the table lock, so a later wait() call can learn the
     // real outcome even though the slot above is already free for a
     // brand-new fork() to land in (unchanged M41 behavior -- this is
     // additive, not a replacement).
     *LAST_KILLED.lock() = Some((target_pid, caller_id));
+    drop(table);
+    if let Some(p) = old_proc {
+        reclaim_process_frames(p);
+    }
     let _ = writeln!(
         serial(),
         "milestone 41: syscall KILL (process {caller_id}) -- pid {target_pid} terminated WITHOUT ever running (bypassed wait()'s normal run-then-reap contract), slot freed for reuse"
@@ -3340,10 +3490,11 @@ pub fn self_test_wait_status() {
 /// (`load_and_run_elf()`) and `fork()`'s own child-builder
 /// (indirectly, via `create_process_from_image()`'s sibling) already
 /// use, not a duplicated loader. The calling process's OLD pml4/code/
-/// stack/heap frames are simply replaced (dropped, never reclaimed --
-/// see this function's own teardown comment below), and CR3 is switched
-/// to the new address space before returning, exactly like
-/// `load_and_run_elf()` does for a brand-new process.
+/// stack/heap frames are replaced -- as of Milestone 54, genuinely
+/// reclaimed (see this function's own teardown comment below), not just
+/// dropped -- and CR3 is switched to the new address space before
+/// returning, exactly like `load_and_run_elf()` does for a brand-new
+/// process.
 ///
 /// Real POSIX exec() contract, checked field by field:
 ///   - SAME pid (the process's own table slot is replaced in place, not
@@ -3364,22 +3515,17 @@ pub fn self_test_wait_status() {
 ///     already `create_process_from_elf()`'s own default for a
 ///     brand-new process).
 ///
-/// **Real, honest, disclosed teardown limitation, matching
-/// `kill()`/`wait_for_child()`'s OWN already-shipped precedent
-/// exactly**: the old process's pml4/code/stack/heap physical frames
-/// are not reclaimed -- this kernel's frame allocator has never freed a
-/// physical frame on process exit, reap, or kill (see
-/// `memory::BootInfoFrameAllocator`'s own doc comment: "bump-allocates
-/// only, never frees"), so there was never a real deallocation path for
-/// exec() to call into here either. `exec()` doesn't introduce a new
-/// gap, it just inherits the existing one, exactly like `kill()`
-/// already does. What DOES genuinely change here, unlike the old
-/// Milestone 37 placeholder: the OLD frames are actually abandoned
-/// (this process's own page tables no longer reference them at all,
-/// once CR3 is switched to the new PML4 below) rather than reused --
-/// this is the real "teardown" half of "teardown-and-rebuild", even
-/// though "teardown" in this kernel has only ever meant "stop
-/// referencing", never "return to a free list" (there isn't one).
+/// **MILESTONE 54 update**: this doc comment used to disclose a real
+/// limitation here, matching `kill()`/`wait_for_child()`'s own
+/// then-identical gap -- the old process's pml4/code/stack/heap/extra
+/// physical frames were replaced but never reclaimed, because this
+/// kernel's frame allocator had never freed a physical frame on process
+/// exit, reap, or kill at all. As of Milestone 54, `replace_process()`
+/// (called below via `replace_process(id, new_proc)`) captures the OLD
+/// `Process` value via `Mutex::replace()` instead of discarding it, and
+/// calls `reclaim_process_frames()` on it -- the real "teardown" half of
+/// "teardown-and-rebuild" now means "returned to the free list", not
+/// just "stopped referencing".
 pub(crate) fn exec_elf(id: u8, image: &[u8], elf_image: &elf::ElfImage) -> Result<u64, &'static str> {
     // Snapshot exactly what real exec() must carry across unchanged --
     // each fallible/heap-touching read its own statement, same reasoning
@@ -3566,6 +3712,152 @@ pub fn self_test_fault_status() {
         serial(),
         "milestone 53: self-test -- OVERALL: {}",
         if faulted_ok && recovery_ok && reuse_ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// MILESTONE 54: real, boot-time, non-interactive proof that
+/// `reclaim_process_frames()` returns a dead process's physical frames
+/// to the allocator's free list AND that a later allocation genuinely
+/// reuses them -- not just that the bookkeeping runs without erroring.
+/// Reuses FAULT_TEST_PROCESS_ID as its own fork source (same "don't pick
+/// a fresh test process/program when an existing one already fits"
+/// discipline as every other self-test in this file); the dummy (0,0)
+/// resume point + immediate kill() pattern is Milestone 53's own reuse_ok
+/// check's exact precedent -- the point here is frame bookkeeping, not a
+/// real ring-3 excursion.
+///
+/// Real history worth keeping, not smoothed over: this self-test went
+/// through THREE honest failures before this version, all real bugs (or
+/// real wrong test assumptions) it found, none hidden or worked around:
+///   - v1 hardcoded "expected +3 frames" (pml4/code/stack), assuming a
+///     forked child's heap is lazily populated. First QEMU boot: real
+///     MISMATCH -- `fork()` eagerly maps a private 4-page heap for every
+///     child, so the true leaf count is 7. Fixed by reading
+///     `heap_frames.len()` off the live process instead of guessing.
+///   - v2 (leaf count now correct) asserted a second fork()'s frames are
+///     ALL drawn from the exact set just freed. Second QEMU boot: real
+///     MISMATCH -- `map_to()` also allocates PRIVATE P3/P2/P1 page-table
+///     frames on demand (see `create_process_from_image()`), which
+///     `reclaim_process_frames()` didn't reclaim yet, so a second
+///     process needs MORE real frames than the 7 leaf ones freed. Fixed
+///     by actually implementing page-table reclamation
+///     (`reclaim_private_page_tables()`) rather than weakening this test
+///     to stop checking for it.
+///   - v3 (page-table reclaim now real, total count independently
+///     confirmed correct) STILL asserted the second fork()'s LEAF frames
+///     specifically matched the freed LEAF set. Third QEMU boot: real
+///     MISMATCH again -- leaf and page-table allocate_frame() calls are
+///     INTERLEAVED during construction (pml4, code, stack, then
+///     map_to()'s on-demand P3/P2/P1, then each heap page immediately
+///     followed by its own map_to()), so the LIFO free list's pop order
+///     does not cleanly hand leaf frames back to the leaf fields alone.
+///     Fixed by testing the TOTAL instead (see check 2 below) -- simpler
+///     and strictly stronger than trying to pin down which specific
+///     frame landed where.
+///
+/// Two real, independent checks, not one, both accounting for the FULL
+/// real frame cost (leaf + page-table), never just the leaf fields:
+///   1. `free_list_len()` grows by exactly `real_frame_cost()` (leaf
+///      fields plus `count_private_page_tables()`'s independent,
+///      read-only walk -- see that function's own doc comment for why
+///      it's kept separate from the freeing walker) the instant the
+///      first forked child is killed.
+///   2. A second, freshly-forked child from the SAME source has its own
+///      real frame cost checked to be exactly the same as the first
+///      (proving determinism, not assumed), and its construction drains
+///      the free list to exactly zero -- proving every single one of
+///      the frames just freed was genuinely reused, not that merely
+///      "enough" of them were.
+pub fn self_test_frame_reclaim() {
+    let phys_mem_offset = memory::phys_mem_offset();
+
+    // Real, independent per-process frame cost: pml4 + code + stack +
+    // heap_frames + extra_frames (the tracked leaf fields), PLUS
+    // whatever `count_private_page_tables()` finds by walking the SAME
+    // process's own page tables read-only. Captured before the process
+    // is killed -- its page tables are still valid to walk right up
+    // until `kill()`/`wait_for_child()` actually reclaims them.
+    fn real_frame_cost(pid: u8, phys_mem_offset: VirtAddr) -> Option<usize> {
+        with_process_mut(pid, |p| {
+            let leaf = 3 + p.heap_frames.len() + p.extra_frames.len();
+            count_private_page_tables(p.pml4_frame, phys_mem_offset) + leaf
+        })
+    }
+
+    let first_cost = fork(FAULT_TEST_PROCESS_ID, 0, 0).and_then(|pid| {
+        let cost = real_frame_cost(pid, phys_mem_offset);
+        let before = memory::with_frame_allocator(|fa| fa.free_list_len()).unwrap_or(0);
+        let killed = kill(FAULT_TEST_PROCESS_ID, pid);
+        let after = memory::with_frame_allocator(|fa| fa.free_list_len()).unwrap_or(0);
+        match cost {
+            Some(cost) => {
+                let count_ok = killed && after == before + cost;
+                let _ = writeln!(
+                    serial(),
+                    "milestone 54: self-test -- forked+killed pid {pid} (independently counted real frame cost, leaf+page-tables: {cost}), free list grew {before} -> {after} -- {}",
+                    if count_ok { "confirmed" } else { "MISMATCH" }
+                );
+                count_ok.then_some(cost)
+            }
+            None => {
+                let _ = writeln!(serial(), "milestone 54: self-test -- FAILED, could not read back the forked child's own frame cost before killing it");
+                None
+            }
+        }
+    });
+    if first_cost.is_none() {
+        let _ = writeln!(serial(), "milestone 54: self-test -- FAILED, fork() itself failed for the reclaim-count check");
+    }
+
+    // Real proof of REUSE, not just a count that happens to match: a
+    // second, freshly-forked child (same source, so deterministically
+    // the SAME real frame cost as the first -- checked explicitly, not
+    // assumed) needs `cost` frames, and the free list holds EXACTLY
+    // `cost` frames sitting there from the first child's reclaim. If
+    // its construction draws every single one of them (free list drains
+    // to exactly zero) rather than falling through to fresh bump
+    // allocation for any of them, that's real, complete physical reuse
+    // -- checking the TOTAL drains cleanly, rather than trying to match
+    // individual freed/reused addresses field-by-field, sidesteps a
+    // real wrinkle this self-test found the hard way: leaf and
+    // page-table frames are allocated in an INTERLEAVED order during
+    // construction (pml4, code, stack, THEN map_to()'s own on-demand
+    // P3/P2/P1 allocations, THEN each heap page followed immediately by
+    // ITS OWN map_to()), so the free list's LIFO pop order does not
+    // cleanly hand the leaf frames back to the leaf fields alone --
+    // asserting the TOTAL is exact and complete is both simpler and
+    // strictly stronger than trying to pin down which specific frame
+    // landed where.
+    let reuse_ok = match first_cost {
+        Some(cost) => match fork(FAULT_TEST_PROCESS_ID, 0, 0) {
+            Some(pid2) => {
+                let second_cost = real_frame_cost(pid2, phys_mem_offset);
+                let remaining = memory::with_frame_allocator(|fa| fa.free_list_len()).unwrap_or(usize::MAX);
+                let _ = kill(FAULT_TEST_PROCESS_ID, pid2);
+                let symmetric = second_cost == Some(cost);
+                let fully_drained = remaining == 0;
+                let _ = writeln!(
+                    serial(),
+                    "milestone 54: self-test -- second fork()'s own real frame cost: {:?} (expected {cost}, symmetric={symmetric}); free list after its construction: {remaining} (expected 0, fully drained={fully_drained})",
+                    second_cost
+                );
+                symmetric && fully_drained
+            }
+            None => {
+                let _ = writeln!(serial(), "milestone 54: self-test -- FAILED, second fork() itself failed for the real-reuse check");
+                false
+            }
+        },
+        None => {
+            let _ = writeln!(serial(), "milestone 54: self-test -- skipping real-reuse check, the reclaim-count check above already failed");
+            false
+        }
+    };
+
+    let _ = writeln!(
+        serial(),
+        "milestone 54: self-test -- OVERALL: {}",
+        if first_cost.is_some() && reuse_ok { "PASS" } else { "FAIL" }
     );
 }
 

@@ -1625,6 +1625,42 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       `PASS`; combined boot also re-confirmed 82 real timer interrupts
       and genuine preemptive multitasking still functioning afterward,
       proving the three-self-test interrupt ordering holds.
+- [x] **Milestone 53**: real `WaitOutcome::Signaled` status for forked
+      children terminated by a hardware fault instead of their own
+      `exit()`. Closes a genuinely silent, previously-undetected gap:
+      `wait_for_child()` had no way to distinguish a page-faulted/#GP'd
+      child from a normally-exited one, so it reported whatever STALE
+      exit code an earlier, unrelated child's real `exit()` last wrote
+      (or 0, on a boot's first `wait()`) as `WaitOutcome::Exited`,
+      mislabeling a crashed child as one that finished normally. Fixed
+      with a `CHILD_FAULTED` flag set by
+      `terminate_faulted_process_and_resume_kernel()` only when the fault
+      hit a forked child mid-`wait()`, consumed atomically by
+      `wait_for_child()` before it ever reads the exit-code field. Proven
+      by a real, non-interactive self-test: forks a child whose entire
+      program is a single faulting instruction (no `exit()` anywhere),
+      confirms `wait()` reports `Signaled` not a stale `Exited`, confirms
+      an unrelated top-level process still runs normally right after
+      (real recovery, not just "didn't crash yet"), and confirms the
+      freed slot is genuinely reusable by forking a second child into it.
+      That self-test found and fixed a real bug in itself, not the
+      kernel: its first version asserted the whole process table was
+      empty after cleanup, which is false given Milestone 41's own
+      SIGKILL self-test deliberately leaves an unrelated child
+      permanently unreaped elsewhere in the table -- caught via an actual
+      QEMU boot, not review, and narrowed to check only its own slot.
+      Real merge conflict with the already-merged Milestone 45: this
+      branch predated Milestone 45 and independently picked PID 9 for
+      its own new hardcoded process slot, colliding with Milestone 45's
+      `EXEC_TEST_PROCESS_ID`; resolved by renumbering to PID 10 and
+      bumping `PID_TABLE_BASE` to 11. A second conflict interleaved
+      `exec_elf()`'s body with this milestone's self-test and a stale
+      pre-Milestone-45 `exec_process()` placeholder this branch never saw
+      removed; resolved by hand, reconstructing `exec_elf()` contiguously
+      and dropping the stale placeholder. Re-verified with a fresh build
+      and a fresh QEMU boot on the merged tree (persist disk attached):
+      milestones 42/43/44/45/53 all self-report `OVERALL: PASS`, zero
+      panics, boot reaches the interactive shell normally.
 
 ## Building and running
 

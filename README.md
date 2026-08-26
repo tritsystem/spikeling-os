@@ -1735,6 +1735,45 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       build, fresh QEMU boot with the persist disk attached, milestones
       42/43/44/45/47/53/54/55 all pass, zero panics, boot reaches the
       interactive shell normally.
+- [x] **Milestone 56**: real UDP (RFC 768), the second IP-layer protocol
+      this kernel speaks -- closes another piece of the gap Milestone
+      47's own doc comment disclosed as future work, built on Milestone
+      55's real IPv4 header framing and Milestone 47's ARP resolution.
+      Adds `UdpHeader` with hand-written network-byte-order encode/
+      decode, `udp_checksum()` (RFC 768's pseudo-header fed through the
+      SAME shared `internet_checksum()` Milestone 55 built for IPv4/
+      ICMP, not a second, independently-trusted copy, including the
+      "computed checksum of 0 is sent as 0xFFFF" rule handled honestly
+      on both ends), `build_udp_frame()`/`send_udp()` (an owned `Vec<u8>`
+      since a real UDP message's length isn't known until runtime,
+      bounded by `UDP_MAX_PAYLOAD` = 214 bytes with a real `Err` on
+      overflow rather than silent truncation), and
+      `parse_udp_datagram()`/`recv_udp()` (bounds-checked before any
+      slice indexing, validates the checksum by recomputing it against
+      the bytes actually received rather than trusting the sender's
+      claim). A real minimal listener registry
+      (`register`/`unregister_udp_listener`, `MAX_UDP_LISTENERS` = 8)
+      gives `recv_udp()` genuine port-based demultiplexing.
+      `udp_send_resolved()` mirrors `icmp_ping()`'s own loopback
+      discipline exactly, for the identical reason. New
+      `udpsend <ip> <port> <message>` shell command. Two boot-time
+      self-tests: a primary loopback round trip through the real receive
+      path (checksum validation included -- chosen over a real off-box
+      round trip because QEMU slirp has no UDP application service to
+      bounce one off of, confirmed by checking the netdev config for
+      hostfwd/guestfwd rules: none exist) and a real-wire send test that
+      calls `udp_send_resolved()` directly -- the literal function
+      `udpsend` invokes -- and gets a real TX descriptor DD-confirmation
+      against QEMU slirp's gateway. Both self-tests PASS with exact
+      matching field values (sender IP, both ports, 38-byte payload) on
+      first real boot, no bugs found this session. Independently
+      reviewed in a separate verification pass (fresh build, fresh boot
+      log, direct source inspection) -- verdict: VERIFIED, no
+      discrepancies found. Clean fast-forward merge into `main` (no
+      conflicts); re-verified end to end afterward: fresh build, fresh
+      QEMU boot with the persist disk attached, milestones
+      42/43/44/45/47/51/53/54/55/56 all pass, zero panics, boot reaches
+      the interactive shell normally.
 
 ## Building and running
 

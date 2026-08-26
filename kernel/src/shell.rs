@@ -154,7 +154,7 @@ fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, ping, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest, seedmalloctest\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, ping, udpsend, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest, seedmalloctest\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -772,6 +772,41 @@ fn run_command(cmd: &str) {
                         "runelf: parsed a REAL ELF64 file, mapped its PT_LOAD segments at their own vaddrs, and ran it under its own private page table -- write+exit syscalls returned cleanly, see serial log for the parsed e_entry/segments + the message it printed (proof execution reached a non-zero-offset segment) + hardware CPL confirmation\n",
                     ),
                     Err(e) => crate::console::write_str(&format!("{e}\n")),
+                }
+            } else if let Some(rest) = other.strip_prefix("udpsend ") {
+                // MILESTONE 56: real UDP send -- mirrors the arp/ping
+                // command pattern (resolve the target's MAC over the
+                // real wire, loopback OFF for the whole real round
+                // trip, restored afterward regardless of outcome).
+                // "udpsend IP PORT MESSAGE...": MESSAGE is everything
+                // after the port, spaces included, same "rest of the
+                // line is free text" convention the `write` command
+                // already uses for its own TEXT argument.
+                match rest.split_once(' ').and_then(|(ip, tail)| tail.split_once(' ').map(|(port, msg)| (ip, port, msg)))
+                {
+                    Some((ip_str, port_str, message)) => match (crate::nic::parse_ipv4(ip_str), port_str.parse::<u16>()) {
+                        (Some(dest_ip), Ok(dest_port)) => {
+                            match crate::nic::udp_send_resolved(
+                                dest_ip,
+                                crate::nic::UDP_SEND_SRC_PORT,
+                                dest_port,
+                                message.as_bytes(),
+                            ) {
+                                Ok(true) => crate::console::write_str(&format!(
+                                    "UDP datagram sent to {}:{dest_port} -- {} bytes, descriptor DD confirmed (real ARP-resolved transmission over the emulated network, loopback OFF; UDP is one-way, no reply is awaited)\n",
+                                    crate::nic::format_ip(dest_ip),
+                                    message.len()
+                                )),
+                                Ok(false) => crate::console::write_str(
+                                    "UDP datagram queued and TDT advanced, but TX DD bit never set within timeout -- transmission NOT confirmed\n",
+                                ),
+                                Err(e) => crate::console::write_str(&format!("udpsend FAILED: {e}\n")),
+                            }
+                        }
+                        (None, _) => crate::console::write_str(&format!("udpsend FAILED: '{ip_str}' is not a valid dotted-quad IPv4 address\n")),
+                        (_, Err(_)) => crate::console::write_str(&format!("udpsend FAILED: '{port_str}' is not a valid port number\n")),
+                    },
+                    None => crate::console::write_str("usage: udpsend IP PORT MESSAGE...\n"),
                 }
             } else if let Some(rest) = other.strip_prefix("pixel ") {
                 match parse_usize_args::<2>(rest) {

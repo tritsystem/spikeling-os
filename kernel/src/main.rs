@@ -731,6 +731,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // IP-layer protocol this kernel speaks, closing the gap M47's own
     // doc comment explicitly disclosed as future work.
     nic::self_test_icmp_ping();
+    // MILESTONE 56: real UDP send/receive on top of Milestone 55's IPv4
+    // layer -- a LOOPBACK self-test (see nic.rs's own module doc for why:
+    // no default UDP echo service exists on QEMU slirp's gateway the way
+    // ICMP's own self-test above relies on), same ordering reasoning as
+    // the two self-tests immediately above (still polling-only, before
+    // PIC remap/interrupts).
+    nic::self_test_udp_loopback();
+    // MILESTONE 56: the loopback self-test above never exercises
+    // udp_send_resolved() (the `udpsend` shell command's actual backing
+    // function -- real ARP resolution + loopback-OFF real-wire send);
+    // this proves THAT code path genuinely reaches the real netdev
+    // backend, same ordering reasoning as every self-test in this block.
+    nic::self_test_udp_send_realwire();
 
     interrupts::init_pics();
     shell::init();

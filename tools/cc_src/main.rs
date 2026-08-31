@@ -3579,7 +3579,7 @@ macro_rules! write_exec_and_check {
             w(b"  build_elf64_standalone returned null (malloc failure)\n");
             false
         } else {
-            let __fd = sys_open(__path.as_ptr() as u64, __path.len() as u64);
+            let __fd = sys_open_trunc(__path.as_ptr() as u64, __path.len() as u64);
             if __fd == SYSCALL_FAIL {
                 w(b"  sys_open failed\n");
                 false
@@ -5003,7 +5003,7 @@ pub extern "C" fn _start() -> ! {
             w(b"  case34 compile_program_standalone_elf failed\n");
             false
         } else {
-            let fd34 = sys_open(PATH34.as_ptr() as u64, PATH34.len() as u64);
+            let fd34 = sys_open_trunc(PATH34.as_ptr() as u64, PATH34.len() as u64);
             if fd34 == SYSCALL_FAIL {
                 w(b"  case34 sys_open failed\n");
                 false

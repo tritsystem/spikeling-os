@@ -5923,6 +5923,71 @@ self-test suite, genuinely open for a future pass.
       `hetero_stdp.rs`, same disclosed gaps Milestone 80 named,
       unchanged by this milestone.
 
+- [x] **Milestone 82**: real `O_TRUNC` -- THE fix for the
+      `fread_real_buffering`/`eof_semantics` FAILs `tools/stdiotest_src`
+      has disclosed as open since Milestone 61/62, reproduced on every
+      reused-disk boot since. Root cause, confirmed by reading the code:
+      `process::open_file()` always preloaded a path's existing on-disk
+      bytes and `write_fd()` only ever GREW that buffer, never shrank it,
+      so a shorter new write over a longer existing file left the old
+      trailing bytes on disk after `close()`.
+
+      **Kernel side**: `process::open_file()` gains a `truncate: bool`
+      parameter -- when `true`, the in-memory buffer starts genuinely
+      empty (`fs::read_file()` is never called) and the fd is marked
+      `dirty` immediately, so `close_fd()`'s own dirty-gated persist
+      writes the (possibly still-empty) buffer back even when zero
+      `fdwrite()`s are ever issued -- real `O_TRUNC` semantics, not
+      merely "future writes start from zero". `truncate=false` is
+      byte-for-byte the original Milestone 35 path.
+
+      **ABI**: real O_TRUNC is its OWN syscall number (**24**,
+      `open_trunc(path_ptr, path_len)`), NOT a new flag argument bolted
+      onto syscall 3 -- the exact reasoning syscall 23 (`mmap_writable`)
+      already documents for staying separate from syscall 21. Syscall 3
+      (`open`) is left byte-for-byte as Milestone 35 shipped it, so every
+      existing OPEN caller is untouched -- including this kernel's own
+      six hand-assembled OPEN callers (the Milestone 64/65 MMAP test
+      programs in `process.rs`), none of which zero `rdx` before `int
+      0x80`. **A first draft of this milestone overloaded syscall 3's
+      `rdx` as a truncate flag and silently broke exactly those six
+      programs' self-tests** (they `mmap` a file they only meant to read,
+      and a leftover nonzero `rdx` from the prior `sbrk` truncated it) --
+      `milestone 64`/`milestone 65 ... OVERALL: FAIL`, PASS through
+      Milestone 81. The dedicated syscall number has no such failure
+      mode; the draft's rebuilt `.elf` assets could not have covered the
+      hand-assembled callers regardless. Only libc's own `fopen(path,
+      "w")` (all four `libc.rs` copies) routes to syscall 24; `'r'` and
+      `'a'` still need the existing content and keep plain `sys_open()`.
+
+      **Verified**: `cargo build --target x86_64-unknown-none` clean, no
+      warnings. `cc.elf`/`stdiotest.elf` rebuilt (`libctest.elf`/
+      `malloctest.elf` rebuilt too, byte-identical -- those libc copies
+      don't reach the truncating path). Two full QEMU boots, a genuine
+      fresh-disk then reused-disk pair (`target/persist.img`/
+      `persist2.img` wiped before the fresh one): on BOTH,
+      `stdiotest ... fread_real_buffering=PASS eof_semantics=PASS
+      content_roundtrip=PASS OVERALL=PASS` -- the disclosed FAIL is now a
+      real PASS on a reused disk, the case that actually exercises the
+      bug. `milestone 64`/`milestone 65 ... OVERALL: PASS` both boots
+      (regression from the discarded draft gone). `OVERALL_M68`..`M81`
+      all still PASS, `milestones 42/43/44/45/53/54/57/59/60/66` all
+      still PASS. The only `FAIL` lines left are the same pre-existing,
+      already-disclosed set every milestone since 70 has named: the
+      permissions/symlinks reused-disk non-idempotency gap (reused boot
+      only), the four deliberately-negative syscall tests (`SBRK`
+      over-request, `READ` bad fd, `WAIT`/`GETPGID` dead pid -- each
+      returning its real error sentinel by design), and `milestone 6`'s
+      keyboard test (needs an external key-injecting harness). No new
+      regressions.
+
+      **Still genuinely open**: no `O_APPEND` flag and no `lseek()`
+      syscall (unchanged -- `fopen`'s `'a'` mode still gets real
+      append semantics by draining the fd to EOF with real `read()`s at
+      open time). The permissions/symlinks self-tests still aren't
+      idempotent across a persisted disk -- orthogonal to this milestone,
+      same disclosed gap.
+
 ## Building and running
 
 Requires:

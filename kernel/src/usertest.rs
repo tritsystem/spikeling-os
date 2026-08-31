@@ -722,6 +722,17 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
             // own ptr/len argument, just applied to a path instead of a
             // message. See MAX_PATH_LEN's own comment for what this cap
             // does and does not protect against.
+            // MILESTONE 82: this arm is UNCHANGED from Milestone 35 --
+            // it only ever reads rdi/rsi, never rdx. Real O_TRUNC lives
+            // in its OWN distinct syscall number (24, below), NOT bolted
+            // onto this one as a new rdx argument -- the exact same
+            // reasoning syscall 23 (mmap_writable) already documents for
+            // staying separate from syscall 21: this kernel has six
+            // hand-assembled OPEN callers (the Milestone 64/65 MMAP test
+            // programs in process.rs) that never zero rdx before `int
+            // 0x80`, so reading rdx here would misread their leftover
+            // register as a truncate request and silently truncate the
+            // file they meant only to read. `false` is passed literally.
             let path_ptr = regs.rdi;
             let requested_len = regs.rsi;
             let truncated = requested_len > MAX_PATH_LEN;
@@ -754,7 +765,7 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                     crate::process::set_errno(active, errno::EINVAL);
                     regs.rax = u64::MAX;
                 }
-                (_, Ok(path)) => match crate::process::open_file(active, path) {
+                (_, Ok(path)) => match crate::process::open_file(active, path, false) {
                     Some(fd) => {
                         let _ = writeln!(
                             serial(),
@@ -1868,6 +1879,77 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                         regs.rax = u64::MAX;
                     }
                 }
+            }
+        }
+        24 => {
+            // MILESTONE 82: open_trunc(path_ptr, path_len) -> fd (u64::MAX
+            // on failure). rdi = path_ptr, rsi = path_len -- byte-for-byte
+            // syscall 3's own argument handling; the ONLY difference is
+            // `open_file()` is called with `truncate = true`, so the
+            // in-memory buffer starts genuinely empty (the path's existing
+            // on-disk bytes are never read) and is marked dirty
+            // immediately -- real O_TRUNC semantics on close() even when
+            // zero writes are ever issued.
+            //
+            // A DISTINCT syscall number from 3 (deliberately -- the exact
+            // reasoning syscall 23 already documents for staying separate
+            // from syscall 21): syscall 3 stays byte-for-byte as Milestone
+            // 35 shipped it, so every existing OPEN caller is completely
+            // unaffected -- including this kernel's own six hand-assembled
+            // OPEN callers (the Milestone 64/65 MMAP test programs in
+            // process.rs), none of which zero rdx before `int 0x80`. An
+            // earlier draft of this milestone overloaded syscall 3's rdx
+            // as a truncate flag and silently broke exactly those six
+            // programs' self-tests (they mmap a file they only meant to
+            // read); a separate number has no such failure mode. Only
+            // libc's own `fopen(path, "w")` (all four libc.rs copies)
+            // routes here.
+            let path_ptr = regs.rdi;
+            let requested_len = regs.rsi;
+            let truncated = requested_len > MAX_PATH_LEN;
+            let len = if truncated { MAX_PATH_LEN } else { requested_len } as usize;
+            if truncated {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 82: syscall OPEN_TRUNC -- requested path_len {requested_len} exceeds MAX_PATH_LEN {MAX_PATH_LEN}, truncating"
+                );
+            }
+            let mut path_bytes = alloc::vec::Vec::with_capacity(len);
+            for i in 0..len {
+                path_bytes.push(unsafe { core::ptr::read((path_ptr as *const u8).wrapping_add(i)) });
+            }
+            match (active, core::str::from_utf8(&path_bytes)) {
+                (0, _) => {
+                    let _ = writeln!(
+                        serial(),
+                        "milestone 82: syscall OPEN_TRUNC called with no active process (plain usertest excursion has no fd table) -- ignoring, returning u64::MAX"
+                    );
+                    regs.rax = u64::MAX;
+                }
+                (_, Err(_)) => {
+                    let _ = writeln!(serial(), "milestone 82: syscall OPEN_TRUNC (process {active}) -- path is not valid UTF-8, returning u64::MAX");
+                    crate::process::set_errno(active, errno::EINVAL);
+                    regs.rax = u64::MAX;
+                }
+                (_, Ok(path)) => match crate::process::open_file(active, path, true) {
+                    Some(fd) => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 82: syscall OPEN_TRUNC (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- path='{path}' -> fd {fd} (truncated)",
+                            regs.cs
+                        );
+                        regs.rax = fd;
+                    }
+                    None => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 82: syscall OPEN_TRUNC (process {active}) -- FAILED for path='{path}' (fd table full -- max {} open files per process) -- returning u64::MAX",
+                            crate::process::MAX_OPEN_FILES
+                        );
+                        crate::process::set_errno(active, errno::EMFILE);
+                        regs.rax = u64::MAX;
+                    }
+                },
             }
         }
         other => {

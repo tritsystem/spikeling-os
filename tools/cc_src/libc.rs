@@ -113,6 +113,39 @@ pub unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
     ret
 }
 
+/// MILESTONE 82: real O_TRUNC open -- its OWN syscall number (24), NOT
+/// syscall 3 with an extra flag argument. Used by
+/// `write_exec_and_check!`'s own real ELF-write path and CASE 34's own
+/// direct write below, both of which reuse the SAME on-disk path
+/// (`PATH8`) across many different CASEs' differently-sized compiled
+/// ELF images within one boot -- a real latent instance of the exact
+/// bug this milestone fixes (a shorter later ELF write leaving a
+/// longer earlier ELF's trailing bytes on disk), though never
+/// EXHIBITED as a real test failure here specifically, because this
+/// kernel's own ELF loader reads based on the image's own real
+/// program-header-declared sizes, not raw file length -- trailing
+/// garbage past what the headers describe is genuinely harmless to
+/// loading. Fixed anyway for real correctness, not left as a
+/// known-but-lucky gap now that the real mechanism exists. A separate
+/// syscall number (not a new rdx argument on syscall 3) so every
+/// existing OPEN caller, compiled or hand-assembled, is untouched --
+/// see usertest.rs's own syscall-24 dispatch comment.
+#[inline(always)]
+pub unsafe fn sys_open_trunc(path_ptr: u64, path_len: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("rax") 24u64 => ret,
+            in("rdi") path_ptr,
+            in("rsi") path_len,
+            out("rcx") _, out("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 #[inline(always)]
 pub unsafe fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let ret: u64;

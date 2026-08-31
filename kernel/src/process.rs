@@ -2791,15 +2791,33 @@ fn replace_process(id: u8, new_proc: Process) -> bool {
 /// the new fd (an index into the process's own fds table) or `None` if
 /// the table is already full (MAX_OPEN_FILES) or `id` doesn't name a
 /// live process.
-pub(crate) fn open_file(id: u8, path: &str) -> Option<u64> {
-    let buffer = match fs::read_file(path) {
-        Ok(data) => data,
-        Err(_) => Vec::new(), // honest "doesn't exist yet" case, not an error -- see doc comment above
+/// MILESTONE 82: `truncate` (real O_TRUNC semantics) -- when true, the
+/// in-memory buffer starts genuinely EMPTY regardless of whatever this
+/// path already holds on disk, `fs::read_file()` is never even called
+/// (real, not a masked read). `dirty` is set `true` immediately in this
+/// case, not left for a later fdwrite() to set -- real O_TRUNC
+/// truncates the on-disk file the moment it's opened, even if this fd
+/// is closed with zero writes ever issued; without forcing `dirty`
+/// here, close_fd()'s own dirty-gated persist would skip writing back
+/// at all when nothing was ever fdwrite()'n, silently leaving the OLD,
+/// pre-truncate content on disk -- the exact opposite of what a
+/// truncating open means, checked against this before relying on it,
+/// not assumed safe. `truncate=false` is byte-for-byte the original
+/// Milestone 35 behavior, unchanged -- every existing caller of the
+/// plain (non-truncating) open path is unaffected.
+pub(crate) fn open_file(id: u8, path: &str, truncate: bool) -> Option<u64> {
+    let (buffer, dirty) = if truncate {
+        (Vec::new(), true)
+    } else {
+        match fs::read_file(path) {
+            Ok(data) => (data, false),
+            Err(_) => (Vec::new(), false), // honest "doesn't exist yet" case, not an error -- see doc comment above
+        }
     };
     let path_owned = path.to_string();
     with_process_mut(id, move |proc| {
         let slot_index = proc.fds.iter().position(|f| f.is_none())?;
-        proc.fds[slot_index] = Some(FdEntry::File(OpenFile { path: path_owned, buffer, pos: 0, dirty: false }));
+        proc.fds[slot_index] = Some(FdEntry::File(OpenFile { path: path_owned, buffer, pos: 0, dirty }));
         Some(slot_index as u64)
     })?
 }
@@ -6687,7 +6705,7 @@ pub fn self_test_real_exec() {
     // a path that doesn't exist yet still gets a real fd (open_file()'s
     // own "always succeeds, starts empty" contract, same as every other
     // caller of it in this file).
-    let fd_opened = open_file(EXEC_TEST_PROCESS_ID, "exectest_marker").is_some();
+    let fd_opened = open_file(EXEC_TEST_PROCESS_ID, "exectest_marker", false).is_some();
 
     let before = with_process_mut(EXEC_TEST_PROCESS_ID, |p| (p.pml4_frame, p.entry, p.pgid));
     if let Some((pml4, entry, pgid)) = before {

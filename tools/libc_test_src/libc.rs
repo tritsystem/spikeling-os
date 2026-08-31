@@ -103,6 +103,31 @@ pub unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
     ret
 }
 
+/// MILESTONE 82: real O_TRUNC open -- its OWN syscall number (24), NOT
+/// syscall 3 with an extra flag argument. Used by `fopen()`'s own
+/// `'w'` mode below so a `fopen(path, "w")` on a path that ALREADY
+/// holds more bytes than this session ends up writing genuinely
+/// truncates the old trailing content on close(), fixing the
+/// disclosed Milestone 35 limitation (see process::open_file()'s own
+/// doc comment for the kernel-side mechanism). A separate syscall
+/// number, not a new rdx argument on syscall 3, so every existing OPEN
+/// caller -- compiled or hand-assembled -- is untouched.
+#[inline(always)]
+pub unsafe fn sys_open_trunc(path_ptr: u64, path_len: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("rax") 24u64 => ret,
+            in("rdi") path_ptr,
+            in("rsi") path_len,
+            out("rcx") _, out("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 #[inline(always)]
 pub unsafe fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let ret: u64;
@@ -550,32 +575,29 @@ pub unsafe fn strchr(s: u64, c: u8) -> u64 {
 // no new syscalls, this is a pure userspace layer over what already
 // exists.
 //
-// Real, disclosed scope cut, checked against the actual kernel code
-// (process::open_file()/read_fd()/write_fd()/close_fd() -- this file's
-// own top doc comment already names their exact syscall-number ABI, not
-// assumed): sys_open() has NO mode flags at all -- every open() starts
-// at cursor 0, reading whatever bytes already exist on disk into an
-// in-memory buffer (empty if the file doesn't exist yet). There is no
-// O_TRUNC, no O_APPEND, no lseek() syscall anywhere in this kernel yet.
-// fopen()'s `mode` byte is therefore real and actually checked/enforced
-// ('r' vs 'w'/'a' genuinely gate whether fwrite()/fread() are refused),
-// but does NOT reach down into new kernel behavior it can't:
+// MILESTONE 82 UPDATE: there is now a real truncating open --
+// `sys_open_trunc()`, its OWN syscall number (24) -- see usertest.rs's
+// own syscall-24 dispatch comment and process::open_file()'s own doc
+// comment for the full kernel-side derivation. `fopen()`'s `'w'` mode
+// below now uses it -- the "'w' leaves old trailing bytes on disk"
+// limitation this comment used to disclose as a real, pre-existing,
+// out-of-scope Milestone 35 gap is FIXED as of this milestone, not
+// merely documented. Plain `sys_open()` (syscall 3) is byte-for-byte
+// unchanged from Milestone 35. There is still no O_APPEND flag or
+// lseek() syscall (unchanged; 'a' mode's own real drain-to-EOF
+// technique below still doesn't need either).
 //   - 'r': read-only. fwrite() on such a FILE fails (0 elements
 //     written).
-//   - 'w': write-only, cursor starts at 0 (the kernel's only real
-//     starting position). If the target path already holds MORE bytes
-//     than this session ends up writing, process::write_fd()'s own
-//     documented "buffer only ever grows" behavior means the file's old
-//     trailing bytes past the new write survive on disk after close().
-//     This is a genuine, PRE-EXISTING Milestone 35 limitation (true for
-//     any raw fdwrite() caller, not something this milestone introduces
-//     or hides) -- a real kernel-side O_TRUNC is out of THIS milestone's
-//     scope (that would be a kernel change; this milestone's scope is
-//     the userspace stdio layer over the syscalls that already exist).
-//     The self-test below only ever fopen("w")s brand-new paths for
-//     exactly this reason -- not to dodge the bug, but because
-//     exercising it honestly would require a kernel-side fix this
-//     milestone doesn't make.
+//   - 'w': write-only, real O_TRUNC via `sys_open_trunc()` -- a path
+//     that already holds MORE bytes than this session ends up writing
+//     is genuinely truncated on close(), not left with stale trailing
+//     content. Real kernel-side mechanism: `process::open_file()`'s new
+//     `truncate` parameter starts the in-memory buffer empty (never
+//     even calls `fs::read_file()`) and marks the fd dirty immediately,
+//     so `close_fd()`'s own dirty-gated persist writes back the
+//     (possibly still-empty) buffer even if nothing was ever
+//     fdwrite()'n -- real O_TRUNC semantics, not merely "future writes
+//     start from zero."
 //   - 'a': write-only, cursor moved to the CURRENT end of whatever
 //     content sys_open() returned -- REAL append-to-existing-content
 //     semantics, achieved without any O_APPEND flag or lseek() syscall
@@ -627,7 +649,11 @@ pub unsafe fn fopen(path_ptr: u64, path_len: u64, mode: u8) -> u64 {
         b'a' => (false, true),
         _ => return 0,
     };
-    let fd = unsafe { sys_open(path_ptr, path_len) };
+    // MILESTONE 82: real O_TRUNC for 'w' -- 'r'/'a' both genuinely need
+    // this path's EXISTING content (read-only for 'r'; 'a' drains it
+    // below to find real end-of-file), so only 'w' uses the new
+    // truncating open.
+    let fd = unsafe { if mode == b'w' { sys_open_trunc(path_ptr, path_len) } else { sys_open(path_ptr, path_len) } };
     if fd == SYSCALL_FAIL {
         return 0;
     }

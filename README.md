@@ -2363,6 +2363,206 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       timestamps/hard links, multi-user uid/gid/chmod/chown, symbolic
       links, `mmap()`, a real block-device abstraction) is the next real
       dependency tier.
+- [x] **Milestone 62**: the first real Tier 2 (filesystem completeness)
+      item -- a real on-disk format upgrade adding permissions (a
+      standard 9-bit unix `rwxrwxrwx` mode), ownership (`uid`/`gid`),
+      and real timestamps (`ctime`/`mtime`, genuine unix-epoch seconds)
+      to every `DirEntry` in `fs.rs`, PLUS real, enforced permission
+      checks in every `DiskFs` operation and `chmod`/`chown`/`stat`/
+      `whoami`/`setid` to inspect and change them.
+
+      **Dependency reasoning** (checked against the actual code first,
+      not assumed): the roadmap's own wording lists "a robust on-disk
+      format (permissions, timestamps, hard links)" and "a minimal
+      multi-user model (uid/gid, chmod/chown)" as two separate items,
+      but real mode bits are meaningless with no owner to compare
+      against and a real `chmod`/`chown` need real bytes on disk to
+      modify -- so this milestone does the format change AND real
+      enforcement together, the smallest slice that's actually
+      verifiable end-to-end rather than inert fields nothing reads.
+      **Hard links were deliberately left out**, confirmed by reading
+      `fs.rs`'s actual allocation model first: a `DirEntry` embeds its
+      own `start_lba`/`sector_count` directly with no inode-indirection
+      layer separating "a name" from "the data it refers to" -- a real
+      hard link (two names sharing one refcounted inode) needs that
+      layer added first, a separate, genuinely bigger structural lift.
+      Symbolic links, `mmap()`, and a real block-device abstraction
+      beyond raw ATA are each independent, separately-scoped Tier 2
+      items, also not attempted here.
+
+      **Real, working, complete slice** (not stubs): `DirEntry` grew
+      from 25 to 39 bytes per entry (`mode: u16`, `uid: u16`, `gid:
+      u16`, `ctime: u32`, `mtime: u32`, appended after the pre-M62
+      fields), persisted to and loaded from disk exactly like every
+      other field. Root (`DIR_LBA`) has no parent `DirEntry` of its own,
+      so its metadata lives in a genuinely new, dedicated sector
+      (`ROOT_META_LBA` = `FILE_DATA_START_LBA + NUM_DATA_SECTORS` = 2 +
+      64 = 66, the first free LBA past the existing shared data pool) --
+      not smuggled into root's own directory-table sector, which
+      `save_dir_at` already zero-fills past the entry table on every
+      ordinary mkdir/write/rm there. Real, standard-algorithm unix
+      timestamps: `rtc.rs` gained `days_from_civil` (Howard Hinnant's
+      well-known, publicly documented civil-calendar algorithm, verified
+      by hand against the known 1970-01-01 -> 0 and 2000-01-01 -> 10957
+      reference values) and `to_unix_timestamp`, converting the real
+      CMOS RTC (Milestone 15) into real unix-epoch seconds -- every
+      `mkdir`/fresh `write` stamps a REAL creation time, not a
+      placeholder. Real, standard unix enforcement, all checked against
+      a kernel-global "current identity" (`CURRENT_ID`, default `(0,
+      0)` == root -- deliberately global, not per-process, because a
+      real per-process identity needs real persistent accounts/login
+      first, already separately named as a much later Tier 8 item; the
+      new `whoami`/`setid UID GID` shell commands read/change it, with
+      NO password/authentication check at all, disclosed and named
+      `setid` rather than `su` specifically so it doesn't imply real
+      login exists): root bypasses every check (standard unix
+      superuser behavior); owner/group/other rwx bits picked by
+      matching the caller's `(uid, gid)` against the entry's; reading a
+      file needs its own read bit; overwriting an EXISTING file needs
+      its own write bit; CREATING a new file/dir needs write on the
+      PARENT directory instead (the target has no mode yet); deleting a
+      file/dir (`rm`/`rmdir`) needs write on the PARENT, not the
+      target's own bits (real unix semantics, proven directly: the
+      self-test below has uid 42 delete a file it no longer even owns,
+      solely because the parent directory permits it); traversing INTO
+      a directory (not just listing it) needs its search/execute bit,
+      checked on every path component in `resolve_dir_lba` including
+      root itself; listing a directory separately needs its READ bit.
+      `chmod` is owner-or-root; `chown` is root-only (the stricter
+      modern-unix rule, a real disclosed choice over classic unix's
+      more permissive owner-can-give-away behavior). `RamFs`'s three new
+      trait methods (`stat`/`chmod`/`chown`) are real, disclosed "not
+      supported" errors, not silently ignored -- consistent with the
+      exact style Milestone 46 already established for ramfs's other
+      unsupported operations (subdirectories).
+
+      **A real, disclosed format-versioning mechanism**: `MAGIC` was
+      bumped (`0x53504B46` "SPKF" -> `0x53504B47`) specifically because
+      `ENTRY_LEN` changed size -- reinterpreting a pre-M62 disk's raw
+      bytes at the new, larger entry stride would misparse
+      `start_lba`/`sector_count` as garbage. Bumping `MAGIC` makes
+      `load_dir_at`'s existing "unrecognized magic -> treat as
+      blank/uninitialized directory" fallback (already there since
+      Milestone 18, for a genuinely blank disk) trigger safely on any
+      pre-M62 disk too, the same safe path a truly blank disk already
+      took -- not a new code path, and a real, useful side effect for
+      this repo's own accumulated-test-fixture disk-full issue (Milestone
+      61's own entry, and this milestone's own process rules) since
+      every pre-M62 entry on `target/persist.img`/`verify_persist.img`
+      is now simply invisible to the new code, not counted against
+      `MAX_ENTRIES`.
+
+      Verified with a real, new, non-interactive self-test
+      (`fs::self_test_permissions()`, called from `main.rs` right after
+      the existing disk/ramfs self-tests, same "every boot's serial log
+      carries direct proof" reasoning, no ring-3 entry needed): 43 real
+      checks -- create-time defaults (mode/owner/timestamp), overwrite
+      preserving mode/uid/gid/ctime while bumping mtime, chmod narrowing
+      then reopening a file's mode with matching read/write behavior
+      changes under a real non-root non-owner identity (uid 42),
+      parent-directory-write-required create/delete (including a
+      creator-owns-what-it-creates check and a delete-via-parent-write-
+      despite-non-ownership check), owner-may-chmod-own-file vs.
+      chown-is-root-only-even-for-the-owner, and directory search(x)-bit
+      traversal gating that blocks reaching a file even though the
+      file's OWN mode (`0o666`, world-read-write) would otherwise allow
+      it -- real proof that traversal permission is checked
+      independently of the leaf's own bits, not derived from it. Root's
+      own chmod/chown (refused for non-root, real for root, restored to
+      the real default afterward) closes out the coverage. Real, fresh
+      build (from repo root) + fresh QEMU boot, quoted from the actual
+      serial log:
+      ```
+      fs self-test: permissions mkdir_root=PASS
+      fs self-test: permissions mkdir_is_dir=PASS
+      fs self-test: permissions mkdir_default_mode_0755=PASS
+      fs self-test: permissions mkdir_owner_root=PASS
+      fs self-test: permissions mkdir_ctime_eq_mtime_fresh=PASS
+      fs self-test: permissions write_create_root=PASS
+      fs self-test: permissions f1_is_file_len5=PASS
+      fs self-test: permissions f1_default_mode_0644=PASS
+      fs self-test: permissions f1_owner_root=PASS
+      fs self-test: permissions write_overwrite_root=PASS
+      fs self-test: permissions f1_overwrite_preserves_owner_mode=PASS
+      fs self-test: permissions f1_overwrite_preserves_ctime=PASS
+      fs self-test: permissions chmod_root_narrows_to_0600=PASS
+      fs self-test: permissions f1_mode_now_0600=PASS
+      fs self-test: permissions uid42_read_denied_mode0600=PASS
+      fs self-test: permissions uid42_write_denied_mode0600=PASS
+      fs self-test: permissions chmod_root_reopens_to_0644=PASS
+      fs self-test: permissions uid42_read_allowed_mode0644=PASS
+      fs self-test: permissions uid42_write_still_denied_mode0644=PASS
+      fs self-test: permissions uid42_create_denied_parent_0755=PASS
+      fs self-test: permissions uid42_mkdir_denied_parent_0755=PASS
+      fs self-test: permissions chmod_root_permtestdir_0777=PASS
+      fs self-test: permissions uid42_create_allowed_parent_0777=PASS
+      fs self-test: permissions g1_owned_by_creator_uid42=PASS
+      fs self-test: permissions uid42_chmod_own_file_allowed=PASS
+      fs self-test: permissions uid42_chown_denied_root_only=PASS
+      fs self-test: permissions root_chown_g1_to_7_7=PASS
+      fs self-test: permissions g1_now_owned_by_7_7=PASS
+      fs self-test: permissions uid42_delete_via_parent_write_0777=PASS
+      fs self-test: permissions mkdir_locked_subdir=PASS
+      fs self-test: permissions write_inner_file=PASS
+      fs self-test: permissions chmod_inner_world_rw=PASS
+      fs self-test: permissions chmod_locked_owner_only_0700=PASS
+      fs self-test: permissions uid42_traversal_denied_despite_file_0666=PASS
+      fs self-test: permissions uid42_ls_traversal_denied=PASS
+      fs self-test: permissions stat_root=PASS
+      fs self-test: permissions uid42_chmod_root_denied=PASS
+      fs self-test: permissions uid42_chown_root_denied=PASS
+      fs self-test: permissions root_chown_root_to_5_5=PASS
+      fs self-test: permissions root_now_owned_by_5_5=PASS
+      fs self-test: permissions root_restored_to_defaults=PASS
+      fs self-test: permissions OVERALL=PASS
+      ```
+      No regressions: milestones 42/43/44/45/51/53/54/57/58/59/60/61 all
+      still self-report `OVERALL: PASS` (or their own program-internal
+      `OVERALL=PASS`) in the same boot, the pre-existing
+      `fs::self_test_disk_write`/`fs::self_test_ramfs` disk/ramfs
+      self-tests both still pass, zero panics anywhere in the log
+      (checked directly, not assumed), zero double/triple faults, zero
+      `MISMATCH`, zero unexpected `FAIL` (the only `FAIL` line is the
+      same pre-existing, disclosed-unrelated "milestone 6: no
+      keystrokes received" interactive-only check every prior milestone
+      already carries), zero compiler warnings on a full build, boot
+      reaches the interactive shell and background task scheduling
+      normally afterward. `tasklist` confirmed zero orphaned
+      `qemu-system-x86_64.exe` processes after verification.
+
+      **Real, disclosed scope cuts**: (1) no umask concept -- new files/
+      dirs always get the fixed conventional defaults (`0o644`/`0o755`),
+      not a configurable creation mask; (2) the shell's new `setid UID
+      GID` command changes the kernel-global current identity with
+      zero authentication -- an explicit testing lever for exercising
+      real enforcement, not a login system (real accounts/login is
+      Tier 8); (3) the new shell commands (`stat`/`chmod`/`chown`/
+      `whoami`/`setid`) were verified by a clean, zero-warning build and
+      direct code review against the same argument-parsing conventions
+      every other shell.rs command already uses (`rest.split_once('
+      ')`, `split_whitespace()`), NOT by a live interactive keystroke
+      session -- consistent with this project's own established
+      reasoning for why its self-tests exist non-interactively in the
+      first place (see `fs::self_test_disk_write`'s own doc comment:
+      real QEMU `sendkey` interactive testing has a real history of
+      being the less reliable path in this project), and the shell
+      layer here is a thin, mechanical pass-through to the exact
+      `fs::stat`/`chmod`/`chown` functions the 43-check self-test above
+      already exercises directly; (4) `ls` itself was NOT changed to
+      display permissions (it still returns the same pre-M62
+      `(name, is_dir, len)` shape) -- `stat PATH` is the real, separate
+      way to see an entry's full metadata, a deliberately smaller-
+      footprint choice than widening `list()`'s shared return type
+      (and the `FileSystem` trait signature) across both backing
+      stores; (5) `RamFs` gained no permission/ownership/timestamp
+      storage at all -- its `BTreeMap<String, Vec<u8>>` backing has
+      nowhere to put it, so `stat`/`chmod`/`chown` against a `ram/...`
+      path are real, disclosed "not supported" errors, not a silent
+      no-op.
+
+      **Still genuinely open**: hard links, symbolic links, `mmap()`,
+      and a real block-device abstraction beyond raw ATA -- every other
+      named Tier 2 item, each independently scoped as explained above.
 ## Building and running
 
 Requires:

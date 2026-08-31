@@ -2563,6 +2563,209 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       **Still genuinely open**: hard links, symbolic links, `mmap()`,
       and a real block-device abstraction beyond raw ATA -- every other
       named Tier 2 item, each independently scoped as explained above.
+- [x] **Milestone 63**: real symbolic links -- the second Tier 2
+      (filesystem completeness) item, chosen over the other three
+      remaining candidates (hard links, `mmap()`, a real block-device
+      abstraction) after re-checking each against the ACTUAL current
+      code, not just the roadmap's wording or Milestone 62's own
+      write-up.
+
+      **Dependency reasoning** (each candidate re-verified directly
+      against the code before picking): (1) **hard links** still need
+      the inode-indirection layer Milestone 62 already identified as
+      missing -- re-confirmed by re-reading `fs.rs`'s allocation model
+      first: `DirEntry` still embeds its own `start_lba`/`sector_count`
+      directly, with every allocation/reclamation function
+      (`write_file_disk`, `delete_file_disk`, `collect_occupied_at`)
+      still keyed off exactly one entry owning exactly one allocation --
+      unchanged since Milestone 62's judgment call, still a genuinely
+      bigger structural lift than one milestone slice. (2) **`mmap()`**
+      needs real file-backed pages wired into the page-fault handler and
+      a process's address space (`process.rs`/`interrupts.rs`) on top of
+      Milestone 57's demand paging -- the roadmap's own Tier 1 section
+      already names copy-on-write and `mmap` together as "the next real
+      VM increment," i.e. a bigger unit of work spanning multiple
+      subsystems, not a filesystem-only change. (3) **a real
+      block-device abstraction beyond raw ATA** would be a pure refactor
+      with only one real backing device (`ata.rs`) to abstract over --
+      there is no second block device anywhere in this kernel (no
+      ramdisk-as-block-device, no partition table, no second
+      controller), so the abstraction would have nothing genuinely
+      different to prove itself against beyond a mock/test double,
+      unlike `RamFs` (Milestone 46), which earned its own milestone
+      specifically because it IS a second, real, independently-
+      verifiable backing store. (4) **Symbolic links**, by contrast, are
+      a self-contained filesystem feature: no new subsystem, a bounded/
+      well-understood real-world semantic (path indirection with cycle
+      detection), directly verifiable end-to-end through the exact same
+      `fs::*` surface and self-test style every prior milestone here has
+      used -- chosen as the right-sized next slice.
+
+      **Real, disclosed format-versioning mechanism, same pattern as
+      Milestone 62**: `DirEntry` gains one more field, `is_symlink: bool`
+      (1 byte), appended after Milestone 62's `mtime` -- `ENTRY_LEN`
+      grows from 39 to 40 bytes/entry, so `MAGIC` is bumped again
+      (0x53504B47 "SPKG" -> 0x53504B48 "SPKH") for the exact same reason
+      Milestone 62 bumped it: reinterpreting a pre-M63 disk's bytes at
+      the new, larger stride would misparse `start_lba`/`sector_count`
+      as garbage, so bumping `MAGIC` routes any pre-M63 disk through
+      `load_dir_at`'s existing "unrecognized magic -> blank directory"
+      fallback instead, the same safe path a genuinely blank disk
+      already took.
+
+      **Real, working, complete slice** (not stubs): a symlink entry has
+      `is_dir == false`, `is_symlink == true`, and reuses the EXACT SAME
+      allocation mechanism a small file already uses (`start_lba`/
+      `sector_count` from the shared data pool, `len` = the target
+      path's byte length) -- its "file content" IS the raw target path
+      text, capped at `MAX_SYMLINK_LEN` (255 bytes, always fits in the
+      one sector this milestone allocates for a link). New shell
+      commands `ln -s TARGET LINKPATH` and `readlink PATH` wrap the new
+      `fs::symlink`/`fs::readlink` functions, dispatched through the
+      identical `resolve_backend`/`FileSystem`-trait machinery Milestone
+      46 built (only `linkpath` is routed by `resolve_backend`; `target`
+      is stored completely verbatim, exactly like real `symlink(2)`).
+
+      **Real, bounded dereferencing, exactly where it earns its keep**:
+      `resolve_dir_lba` is now a thin wrapper around a new
+      `resolve_dir_lba_from(base, path, symlink_depth)`, which
+      dereferences a symlink encountered as ANY directory-path component
+      -- intermediate OR the final one, since resolving "the table this
+      directory path names" treats every component uniformly (the
+      direct generalization of Milestone 32's own arbitrary-depth-
+      nesting precedent) -- so `cd`/`ls`/every multi-level path argument
+      transparently walks THROUGH a symlinked directory. A relative
+      target (no leading `/`) resolves starting at the directory
+      CONTAINING the symlink (real unix semantics, proven directly by
+      the self-test's `symlink_create_relative`/`read_through_
+      symlinked_directory_component` checks); an absolute target
+      resolves from root (`symlink_create_absolute`/`read_through_
+      absolute_symlink`). Chains are followed up to `MAX_SYMLINK_DEPTH`
+      (8) hops before a real "too many levels of symbolic links" error
+      (`read_symlink_cycle_hits_eloop_guard`, exercised against a
+      genuine two-node cycle), and a broken link is a real "no such file
+      or directory" error (`read_broken_symlink_fails_cleanly`) --
+      neither silently swallowed. `read_file` additionally dereferences
+      when the FINAL path component itself names a symlink to a file
+      (new `deref_leaf` helper), proven both for a single hop and a
+      2-hop chain. The single most important property, proven directly
+      by `uid42_denied_through_symlink_no_privilege_escalation`: a
+      symlink can NEVER be used to bypass a real permission check on the
+      directory it ultimately points into -- a non-root, non-owner
+      identity is denied reaching a file behind a symlink to a
+      `chmod 700`'d real directory, exactly as if it had typed the real
+      path directly, because `resolve_dir_lba_from`'s search(x)-bit
+      check runs against the DEREFERENCED entry's own mode, never the
+      symlink's.
+
+      Verified with a real, new, non-interactive self-test
+      (`fs::self_test_symlinks()`, called from `main.rs` right after
+      `fs::self_test_permissions()`, same reasoning as every prior fs
+      self-test): 35 real checks covering creation, raw `stat`/
+      `readlink` inspection, single-hop and 2-hop-chain dereferencing on
+      read, ELOOP and broken-link errors, traversal through a symlinked
+      directory (both `read_file` and `list`), `rmdir` correctly
+      refusing a symlink-to-directory (ENOTDIR, matching real unix),
+      `rm` removing the link while the target survives completely
+      untouched, the disclosed write-through-symlink refusal, chmod/
+      chown acting on the link itself (proven by the TARGET's own mode
+      staying unaffected), an empty-target refusal, and the privilege-
+      escalation check above. Real, fresh build (from repo root) +
+      fresh QEMU boot, quoted from the actual serial log:
+      ```
+      fs self-test: symlinks mkdir_symtestdir=PASS
+      fs self-test: symlinks write_real_txt=PASS
+      fs self-test: symlinks symlink_create_relative=PASS
+      fs self-test: symlinks read_through_symlink_single_hop=PASS
+      fs self-test: symlinks stat_link_to_real_is_symlink_lstat_shaped=PASS
+      fs self-test: symlinks stat_link_to_real_len_is_target_text_len=PASS
+      fs self-test: symlinks readlink_link_to_real_raw_target=PASS
+      fs self-test: symlinks symlink_create_chain=PASS
+      fs self-test: symlinks read_through_symlink_chain_two_hops=PASS
+      fs self-test: symlinks cleanup_link_to_link=PASS
+      fs self-test: symlinks symlink_create_broken=PASS
+      fs self-test: symlinks read_broken_symlink_fails_cleanly=PASS
+      fs self-test: symlinks cleanup_broken=PASS
+      fs self-test: symlinks symlink_create_loop_a=PASS
+      fs self-test: symlinks symlink_create_loop_b=PASS
+      fs self-test: symlinks read_symlink_cycle_hits_eloop_guard=PASS
+      fs self-test: symlinks cleanup_loop=PASS
+      fs self-test: symlinks mkdir_realsub=PASS
+      fs self-test: symlinks write_inner_txt=PASS
+      fs self-test: symlinks symlink_create_dir_link=PASS
+      fs self-test: symlinks read_through_symlinked_directory_component=PASS
+      fs self-test: symlinks list_through_symlinked_directory_component=PASS
+      fs self-test: symlinks rmdir_symlink_to_dir_refused_enotdir=PASS
+      fs self-test: symlinks symlink_create_link2=PASS
+      fs self-test: symlinks write_through_existing_symlink_refused=PASS
+      fs self-test: symlinks chmod_link2_acts_on_link_itself=PASS
+      fs self-test: symlinks link2_mode_now_0600=PASS
+      fs self-test: symlinks real_txt_mode_unaffected_by_chmod_on_link=PASS
+      fs self-test: symlinks rm_link_to_real=PASS
+      fs self-test: symlinks link_to_real_gone_after_rm=PASS
+      fs self-test: symlinks real_txt_survives_rm_of_its_link=PASS
+      fs self-test: symlinks mkdir_lockedreal=PASS
+      fs self-test: symlinks write_secret_txt=PASS
+      fs self-test: symlinks chmod_lockedreal_owner_only=PASS
+      fs self-test: symlinks symlink_create_lockedlink=PASS
+      fs self-test: symlinks uid42_denied_through_symlink_no_privilege_escalation=PASS
+      fs self-test: symlinks symlink_empty_target_refused=PASS
+      fs self-test: symlinks symlink_create_absolute=PASS
+      fs self-test: symlinks read_through_absolute_symlink=PASS
+      fs self-test: symlinks OVERALL=PASS
+      ```
+      No regressions: milestones 42/43/44/45/51/53/54/57/58/59/60/61/62
+      (`fs self-test: permissions OVERALL=PASS`) all still self-report
+      `OVERALL: PASS` (or their own program-internal `OVERALL=PASS`) in
+      the same boot, zero panics anywhere in the log (checked directly),
+      zero double/triple faults, zero `MISMATCH`, zero unexpected `FAIL`
+      (the only `FAIL` line is the same pre-existing, disclosed-
+      unrelated "milestone 6: no keystrokes received" interactive-only
+      check every prior milestone already carries), zero compiler
+      warnings on a full build, boot reaches the interactive shell and
+      background task scheduling normally afterward. `tasklist`
+      confirmed zero orphaned `qemu-system-x86_64.exe` processes after
+      verification.
+
+      **Real, disclosed scope cuts**: (1) `stat` on a symlink reports
+      the LINK's own metadata (`is_symlink: true`, `len` = target text
+      length) and does NOT follow -- effectively `lstat` semantics, not
+      `stat` semantics; `readlink` is the real, separate way to read
+      what it points at, and a caller wanting the TARGET's metadata can
+      `readlink` then `stat` that path themselves. (2) `chmod`/`chown`
+      likewise act on the symlink entry itself, never following --
+      consistent with (1), and harmless in practice since this kernel's
+      permission checks never consult a symlink's OWN mode bits during
+      traversal anyway (real Linux behavior too: symlink permissions are
+      ignored, only the resolved target's mode matters). (3)
+      `write_file` on a path whose FINAL component is an EXISTING
+      symlink is refused with a real, clear, disclosed error rather than
+      either silently overwriting the link itself with file content
+      (corrupting/orphaning its target) or silently writing through it
+      (which would need the create-vs-overwrite and permission logic
+      reworked around a dereferenced target table/name -- a real,
+      separately-scoped restructuring this slice deliberately does not
+      attempt). (4) `delete_file` (`rm`) and `remove_dir` (`rmdir`)
+      needed NO changes at all -- not a cut, genuinely correct real unix
+      behavior already: `rm` removes the link, never the target;
+      `rmdir` on a symlink-to-directory correctly refuses with ENOTDIR
+      since a symlink's own `is_dir` is always `false`. (5) `RamFs`
+      gained no symlink support at all (same reasoning as its
+      pre-existing no-subdirectories/no-permissions cuts) --
+      `symlink`/`readlink` against a `ram/...` path are real, disclosed
+      "not supported" errors. (6) a symlink's target text is resolved
+      PURELY within the backend it was created on (disk-internal LBA
+      resolution, never routed back through `resolve_backend`) -- a disk
+      symlink cannot point into `ram/...` or vice versa. (7) no `.`/`..`
+      special-path handling was added anywhere -- this fs has never
+      supported them, at any milestone, so a symlink target containing
+      them is just looked up as a literal (normally nonexistent)
+      component name, the same pre-existing behavior every other path in
+      this file already has.
+
+      **Still genuinely open**: hard links, `mmap()`, and a real
+      block-device abstraction beyond raw ATA -- each independently
+      scoped as explained above.
 ## Building and running
 
 Requires:

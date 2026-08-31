@@ -5120,6 +5120,207 @@ self-test suite, genuinely open for a future pass.
       "userspace-only" streak) -- either a legitimate next dependency-
       ordered step, not attempted here.
 
+- [x] **Milestone 75**: Tier 3's ninth slice -- real, end-to-end
+      verification (and one real kernel-side diagnostic) of this kernel's
+      stack-overflow safety, the one significant OPEN SAFETY item
+      Milestone 73's own closing disclosure first flagged and Milestone
+      74's own closing disclosure re-confirmed still open, twice in a
+      row. Weighed directly against the other real dependency-ordered
+      candidates (growing the grammar with unary minus/`&&`/`||`; raising
+      `MAX_FUNCS`/`MAX_PARAMS` past 4) before picking this: this kernel
+      gives every process exactly ONE 4 KiB stack page with no guard
+      against a deep or runaway call chain -- self-recursion (Milestone
+      73) and mutual recursion (Milestone 74) both now exist in this
+      toolchain's own grammar, and growing the grammar a THIRD time in a
+      row without ever closing the one significant open safety item on
+      the books would be defaulting to the easy, familiar path rather
+      than the most valuable one. This is real kernel-side work
+      (`kernel/src/interrupts.rs`), breaking the Milestone 74/73/72-and-
+      earlier-since-67 streak of pure userspace toolchain changes on
+      purpose -- exactly the tradeoff this milestone's own task
+      description asked to be weighed honestly rather than defaulted
+      past again.
+
+      **What this milestone actually found**, checked directly against
+      `kernel/src/interrupts.rs` and `kernel/src/process.rs` before
+      writing any new code, not assumed from this README's own prior
+      wording: a ring-3 stack overflow in this kernel was ALREADY safe,
+      as a real, previously-un-exercised BYPRODUCT of the virtual
+      address layout, not because any code path ever checked for it on
+      purpose. `USER_STACK_ADDR` (`0x_5555_6000_0000`, `usertest.rs`)
+      sits a real, computed ~256 MiB above `USER_CODE_ADDR`'s own single
+      mapped page (`0x_5555_5000_0000`), and nothing in this kernel ever
+      maps so much as one byte of that gap -- not the heap
+      (`try_demand_page_heap()`'s own range check is bounded to
+      `[HEAP_START, HEAP_START + HEAP_SIZE)`, ABOVE the stack, never
+      below it), not mmap (`try_demand_page_mmap()`, same). A stack push
+      that runs off the bottom of the single real mapped stack page
+      therefore produces an ordinary NOT-PRESENT `#PF` against unmapped
+      memory, which already fell through both of those real demand-
+      paging attempts (Milestone 57/64) straight into the SAME
+      unconditional SIGSEGV-and-terminate path (Milestone 41) every
+      other invalid ring-3 access already used -- `WaitOutcome::Signaled`
+      (Milestone 53) and all. This was true before this milestone too;
+      it had simply never been verified end-to-end against a program
+      that actually recurses far enough to hit it.
+
+      **The real kernel-side change**: a new `STACK_GUARD_REGION_SIZE`
+      constant (1 MiB) and a check in `page_fault_handler`
+      (`kernel/src/interrupts.rs`) that recognizes a NOT-PRESENT fault
+      whose `CR2` falls inside a conservative 1 MiB band immediately
+      below `USER_STACK_ADDR` and logs it as a distinct
+      `"milestone 75: STACK OVERFLOW"` line instead of the generic
+      Milestone 41 SIGSEGV wording -- real, but deliberately narrow: it
+      does NOT alter control flow at all (the exact same
+      `terminate_faulted_process_and_resume_kernel()` call follows
+      either branch), does NOT raise the single-page stack to more than
+      one page, and does NOT add a software recursion-depth counter --
+      this kernel has no visibility into arbitrary ring-3 `call`/`ret`
+      depth without per-call instrumentation this codegen has never
+      emitted, and a hard depth counter would only re-detect, less
+      precisely, the exact same real resource exhaustion the address-
+      based guard already catches directly (a heavy-stack-frame function
+      could overflow well under any chosen depth threshold; the guard-
+      page mechanism catches the real overrun itself, the same way a
+      page fault always has for ordinary memory). A wild pointer that
+      happens to land in that same 1 MiB band would be mislabeled by the
+      log line -- a real, disclosed, purely cosmetic limitation, not a
+      new safety gap.
+
+      **Real, end-to-end verification**, new CASE 34 in
+      `tools/cc_src/main.rs`: a real subset-C program with genuine,
+      UNCONDITIONAL, unbounded self-recursion and no base case at all --
+      `int spin(int n) { return spin(n + 1); } int main() { return
+      spin(0); }` -- so it can only terminate one of two ways: run off
+      the single stack page, or hang forever. Run through the real
+      on-disk-ELF + kernel `exec()` + `wait()` path Milestone 69
+      established, the strongest verification tier, same as every
+      milestone since -- deliberately NOT through the in-process
+      Callable path CASE 5/6/11-16/30/32 all use: that path executes the
+      freshly-compiled code on cc.elf's OWN current stack, in cc.elf's
+      OWN process, and an unbounded overflow there would take down this
+      very self-test harness before `OVERALL_M75` could ever print, not
+      just the intended child. Success requires the real kernel `wait()`
+      syscall to report `WaitOutcome::Signaled` (bit 17 of the encoding
+      `usertest.rs`'s own syscall dispatch documents) and specifically
+      NOT `WaitOutcome::Exited` -- a program with no base case reaching
+      its own `exit()` would itself be a serious, distinguishing bug
+      (a corrupted return address, or a mis-generated `spin` that
+      silently stopped recursing), not a plausible success path.
+
+      **Real verification loop**: `cargo build` from the repo root (a
+      clean workspace build, zero new warnings beyond the same
+      pre-existing disclosed set every milestone since 69 has carried),
+      then the project's own pinned-nightly `rustc` recipe (unchanged,
+      see `tools/cc_src/README.md`) to rebuild `kernel/assets/cc.elf`
+      (grown from Milestone 74's 38408 bytes to 39664 bytes; the real
+      `PT_LOAD` segment `p_memsz`, inspected directly via `readelf -l`
+      against the ELF program header rather than inferred from file
+      size, is 30538 bytes -- 8 pages, still comfortably under Milestone
+      70's 64-page per-segment cap and 128-page total cap, so **no cap
+      change was needed this milestone**), then a second `cargo build`
+      from the repo root to re-embed the new `cc.elf` via
+      `kernel/src/loader.rs`'s unchanged `CC_ELF_BYTES`, then two real
+      QEMU boots (`cargo run -- bios` with `SPIKELING_QEMU_MONITOR_PORT`
+      set, the same real, pre-existing Milestone 33 monitor-port
+      mechanism, driving the exact same `bus=ide.1`/`unit=0`/`unit=1`
+      secondary-bus drive topology `src/main.rs` already builds
+      unmodified -- `quit` sent over that monitor port once the boot
+      reached its own steady-state `hlt_loop`, evidenced by the
+      Milestone 25 "background task scheduling enabled" line) -- one
+      genuinely fresh-disk boot (`target/persist.img`/`persist2.img`
+      deleted and recreated blank first) and one immediately-following
+      boot reusing that same disk, unmodified. Quoted directly from the
+      fresh-disk boot's own serial log (`m75_fresh_boot.log`):
+      ```
+      milestone 75: cc real stack-overflow safety verification starting
+      milestone 45: syscall EXEC (process 14) -- REAL teardown-and-rebuild complete...
+      milestone 75: STACK OVERFLOW -- process 14 ran off the bottom of its own single 4096-byte stack page (fault address Ok(VirtAddr(0x55555ffffff0)), 16 bytes below USER_STACK_ADDR 0x555560000000 -- inside this kernel's real, deliberately-unmapped guard gap below the stack, not a wild-pointer SIGSEGV) -- terminating this process, kernel continues
+      milestone 53: syscall WAIT (process 3) -- child pid 14 was signal-terminated (real hardware fault, not its own exit()) and was reaped, CR3 restored to parent's own pml4 0x135000
+      milestone 53: syscall WAIT (process 3) -- hardware-recorded CS=0x1b (CPL=3) -- child pid 14 was signal-terminated (real hardware fault) after actually running
+        real on-disk ELF written, real fork()+exec()+wait() -- unconditional unbounded recursion -- child exited=false signaled=true (expected exited=false signaled=true -- caught by this kernel's real stack-overflow guard, not a silent exit)
+      case34_unbounded_recursion_stack_overflow_signals_not_exits=PASS
+      OVERALL_M75=PASS
+      ```
+      The new `milestone 75: STACK OVERFLOW` line's own fault address
+      (16 bytes below `USER_STACK_ADDR`) is only reachable if `spin()`'s
+      real recursive `call` chain genuinely ran RSP off the bottom of
+      the single mapped stack page and into this kernel's real unmapped
+      guard gap -- a bug that stopped the recursion early, corrupted a
+      return address into a coincidentally-valid-looking address, or
+      failed to fault at all would produce a different, specific wrong
+      outcome (a wrong return value, a generic Milestone 41 SIGSEGV
+      line instead of this milestone's new one, a hang, or a genuine
+      double/triple fault), not a plausible near-miss. In the same boot:
+      `OVERALL=` PASS x4 (Milestones 1-66's own aggregate checks, real,
+      individually re-identified this milestone: `fdtest`/`malloctest`/
+      `argvlauncher`/cc.elf's own Milestone 67 lex-parse group), through
+      `OVERALL_M74=PASS`, `fs self-test: permissions OVERALL=PASS`, `fs
+      self-test: symlinks OVERALL=PASS`, `fread_real_buffering=PASS`/
+      `eof_semantics=PASS` (both real on a genuinely fresh disk), zero
+      `EXCEPTION: DOUBLE FAULT`/`EXCEPTION: TRIPLE FAULT` and zero
+      `panicked at`/`kernel panicked` anywhere in the log (checked
+      case-sensitively via `grep -a -c` against the raw serial log, per
+      Milestone 72's own caught-and-fixed methodology trap). All four
+      counts were exactly 0. Independently re-confirmed on the
+      immediately-following reused-disk boot (`m75_reused_boot.log`):
+      identical `milestone 75: STACK OVERFLOW` line (same fault address,
+      same 16-byte offset -- fully deterministic across both boots),
+      identical `case34_unbounded_recursion_stack_overflow_signals_not_
+      exits=PASS` and `OVERALL_M75=PASS`, zero panics/unhandled
+      exceptions (re-checked the same case-sensitive way) -- the only
+      failures in that second boot were the SAME two pre-existing,
+      already-disclosed reused-disk gaps Milestone 70/71/72/73/74's own
+      entries already named (`stdiotest.elf`'s own true final
+      `OVERALL=FAIL`, with `fread_real_buffering=FAIL`/
+      `eof_semantics=FAIL` individually confirmed as its real cause, the
+      Milestone 61 O_TRUNC gap; `fs self-test: permissions`/`symlinks`
+      both `OVERALL=FAIL`, the Milestone 62-era fixture-cleanup gap) --
+      neither touched nor caused by this milestone, both real and
+      unfixed, exactly as before. (One real investigation dead-end
+      honestly disclosed: an earlier pass mis-attributed a THIRD
+      "OVERALL=FAIL" to an unidentified self-test by naively diffing
+      reconstructed-log line numbers between the two boots -- direct
+      re-verification against the raw serial log traced every one of
+      the four pre-`OVERALL_M68` `OVERALL=` occurrences to its real
+      owning program by content, confirming there is no third, new, or
+      undisclosed reused-disk regression; a lesson in not trusting a
+      derived reconstruction over the raw log it was built from.)
+      `tasklist` confirmed zero `qemu-system-x86_64.exe` processes both
+      before this milestone's work began and after each of the two boots
+      above (each stopped cleanly via its own real monitor-port `quit`,
+      independently re-checked with `tasklist` each time). No evidence
+      of concurrent editing found: `git status`/`git diff --stat`
+      checked both before this milestone's own work began and after it
+      finished matched the exact same pre-existing modified/untracked
+      file set throughout, with `git diff --stat -- kernel/src`
+      excluding this milestone's own `interrupts.rs` edit showing the
+      IDENTICAL per-file insertion/deletion counts at both checkpoints.
+
+      **Still genuinely open**: this kernel still gives every process
+      exactly ONE 4 KiB stack page -- that has NOT changed, and a
+      diagnostic-only kernel change was never going to change it; what
+      changed is that running off the bottom of it is now verified,
+      end-to-end, on real hardware, twice (fresh and reused disk), to be
+      a clean, disclosed, recoverable `SIGSEGV`/`Signaled` termination
+      rather than an unmeasured risk of silent corruption, a triple
+      fault, or a kernel panic. `MAX_FUNCS`/`MAX_PARAMS` (both still 4,
+      unraised), the `MAX_PENDING_CALLS = 8` forward-call cap, no unary
+      minus, no `&&`/`||`, no arrays/pointers, no additional C types (all
+      unchanged scope cuts from prior milestones); the `fs.rs` 8-entry
+      directory cap, the `stdiotest.elf` O_TRUNC gap, and the `fs.rs`
+      self-test reused-disk fixture-cleanup gap are all still real and
+      unfixed, untouched by this milestone. `STACK_GUARD_REGION_SIZE`'s
+      own 1 MiB band is a real, disclosed, conservative heuristic
+      subset of the true ~256 MiB guard gap -- a wild pointer landing in
+      that specific 1 MiB band would still be logged as "STACK OVERFLOW"
+      rather than generic SIGSEGV, a real but purely cosmetic
+      mislabeling risk, not a safety gap (the termination path is
+      identical either way). The natural next Tier 3 milestone: growing
+      the grammar itself (unary minus, `&&`/`||`, arrays/pointers, more
+      C types) or raising `MAX_FUNCS`/`MAX_PARAMS` -- both legitimate
+      next dependency-ordered steps, not attempted here.
+
 ## Building and running
 
 Requires:

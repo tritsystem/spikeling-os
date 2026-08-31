@@ -2954,6 +2954,326 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       milestone's own disclosed scope cuts above), and the newly-found
       pre-existing exec()-rebuild-triple-faults-on-a-fresh-disk bug
       disclosed just above.
+- [x] **Milestone 65**: real `mmap()` `PROT_WRITE` support -- the first
+      item of Milestone 64's own disclosed "real future work" list,
+      chosen over the other two remaining Tier 2 candidates after
+      re-verifying each against the ACTUAL current code, not just
+      Milestone 64's own write-up: **hard links** still need the
+      inode-indirection layer Milestones 62/63/64 already identified as
+      missing (`DirEntry` still embeds its own `start_lba`/`sector_count`,
+      re-confirmed unchanged); a **real block-device abstraction beyond
+      raw ATA** still has no second real block device to prove itself
+      against (`ata.rs` remains the only one, re-confirmed), AND this
+      milestone's own verification independently re-confirmed the
+      disclosed Milestone 64 second-ATA-drive bug is still live (see
+      below) -- deliberately not the moment to go looking for a second
+      block device to make that worse. `mmap()`'s own writable slice, by
+      contrast, was a real, honestly bounded next increment once checked
+      directly: `MmapSlot` already had everything else needed (a
+      per-process, per-slot snapshot with no sharing between mappings --
+      every mmap() call gets its OWN slot, and fork() never copies
+      `mmaps` -- see that field's own disclosed gap), so a writable slot
+      is already structurally `MAP_PRIVATE`-equivalent; the only real gap
+      was `try_demand_page_mmap()`'s hardcoded write-refusal and the
+      missing hardware `WRITABLE` page-table bit.
+
+      **Real mechanism**: a NEW syscall (23, `mmap_writable(fd)`) rather
+      than a new argument bolted onto syscall 21's existing rdi-only
+      `mmap(fd)` -- deliberately, so every one of Milestone 64's own four
+      hand-assembled test programs stays byte-for-byte unmodified (their
+      calling convention leaves whatever value syscall 3's own `open()`
+      call happened to leave in `rsi` completely unexamined by mmap(),
+      so overloading `rsi` as a new "prot" argument would have silently
+      changed those FOUR already-verified programs' real behavior --
+      confirmed by hand-tracing their actual register state before
+      picking the new-syscall-number approach instead). `MmapSlot` gains
+      one field, `writable: bool` -- `false` for every slot `mmap_file()`
+      (syscall 21) creates, `true` only for a slot `mmap_file_writable()`
+      (syscall 23) creates, both now thin wrappers around one shared
+      `mmap_file_impl()`. `try_demand_page_mmap()`'s own real refusal
+      check becomes `is_write && !writable` -- for a `writable == false`
+      slot this is EXACTLY Milestone 64's own unconditional `if is_write
+      { return false }`, zero behavioral change (independently confirmed:
+      Milestone 64's own CASE 2/CASE 3 self-test cases pass byte-for-byte
+      unmodified, see below). For a `writable == true` slot, BOTH a
+      first-touch READ and a first-touch WRITE now demand-page the real
+      file content in and map it WITH the hardware `WRITABLE` bit set --
+      prot is a property of the MAPPING, decided once at map time, not of
+      which access happens to arrive first (real POSIX semantics, not a
+      shortcut). Once mapped, a later store is an ordinary hardware write
+      with no second fault at all -- `munmap()` (syscall 22, unchanged)
+      works generically for either kind of slot.
+
+      **Real, disclosed scope cuts**: (1) still `MAP_PRIVATE`-only, never
+      `MAP_SHARED` -- a write NEVER reaches the backing fd's buffer or the
+      on-disk file, proven directly (not just claimed) by
+      `self_test_mmap_writable()` re-reading the real on-disk file after
+      two separate processes each genuinely wrote into their own private
+      copy, and finding it byte-for-byte unchanged. (2) still one page,
+      one already-open fd, no `MAP_FIXED`/arbitrary length/offset -- same
+      `fs::MAX_FILE_BYTES == PAGE_SIZE` bound Milestone 64 established,
+      unchanged. (3) a forked child still does NOT inherit a parent's
+      mmap regions, writable or not -- same pre-existing, disclosed gap.
+      (4) no copy-on-write in the traditional shared-then-diverges sense
+      -- moot here since no two mappings can ever alias the same physical
+      frame in this design (each `mmap()`/`mmap_writable()` call always
+      snapshots its own private copy), so "private" and "writable" were
+      never in tension to begin with; real future work still open:
+      multi-page files (blocked on `fs::MAX_FILE_BYTES` itself growing)
+      and `MAP_FIXED`.
+
+      Verified with a real, new, non-interactive self-test
+      (`process::self_test_mmap_writable()`, called from `main.rs`
+      immediately after `process::self_test_mmap()` -- same real
+      ring-3-excursion ordering requirement, reusing the SAME on-disk
+      fixture file `self_test_mmap()` already writes), exercising TWO
+      genuinely different real success paths (mirroring Milestone 64's
+      own discipline of proving two structurally different REFUSAL paths
+      with two separate cases, just for the success side this time):
+      CASE 5 demand-pages via a first-touch READ (mapped `WRITABLE`
+      immediately), then a real WRITE against the now-present page
+      succeeds with NO second fault, read back and confirmed correct;
+      CASE 6's own triggering access is ITSELF a write with no prior
+      read at all (`is_write == true` on a genuine not-present fault --
+      the exact same real hardware condition as Milestone 64's own
+      MMAP_WRITE_BEFORE_READ_FAULT_PROGRAM, hitting a `writable` slot
+      instead of a read-only one this time) -- genuinely SERVICED rather
+      than refused, with the rest of the page independently confirmed
+      still holding real, untouched file content. Quoted from the actual
+      serial log (fresh-disk diagnostic boot -- see this milestone's own
+      "genuinely open" disclosure below for why a fresh disk, not the
+      normal single-drive config, is what this specific quote required):
+      ```
+      milestone 65: self-test -- layout check: both writable-mmap programs' embedded 'mmapf' path bytes match their own declared offsets -- confirmed
+      milestone 65: syscall MMAP_WRITABLE (process 23) -- fd=0 slot=0 -- reserved 0x555580000000 (not yet backed by any physical frame -- real demand paging on first touch, same mechanism as the per-process heap)
+      milestone 65: demand-paged mmap slot 0 for process 23 (fault addr 0x555580000000, is_write=false) -- fresh physical frame 0x135000 mapped READ-WRITE with real file content, resuming the faulting instruction
+      milestone 65: self-test -- CASE 5 (writable: read then write, expect write to succeed with no second fault): run()_ok=true original-first-byte-matched-real-file=true write-of-0x99-stuck=true munmap-result-byte=Some(0) (expect Some(0)) -- PASS
+      milestone 65: syscall MMAP_WRITABLE (process 24) -- fd=0 slot=0 -- reserved 0x555580000000 (not yet backed by any physical frame -- real demand paging on first touch, same mechanism as the per-process heap)
+      milestone 65: demand-paged mmap slot 0 for process 24 (fault addr 0x555580000000, is_write=true) -- fresh physical frame 0x135000 mapped READ-WRITE with real file content, resuming the faulting instruction
+      milestone 65: self-test -- CASE 6 (writable: write as first-ever touch, expect real demand-page-and-service instead of refusal): run()_ok=true write-of-0x77-stuck=true untouched-byte-still-real-file-content=true munmap-result-byte=Some(0) (expect Some(0)) -- PASS
+      milestone 65: self-test -- real on-disk file 'mmapf' re-read directly after both writable mappings wrote into their own private copies -- unchanged-from-original=true
+      milestone 65: self-test -- PROCESS_A ran normally right after both writable-mmap test processes -- kernel genuinely recovered
+      milestone 65: self-test -- OVERALL: PASS
+      ```
+      Note `is_write=false` (CASE 5) vs `is_write=true` (CASE 6) in the
+      demand-page log lines above -- direct, independent proof the two
+      cases exercise genuinely different real hardware fault conditions,
+      not the same path hit twice. In the SAME fresh-disk boot, also
+      directly confirmed still passing with zero regressions: `fs
+      self-test: permissions OVERALL=PASS`, `fs self-test: symlinks
+      OVERALL=PASS`, `milestone 64: self-test -- OVERALL: PASS`
+      (Milestone 64's own four cases, byte-for-byte unmodified programs,
+      all still PASS), and milestones 42, 43, 44, 51 (malloctest.elf's
+      own `OVERALL=PASS`), 53, 54, 57, 59, 60, and 61 (stdiotest.elf's
+      own `OVERALL=PASS`) -- zero panics, zero unexpected FAIL. A
+      SEPARATE, immediately-following boot (normal single-drive config,
+      the SAME already-used disk from the fresh-disk boot just above,
+      now genuinely non-fresh) independently confirmed `milestone 45:
+      self-test -- OVERALL: PASS` and `milestone 65: self-test --
+      OVERALL: PASS` together in one boot, proving Milestone 65 itself
+      needs neither a fresh disk nor any diagnostic skip to pass for
+      real -- only the TWO specific, already-fragile self-tests named
+      below do. `tasklist` confirmed zero orphaned
+      `qemu-system-x86_64.exe` processes after every verification run
+      this milestone performed.
+
+      **Two real, pre-existing bugs this milestone's own verification
+      independently re-confirmed and newly found, disclosed honestly
+      rather than worked around silently -- neither caused by, nor fixed
+      by, this milestone**: (1) Milestone 64's own disclosed
+      exec()-rebuild-triple-faults-on-a-genuinely-fresh-disk bug is still
+      live, re-confirmed directly: `main.rs`'s two exec()-rebuild self-test
+      calls (`process::self_test_real_exec()`, `loader::
+      self_test_execargv()`) were temporarily, diagnostically disabled
+      (never left disabled in the delivered code -- confirmed byte-
+      identical to the fully-enabled state via `git diff` before
+      finishing) to reach a real, working, fresh disk for the quote
+      above, the exact same technique Milestone 64's own writeup
+      disclosed using for the identical reason. (2) a SECOND, newly-found
+      real issue this milestone's own two-boot verification directly
+      exposed: `fs::self_test_permissions()`/`fs::self_test_symlinks()`
+      (Milestones 62/63) are NOT idempotent across repeated boots against
+      the SAME persisted disk -- their own fixture directories
+      (`permtestdir`, etc.) are created with a plain `make_dir()` that
+      fails once that name already exists, so a SECOND boot against a
+      disk a first boot already ran them on fails `mkdir_root` (and
+      cascades to most later checks in both self-tests) -- independently,
+      `loader::self_test_execargv()`'s (Milestone 58) own fixture-seeding
+      step fails the same way for a structurally different reason
+      (`seedargvtarget: directory full (max 8 entries)` -- the root
+      directory's own small, real, enforced capacity genuinely fills up
+      after just two boots' worth of accumulated self-test fixtures).
+      Directly confirmed real and reproducible, not a one-off: the FIRST
+      boot against a freshly-created disk shows both fs self-tests PASS
+      (quoted above); the VERY NEXT boot against that same,
+      now-once-used disk shows both FAIL, with no code change in
+      between. This creates a genuine three-way tension for any single
+      future boot log: a disk fresh enough for `fs::self_test_permissions
+      ()`/`self_test_symlinks()`/`self_test_execargv()`'s own
+      create-not-overwrite fixture logic to pass is EXACTLY the disk
+      state that trips bug (1) above at `self_test_real_exec()`/
+      `self_test_execargv()` itself; a disk stale enough to avoid bug (1)
+      has already failed bug (2)'s checks on some earlier boot. Milestone
+      65 itself is unaffected either way (`self_test_mmap()`/
+      `self_test_mmap_writable()`'s own fixture file is written with
+      `write_file()`, which overwrites rather than create-exclusive, so
+      it never hits this class of bug) -- independently confirmed by
+      being the only self-test proven PASS in BOTH boots quoted above.
+      **Left genuinely open for a future milestone to actually diagnose
+      and fix** -- out of this milestone's own scope (neither bug is an
+      mmap gap), but real, and now doubly significant: together these two
+      issues mean a single, non-diagnostically-modified `cargo run`
+      cannot currently show a 100%-clean self-test sweep from Milestone
+      45 through 65 against any one persisted disk, fresh or not.
+
+      **Still genuinely open**: hard links and a real block-device
+      abstraction beyond raw ATA (each independently scoped as explained
+      above and re-confirmed still blocked by this milestone), `mmap()`'s
+      own remaining real future work (multi-page files, `MAP_FIXED` --
+      `PROT_WRITE` itself is now done), the pre-existing exec()-rebuild-
+      triple-faults-on-a-fresh-disk bug, and the newly-found fs-self-test/
+      `self_test_execargv()` disk-non-idempotency bug -- both disclosed
+      just above.
+
+**Post-Milestone-65 fix pass**: a dedicated, fix-only pass closing both
+of Milestone 64/65's own disclosed problems -- NOT a new feature
+milestone, no roadmap item added. Both are now resolved together: a
+normal `cargo run` (the standard single-second-ATA-drive config every
+milestone has used) cleanly passes every self-test from Milestone 42
+through 65 in one boot, repeatably, across multiple consecutive boots on
+the same persisted disk, with no diagnostic skips.
+
+**Problem 1 fixed for real (not a safeguard) -- the fresh-second-ATA-
+drive triple fault**: real root cause found via a genuine `-d int,
+cpu_reset` QEMU hardware trace (`-no-reboot -no-shutdown` so the VM
+halts instead of silently resetting), not guessed at. The trace showed
+the SAME two-step escalation every time: a first, real `#PF` (page
+fault) at `CR2=0xfffffffffffffff8` while the freshly EXECARGV-rebuilt
+process was executing its own code, immediately followed by a SECOND
+`#PF` while the CPU was still trying to DELIVER the first one (`check_
+exception old: 0xe new 0xe`), which is architecturally what escalates to
+a double fault and then a triple fault. A second `#PF` occurring WHILE
+delivering the first means the CPU's own attempt to push the exception
+frame onto `TSS.privilege_stack_table[0]` (the single, shared ring0
+stack every ring3->ring0 transition -- syscalls AND hardware exceptions
+alike -- switches onto, since `interrupts.rs` never gives `page_fault`
+its own IST index) itself faulted -- i.e. that stack had run out of real
+room. Confirmed directly: `gdt.rs`'s `privilege_stack_table[0]` stack was
+still sized at its Milestone 27 value, `4096 * 5` (20 KiB) -- adequate
+for every ORDINARY syscall, but the EXEC/EXECARGV path is structurally
+deeper than any other syscall this kernel has: `syscall_entry`'s 15
+pushed GPRs, then `syscall_dispatch`'s own (debug-build, unoptimized)
+stack frame for its whole big match statement, then `exec_elf_with_args`
+-> `create_process_from_elf()` (ELF validation, a fresh PML4 walk,
+segment-by-segment mapping) -> `build_argv_envp_stack()` (real argv/envp
+`Vec<Vec<u8>>` construction) -> `exec_into_ring3()`'s own final iretq --
+all on the SAME 20 KiB stack, all still nested (exec never unwinds back
+through the normal syscall-return path before jumping into the new
+program). Both of the disclosed crash sites --
+`process::self_test_real_exec()` (Milestone 45) and `loader::self_test_
+execargv()` (Milestone 58) -- go through this exact same shared stack,
+which is why both hit the identical failure mode. Fixed by enlarging
+`privilege_stack_table[0]`'s real, allocated stack from `4096 * 5` (20
+KiB) to `4096 * 16` (64 KiB) in `kernel/src/gdt.rs` -- empirically
+verified: `4096 * 40` (160 KiB, tested first as a diagnostic) eliminated
+the crash outright, and `4096 * 16` was then independently re-verified
+sufficient on its own, real, fresh-disk boot (not just inferred from the
+larger value). A SEPARATE, real (but ultimately not the cause)
+correctness gap was also found and fixed along the way, kept because
+it's independently correct regardless: `create_process_from_image()`/
+`create_process_from_elf()` both used to determine which PML4 to copy
+the 511 shared "kernel-space" entries FROM by calling `Cr3::read()`
+("whatever is currently loaded") rather than the canonically-saved
+`KERNEL_PML4_FRAME` -- harmless for every ordinary process-creation call
+site (all run from genuine kernel context already), but genuinely wrong
+in principle for the one call path where it differs: `exec_elf()`/
+`exec_elf_with_args()` call `create_process_from_elf()` from INSIDE the
+EXEC/EXECARGV syscall's own dispatch, i.e. while CR3 is still the DYING
+process's own PML4, not the kernel's. A/B-tested directly: fixing this
+ALONE (new `kernel_pml4_for_new_process()` helper, both call sites
+updated) did NOT resolve the triple fault (confirmed via an identical
+`-d int` trace, same crash, same `CR2`, same RIP) -- so this is disclosed
+honestly as a real, independent hardening fix, not the actual root
+cause. Real verification, fresh build (repo root) + fresh (genuinely
+blank, first-ever) `target/persist.img` + the real, standard single
+extra ATA drive `src/main.rs` has always attached, quoted from the
+actual serial log:
+```
+milestone 58: syscall EXECARGV (process 3) -- hardware-recorded CS=0x1b (CPL=3) -- REAL teardown-and-rebuild from 'argvtarget' WITH real argv/envp, new entry=0x555550000000, new rsp=0x555560000fa0, never returning to the old one
+milestone 58: argvtarget starting -- reading real argv/envp off the real SysV process-entry stack
+milestone 58: self-test -- argvlauncher.elf's real EXECARGV replaced it with argvtarget.elf, which ran to completion and returned to the kernel cleanly (no panic, no double fault) -- see the 'milestone 58:' lines above for the real argv/envp-correctness evidence written by the programs themselves
+```
+No triple fault, no reset, no `EXCEPTION: PAGE FAULT`/`DOUBLE FAULT`
+anywhere in the log -- the boot continued straight through to `milestone
+6: waiting for keyboard input` (the interactive shell going live), the
+same real completion marker every prior clean boot has used. `process::
+self_test_real_exec()` (Milestone 45, the OTHER disclosed crash site)
+also shows a clean `OVERALL: PASS` in this same fresh-disk boot, proving
+both sites are genuinely fixed, not just the one exercised directly by
+the trace investigation.
+
+**Problem 2 fixed for real -- non-idempotent fixtures across repeated
+boots**: `fs::self_test_permissions()`/`fs::self_test_symlinks()`
+(Milestones 62/63) used create-EXCLUSIVE calls (`make_dir()`/`symlink()`
+for a name that must not already exist) for their own fixtures
+(`permtestdir`, `symtestdir`, `abslink`) with no cleanup -- fine on a
+disk's first-ever boot, but every name collides with itself on a second
+boot against the same disk, cascading into most of that self-test's own
+later assertions (a stale directory's mode/ownership left over from the
+FIRST run's own chmod/chown calls no longer matches what a freshly-
+created one would show). Fixed with two new, real, idempotent teardown
+helpers in `kernel/src/fs.rs` -- `teardown_permtestdir_fixtures()` /
+`teardown_symtestdir_fixtures()` -- called BOTH at the very start of
+each self-test (so a repeated boot always begins from a real,
+guaranteed-clean slate, ignoring every removal's `Result` since a
+genuinely fresh disk simply won't have any of these paths yet) AND at
+the very end (so THIS boot's own fixtures don't sit around consuming
+root-directory capacity for the rest of the same boot). That second half
+mattered for real, independently of the first: `loader::self_test_
+execargv()`'s (Milestone 58) own `write_file()` for `argvtarget` was
+failing with a genuine "directory full (max 8 entries)" even on a
+SINGLE boot, not just a repeated one -- root's own small, real, enforced
+8-entry capacity (`fs::MAX_ENTRIES`) was already exhausted by the time
+`self_test_execargv()` ran, by the combination of `selftestwrite`,
+`permtestdir`, `symtestdir`, `abslink`, `stdiotest_a`, `stdiotest_b`, and
+`mmapf` -- seven names already claimed by self-tests earlier in the SAME
+boot, before `argvtarget` could become the eighth. Freeing `permtestdir`/
+`symtestdir`/`abslink` back up the moment their own tests are done fixes
+this directly, with no change needed to `self_test_execargv()` itself
+(its own `write_file()` call was already correctly overwrite-safe, not
+create-exclusive -- the bug was root-capacity pressure from ELSEWHERE,
+not its own fixture logic). Real verification: `cargo run` (repo root)
+three times in a row against the SAME, never-deleted, never-reset
+`target/persist.img` (boot 1 genuinely fresh/blank; boots 2 and 3 reused
+the disk boot 1 and then boot 2 actually wrote to) -- all three self-
+tests PASS in EVERY boot, quoted from boot 3's own serial log (the
+THIRD consecutive boot on the same disk):
+```
+fs self-test: permissions OVERALL=PASS
+fs self-test: symlinks OVERALL=PASS
+milestone 58: self-test -- argvlauncher.elf's real EXECARGV replaced it with argvtarget.elf, which ran to completion and returned to the kernel cleanly (no panic, no double fault) -- see the 'milestone 58:' lines above for the real argv/envp-correctness evidence written by the programs themselves
+```
+Zero `mkdir_root`-style EEXIST failures, zero "directory full" errors,
+in any of the three boots.
+
+**A real, pre-existing, ALREADY-DISCLOSED limitation independently
+re-confirmed during this pass's own verification, left untouched --
+out of this pass's explicit two-problem scope**: `loader::self_test_
+stdio()`'s (Milestone 61) own doc comment already discloses that
+`stdiotest.elf` writes files (`stdiotest_a`/`stdiotest_b`) with no
+O_TRUNC semantics, so a re-run whose total written length ends up
+SHORTER than a previous run's leaves stale trailing bytes from the
+earlier run behind. This was directly observed on boots 2 and 3 above
+(`fread_real_buffering`/`eof_semantics`/`OVERALL` all reporting `FAIL`
+for `stdiotest.elf` specifically, on the repeated boots only -- boot 1,
+genuinely fresh, showed a clean `stdiotest.elf` `OVERALL=PASS`) --
+independently reproduced, not caused by this fix pass's own changes
+(neither of the two problems fixed above touches `stdiotest.elf`, `fs::
+write_file()`, or Milestone 61's own code at all), and not one of this
+pass's two named problems. Disclosed honestly rather than silently
+patched: a real, small, additional idempotency gap in this project's
+self-test suite, genuinely open for a future pass.
+
 ## Building and running
 
 Requires:

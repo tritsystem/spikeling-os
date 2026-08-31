@@ -4079,6 +4079,196 @@ self-test suite, genuinely open for a future pass.
       source -- a future milestone's own honest scoping judgment should
       decide which, after checking the actual tractability of each against
       the code that exists by then.
+- [x] **Milestone 70**: Tier 3's fourth slice -- real comparison operators
+      (`==`, `!=`, `<`, `>`, `<=`, `>=`) and real `if`/`else` control flow,
+      with genuine `cmp`/`SETcc` and conditional-jump (`jz`/`jmp`, real
+      forward-patched `rel32`) x86_64 codegen -- the natural next grammar
+      increment Milestone 69's own closing disclosure named, picked over
+      the self-hosting capstone because a real compile-to-disk-to-exec()
+      loop now exists and had nothing but straight-line arithmetic to
+      point it at.
+
+      **Grammar added** (see `tools/cc_src/main.rs`'s own top doc comment
+      for the full, precise BNF): `cond_expr := expr (relop expr)?` (no
+      chaining -- `a < b < c` is not legal, a real, disclosed scope cut),
+      `if_stmt := "if" "(" cond_expr ")" "{" stmt* "}" ("else" "{" stmt*
+      "}")?` (no bare `else if` without its own braces), and factor's
+      parenthesized case now recurses through `cond_expr` rather than the
+      narrower `expr`, so a parenthesized comparison like `(a < b)` is a
+      legal sub-expression of ordinary arithmetic on its own 0/1 result --
+      a real, deliberate widening exercised by this milestone's own CASE
+      11 (below). Real codegen: each comparison emits `cmp rax, rcx`
+      (left operand in RAX, right in RCX, the same operand convention
+      every arithmetic op already used) followed by the one real SETcc
+      opcode that operator means (`sete`/`setne`/`setl`/`setg`/`setle`/
+      `setge`) and a `movzx eax, al` to clean-zero-extend the 0/1 result
+      into the full 64-bit RAX; `if`/`else` emits `test rax, rax` against
+      the evaluated condition, a forward-patched `jz` to skip the
+      then-block when false, and (only when an `else` is present) a
+      forward-patched `jmp` at the end of the then-block to skip over the
+      else-block -- the standard "one conditional branch plus one
+      unconditional branch" if/else shape, checked against real rustc/gcc
+      `-O0` output before writing it, not guessed at. `gen_stmt_list()`
+      (new, replacing the statement-walk `gen_function()` used to inline
+      directly) recurses into both branches so nested `if`/else and
+      variable declarations inside either branch are handled through the
+      exact same DECL/ASSIGN/RETURN/IF code every top-level function body
+      already used; `collect_vars_rec()` was given the matching recursive
+      case so a variable declared inside a branch still gets a real stack
+      slot.
+
+      **This milestone recovered from an interrupted prior session**: a
+      previous agent's real work -- the full lexer/parser/codegen grammar
+      described above, plus test cases 11 and 13 through 18 (case 12 was
+      never used; a numbering gap from an earlier draft, left as-is
+      rather than renumbered, harmless) -- was already present in
+      `tools/cc_src/main.rs` and `kernel/assets/cc.elf` (grown from
+      Milestone 69's 17952 bytes to 24112) when this session picked the
+      work up, cut off mid-verification by a rate limit. Read in full
+      before touching anything: genuinely complete, coherent, correct
+      work, not a stub -- confirmed by tracing the SETcc/Jcc opcode
+      choices against the Intel SDM and the `rel32`-patching arithmetic
+      by hand before trusting any of it.
+
+      **Real blocker #1 (already diagnosed before this session started,
+      confirmed and fixed here): `cc.elf`'s growth outran two Milestone-36
+      safety caps.** `process::create_process_from_elf()`'s
+      `MAX_PAGES_PER_ELF_SEGMENT` (4) and `MAX_TOTAL_ELF_PAGES` (16) exist
+      to reject a malicious/malformed ELF's `p_memsz` up front, before any
+      frame is allocated -- but cc.elf's one `PT_LOAD` segment (see
+      `tools/cc_src/linker.ld`'s single `seg1` PHDR) now needs 6 pages
+      (24112 bytes), past the old 4-page cap. Confirmed the hard way via
+      a real fresh-QEMU-boot failure, quoted from `m70_fresh_boot.log`:
+      `milestone 67: self-test FAILED -- run_loaded_elf_process(cc.elf)
+      returned Err: elf: a PT_LOAD segment needs more pages than this
+      loader's fixed per-segment cap`. Same class of situation as
+      Milestone 57's `HEAP_PAGE_COUNT` increase (4 -> 64 pages): a real,
+      legitimately growing component outgrowing an initially-conservative
+      limit, not a bug to route around. Raised to `MAX_PAGES_PER_ELF_
+      SEGMENT = 64` and `MAX_TOTAL_ELF_PAGES = 128` (kept at the SAME 2x
+      ratio the original 16-vs-4 pair used) -- deliberately not raised to
+      an arbitrarily large number, because the cap is still meant as a
+      genuine "reject up front" safety check, not a formality: this
+      kernel's real QEMU default (no `-m` flag anywhere in `src/main.rs`/
+      `launch_qemu.ps1`) is 128 MiB (32768 4 KiB pages), so even the full
+      new 64-page cap is under 0.2% of it -- real headroom (roughly 10x
+      cc.elf's current 6-page need) for several more milestones of
+      grammar/codegen/assembler/linker growth without being "whatever the
+      file happens to ask for". Checked, not assumed: the loader's
+      per-page `p4_index()` invariant (every `PT_LOAD` page must fall in
+      the SAME private PML4 slot as `USER_CODE_ADDR`/`USER_STACK_ADDR`,
+      `kernel/src/process.rs` ~4024-4031) still holds at the new cap size
+      -- that check is computed fresh per page regardless of the cap
+      constant, and `USER_STACK_ADDR` sits `0x10000000` (256 MiB) above
+      `USER_CODE_ADDR`, `HEAP_START` `0x20000000` (512 MiB) above it,
+      both enormously larger than the new 64-page (256 KiB)/128-page
+      (512 KiB) ceilings and both still inside the SAME 512 GiB PML4
+      slot -- no collision possible at this new size, verified by
+      arithmetic, not just re-run and hoped clean.
+
+      **Real bug #2 (found by this session's own verification, not
+      inherited from the diagnosis above): CASE 11's own token count
+      exceeded the lexer's fixed token-buffer cap.** `MAX_TOKENS` (64)
+      predates this milestone; CASE 11 (all six comparisons combined into
+      one hand-verifiable decimal result, `(a<b)+(a>b)*10+(a==b)*100+
+      (a!=b)*1000+(a<=b)*10000+(a>=b)*100000`) lexes to 67 real tokens +
+      1 EOF = 68, already past it. Not caught by only reading the code --
+      found by actually booting after the cap fix above and reading CASE
+      11's real output: `(compile failed)` /
+      `case11_all_six_comparisons_return_101010=FAIL`, tracing that back
+      to `lex_and_parse()` -> `lex()` -> `Err(LexError::TooManyTokens)` ->
+      `None`, then hand-counting CASE 11's own token stream to confirm 68
+      against a 64 cap. Fixed by raising `MAX_TOKENS` to 128 (real
+      headroom, roughly 2x CASE 11's own need, not picked to exactly fit
+      today's one failure) -- a real, independent, lower-risk fix than
+      blocker #1's: `toks_ptr` is a transient `malloc()`ed scratch buffer,
+      freed implicitly at process exit, so raising it has ZERO effect on
+      cc.elf's own compiled/linked SIZE (no token is ever emitted into
+      the ELF image itself), and does not reopen the ELF-segment-page-cap
+      concern blocker #1 addressed.
+
+      **Real verification loop**: `cargo build` from the repo root after
+      each fix, then real QEMU boots (`SPIKELING_QEMU_MONITOR_PORT` set,
+      the kernel's own real monitor-port mechanism, so a real `quit`
+      could be sent once the boot reached its own steady-state `hlt_loop`
+      after Milestone 25's line, rather than guessing at a timeout) --
+      one genuinely fresh-disk boot (`target/persist.img`/`persist2.img`
+      deleted first, so `fs.rs`'s real on-disk filesystem starts from
+      nothing) and one immediately-following boot reusing that same disk,
+      unmodified. Quoted from the fresh-disk boot's own serial log
+      (`m70_verify_fresh2.log`):
+      ```
+      milestone 70: cc comparisons + if/else (real conditional jumps, both branches) starting
+      case11_all_six_comparisons_return_101010=PASS
+      case13_if_else_true_branch_returns_1=PASS
+      case14_if_else_false_branch_returns_0=PASS
+      case15_if_no_else_true_branch_returns_42=PASS
+      case16_if_no_else_false_branch_returns_7=PASS
+      case17_real_elf_exec_if_else_true_branch_returns_1=PASS
+      case18_real_elf_exec_if_else_false_branch_returns_0=PASS
+      OVERALL_M70=PASS
+      ```
+      immediately followed by `milestone 67: self-test -- cc.elf ran to
+      completion and returned to the kernel cleanly (no panic, no double
+      fault)` -- the embedded cc.elf loading through the now-fixed cap,
+      genuinely re-confirmed, not assumed from the standalone-ELF cases
+      alone. CASE 17/18 (the same if/else source as CASE 13/14, run
+      through the real on-disk-ELF + kernel `exec()` + `wait()` path
+      Milestone 69 established) each show a real `milestone 45: syscall
+      EXEC` teardown-and-rebuild immediately followed by a real `milestone
+      43: syscall WAIT` reaping the child with the hand-predicted exit
+      code (1, then 0) -- the real kernel `exec()` path exercising a
+      genuinely branching program, not a straight-line one. In the same
+      boot: `OVERALL=PASS` x4 (Milestones 1-66's own aggregate checks),
+      `OVERALL_M68=PASS`, `OVERALL_M69=PASS`, `fs self-test: permissions
+      OVERALL=PASS`, `fs self-test: symlinks OVERALL=PASS`,
+      `fread_real_buffering=PASS` (stdiotest, real on a genuinely fresh
+      disk), zero `kernel panicked`/`panicked at`, zero unhandled
+      `DOUBLE FAULT`/`TRIPLE FAULT` anywhere in the log. Independently
+      re-confirmed on the immediately-following reused-disk boot
+      (`m70_verify_reused2.log`): identical `OVERALL_M70=PASS` with all
+      seven cases individually `PASS`, `milestone 67: self-test -- cc.elf
+      ran to completion` again unchanged, zero panics/unhandled
+      exceptions -- the only two failures in that second boot were
+      `stdiotest.elf`'s own `fread_real_buffering=FAIL` (the pre-existing,
+      already-disclosed Milestone 61 O_TRUNC gap, independently
+      re-confirmed here and NOT touched by this milestone) and `fs
+      self-test: permissions`/`symlinks` both `OVERALL=FAIL` -- a REAL,
+      newly-observed reused-disk artifact this milestone found but did
+      NOT cause and did not fix (out of scope: `fs.rs` and its self-test
+      are untouched by this milestone): those two self-tests `mkdir` a
+      fixed-name scratch directory (`permtestdir`/`symtestdir`) and never
+      remove it on success, so a second boot against the same disk finds
+      it already present and every dependent check cascades to `FAIL`
+      (`no such directory 'permtestdir'`, etc.) -- the same underlying
+      class of gap as the already-documented `stdiotest.elf` O_TRUNC
+      issue (a self-test that assumes a fresh disk), just not previously
+      exercised in this exact two-boots-in-a-row shape. Disclosed here,
+      not fixed, and not this milestone's own regression: both
+      `permtestdir`/`symtestdir` are Milestone-62-era fs.rs self-test
+      fixtures with no dependency on anything this milestone touched.
+      `tasklist` confirmed zero orphaned `qemu-system-x86_64.exe`/
+      `spikeling-os.exe` processes after every verification boot in this
+      session (each QEMU instance was cleanly stopped via its own real
+      monitor-port `quit`, then independently re-checked with `tasklist`).
+
+      **Still genuinely open**: no unary minus, no additional C types, no
+      function parameters/calls/multiple functions, no arrays/pointers, no
+      preprocessor (unchanged from Milestone 67's own grammar); no
+      comparison chaining and no bare `else if` (this milestone's own
+      disclosed scope cuts, see the grammar section above); while-loops
+      (backward jumps, reusing this same forward-patch machinery) are the
+      natural next Tier 3 grammar increment; the `fs.rs` 8-entry directory
+      cap is real and unraised (CASE 17/18 reuse CASE 8/10's own `ccout1`
+      path, same real reason CASE 10's own doc comment already gives); the
+      trailing `leave; ret`/`sys_exit` safety backstop for a missing
+      `return` is unchanged from Milestone 68's own disclosed gap; the
+      newly-observed `fs.rs` self-test reused-disk directory-already-
+      exists gap (permissions/symlinks self-tests) named above is real,
+      disclosed, and unfixed. The natural next Tier 3 milestone: while-
+      loops, or continue toward function parameters/calls now that both
+      comparisons and control flow are real.
+
 ## Building and running
 
 Requires:

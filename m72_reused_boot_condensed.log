@@ -1,0 +1,625 @@
+SIGSEGV test
+
+hello from process A -- via real write(ptr,len)!                
+hello from a non-USER_CODE_ADDR entry point -- milestone 44 confirmed!
+hello from a non-USER_CODE_ADDR entry point -- milestone 44 confirmed!
+milestone 51: malloctest starting -- real malloc()/free() over sys_sbrk()
+
+  ptr_a=
+0x0000555570000008
+
+
+  ptr_b=
+0x0000555570000050
+
+
+  ptr_c=
+0x0000555570000008
+
+
+  ptr_d=
+0x0000555570000078
+
+
+  ptr_e=
+0x0000555570000078
+
+
+  ptr_f=
+0x0000555570000090
+
+
+distinct=
+PASS
+ 
+integrity=
+PASS
+ 
+reuse=
+PASS
+ 
+split_reuse=
+PASS
+ 
+split_remainder=
+PASS
+ 
+split_integrity=
+PASS
+ 
+OVERALL=
+PASS
+
+
+milestone 61: stdiotest starting -- real string.h + buffered stdio
+
+memcpy=
+PASS
+ 
+memset=
+PASS
+ 
+memmove=
+PASS
+ 
+memcmp=
+PASS
+ 
+strlen=
+PASS
+ 
+strcmp=
+PASS
+ 
+strncmp=
+PASS
+ 
+strcpy=
+PASS
+ 
+strncpy=
+PASS
+ 
+strcat=
+PASS
+ 
+strchr=
+PASS
+ 
+
+
+content_len_is_40=
+PASS
+ 
+fopen_w=
+PASS
+ 
+  wlen after 12B write=
+0x000000000000000c
+
+
+  wlen after +25B write=
+0x0000000000000005
+
+
+  wlen after +3B write=
+0x0000000000000008
+
+
+fwrite_counts=
+PASS
+ 
+fwrite_real_buffering=
+PASS
+ 
+fclose_w=
+PASS
+ 
+fopen_r=
+PASS
+ 
+  rlen after 5B read=
+0x0000000000000020
+
+
+  rpos after 5B read=
+0x0000000000000005
+
+
+  rlen after +20B read=
+0x0000000000000020
+
+
+  rpos after +20B read=
+0x0000000000000019
+
+
+  rlen after +10B read=
+0x000000000000000c
+
+
+  rpos after +10B read=
+0x0000000000000003
+
+
+fread_counts=
+PASS
+ 
+fread_real_buffering=
+FAIL
+ 
+content_roundtrip=
+PASS
+ 
+eof_semantics=
+FAIL
+ 
+fclose_r=
+PASS
+ 
+
+
+append_write=
+PASS
+ 
+append_roundtrip=
+PASS
+ 
+
+
+fprintf_len=
+PASS
+ 
+fprintf_content=
+PASS
+ 
+
+
+OVERALL=
+FAIL
+
+
+hello from process A -- via real write(ptr,len)!                
+hello from process A -- via real write(ptr,len)!                
+hello from process A -- via real write(ptr,len)!                
+hello from process A -- via real write(ptr,len)!                
+milestone 58: argvlauncher starting -- calling real EXECARGV with 3 argv + 1 envp entries
+
+milestone 58: argvtarget starting -- reading real argv/envp off the real SysV process-entry stack
+
+  argc=
+3
+
+
+  argv[
+0
+]=
+argvtarget
+
+
+  argv[
+1
+]=
+hello
+
+
+  argv[
+2
+]=
+world
+
+
+  envp[
+0
+]=
+GREETING=hi
+
+
+  envc=
+1
+
+
+argc=3: 
+PASS
+ 
+argv0=argvtarget: 
+PASS
+ 
+argv1=hello: 
+PASS
+ 
+argv2=world: 
+PASS
+ 
+envc=1: 
+PASS
+ 
+envp0=GREETING=hi: 
+PASS
+ 
+OVERALL=
+PASS
+
+
+milestone 67: cc (subset-C lexer + parser, no codegen yet) starting
+
+case1_lex_ok=
+PASS
+ 
+  ntoks1=
+1
+9
+
+
+case1_ntoks_is_19=
+PASS
+ 
+case1_token_kinds_match=
+PASS
+ 
+case1_token_payloads_match=
+PASS
+ 
+case1_parse_ok=
+PASS
+ 
+case1_func_name_is_main=
+PASS
+ 
+case1_stmt_count_is_3=
+PASS
+ 
+case1_stmt0_is_decl_x=
+PASS
+ 
+case1_stmt1_is_assign_x_40plus2=
+PASS
+ 
+case1_stmt2_is_return_x=
+PASS
+ 
+
+
+case2_lex_ok=
+PASS
+ 
+  case2 real parse error at token index=
+7
+
+
+case2_real_parse_error_at_token7=
+PASS
+ 
+
+
+  case3 real lex error at byte offset=
+0
+
+
+case3_real_lex_error_at_offset0=
+PASS
+ 
+
+
+OVERALL=
+PASS
+
+
+
+milestone 68: cc codegen (real x86_64 machine code, direct execution) starting
+
+  case4 returned=
+4
+2
+ (expected 42)
+
+case4_codegen_exec_returns_42=
+PASS
+ 
+
+
+  case5 returned=
+4
+1
+ (expected 41)
+
+case5_two_vars_mul_sub_returns_41=
+PASS
+ 
+
+
+  case6 returned=
+2
+8
+ (expected 28)
+
+case6_division_and_precedence_returns_28=
+PASS
+ 
+
+
+  case7 real codegen error -- undeclared variable at byte offset=
+2
+7
+
+
+case7_undeclared_variable_error_at_offset27=
+PASS
+ 
+
+
+OVERALL_M68=
+PASS
+
+
+
+milestone 69: cc ELF64 writer + real exec() (real on-disk executable, real kernel exec()) starting
+
+  real on-disk ELF written, real fork()+exec()+wait() -- child exited=
+true
+ real exit code=
+4
+2
+ (expected exited=true code=
+4
+2
+)
+
+case8_real_elf_exec_returns_42=
+PASS
+ 
+
+
+  real on-disk ELF written, real fork()+exec()+wait() -- child exited=
+true
+ real exit code=
+2
+5
+ (expected exited=true code=
+2
+5
+)
+
+case9_fresh_source_real_elf_exec_returns_25=
+PASS
+ 
+
+
+  real on-disk ELF written, real fork()+exec()+wait() -- child exited=
+true
+ real exit code=
+2
+8
+ (expected exited=true code=
+2
+8
+)
+
+case10_division_real_elf_exec_returns_28=
+PASS
+ 
+
+
+OVERALL_M69=
+PASS
+
+
+
+milestone 70: cc comparisons + if/else (real conditional jumps, both branches) starting
+
+  case11 (all 6 comparisons, a=5,b=3) returned=
+1
+0
+1
+0
+1
+0
+ (expected 101010)
+
+case11_all_six_comparisons_return_101010=
+PASS
+ 
+
+
+  case13 (x=10, TRUE branch) returned=
+1
+ (expected 1)
+
+case13_if_else_true_branch_returns_1=
+PASS
+ 
+
+
+  case14 (x=2, FALSE branch) returned=
+0
+ (expected 0)
+
+case14_if_else_false_branch_returns_0=
+PASS
+ 
+
+
+  case15 (x=1, TRUE branch taken) returned=
+4
+2
+ (expected 42)
+
+case15_if_no_else_true_branch_returns_42=
+PASS
+ 
+
+
+  case16 (x=0, FALSE branch, fell through) returned=
+7
+ (expected 7)
+
+case16_if_no_else_false_branch_returns_7=
+PASS
+ 
+
+
+  real on-disk ELF written, real fork()+exec()+wait() -- child exited=
+true
+ real exit code=
+1
+ (expected exited=true code=
+1
+)
+
+case17_real_elf_exec_if_else_true_branch_returns_1=
+PASS
+ 
+
+
+  real on-disk ELF written, real fork()+exec()+wait() -- child exited=
+true
+ real exit code=
+0
+ (expected exited=true code=
+0
+)
+
+case18_real_elf_exec_if_else_false_branch_returns_0=
+PASS
+ 
+
+
+OVERALL_M70=
+PASS
+
+
+milestone 71: cc while-loops (real backward-jump codegen) starting
+
+  case19 (sum 1..5 via while) returned=
+1
+5
+ (expected 15)
+
+case19_while_sum_1_to_5_returns_15=
+PASS
+ 
+
+
+  case20 (while condition false from the start, zero iterations) returned=
+9
+9
+ (expected 99, unchanged)
+
+case20_while_zero_iterations_returns_99=
+PASS
+ 
+
+
+  case21 (if nested inside while, counts i==3 only) returned=
+1
+ (expected 1)
+
+case21_if_nested_in_while_returns_1=
+PASS
+ 
+
+
+  real on-disk ELF written, real fork()+exec()+wait() -- child exited=
+true
+ real exit code=
+1
+5
+ (expected exited=true code=
+1
+5
+)
+
+case22_real_elf_exec_while_sum_1_to_5_returns_15=
+PASS
+ 
+
+
+OVERALL_M71=
+PASS
+
+
+
+milestone 72: cc function parameters and calls (real x86_64 calling convention) starting
+
+case23_first_func_is_combine_with_2_params=
+PASS
+ 
+case23_second_func_is_main_with_0_params_and_ends_list=
+PASS
+ 
+case23_multifunction_ast_shape=
+PASS
+ 
+
+
+  case24 (combine(7,5) = 7*10+5, real 2-param call) returned=
+7
+5
+ (expected 75)
+
+case24_two_param_call_returns_75=
+PASS
+ 
+
+
+  case25 (mix(1,2,3), real 3-param call) returned=
+1
+2
+3
+ (expected 123)
+
+case25_three_param_call_returns_123=
+PASS
+ 
+
+
+  case26 (mix4(1,2,3,4), real 4-param call) returned=
+1
+2
+3
+4
+ (expected 1234)
+
+case26_four_param_call_returns_1234=
+PASS
+ 
+
+
+  case27 (add(x, add(1,2)) with x=5, nested call as argument) returned=
+8
+ (expected 8)
+
+case27_nested_call_as_argument_returns_8=
+PASS
+ 
+
+
+  real on-disk ELF written, real fork()+exec()+wait() -- child exited=
+true
+ real exit code=
+7
+5
+ (expected exited=true code=
+7
+5
+)
+
+case28_real_elf_exec_two_param_call_returns_75=
+PASS
+ 
+
+
+  case29 real codegen error -- undeclared function at byte offset=
+2
+0
+
+
+case29_undeclared_function_error_at_offset20=
+PASS
+ 
+
+
+OVERALL_M72=
+PASS
+
+

@@ -4419,6 +4419,292 @@ self-test suite, genuinely open for a future pass.
       control flow, but still cannot factor any of it into more than one
       function; that is the next genuinely bigger step (a real calling
       convention and per-function stack frames), not attempted here.
+- [x] **Milestone 72**: Tier 3's sixth slice -- real function parameters
+      and function calls, with a real x86_64 calling convention and real
+      per-function stack frames -- exactly the "next genuinely bigger
+      step" Milestone 71's own closing disclosure named, picked over any
+      further single-function grammar growth because it is the one
+      remaining item that changes this subset from "one function with
+      real control flow" into "a real program factored across more than
+      one function", the actual capability this whole Tier exists to
+      build toward. Checked directly against `tools/cc_src/main.rs`
+      itself (not just the README's own prior wording) before starting:
+      `FuncDef` had no `next` field and `ExprNode` had no call-argument
+      shape at all, confirming no prior milestone had begun this work
+      under a different name.
+
+      **The calling convention chosen, and why**: integer arguments 1-4
+      passed in RDI, RSI, RDX, RCX, in that order -- checked directly
+      against this kernel's own real syscall ABI (`tools/cc_src/libc.rs`'s
+      own `sys_write`/`sys_open`/`sys_fdwrite` wrappers, which already pass
+      their own first three arguments via `in("rdi")`/`in("rsi")`/
+      `in("rdx")`) before picking it, so a subset-C function call now uses
+      the SAME real register ordering this kernel's syscall boundary
+      already established, just extended one register further (RCX for a
+      genuine 4th argument, ordinary SysV x86_64 order) rather than
+      inventing a new, unrelated convention. A return value comes back in
+      RAX -- the same "every `gen_expr()` node leaves its value in RAX"
+      postcondition this codegen already relied on internally since
+      Milestone 68, so a call composes with the rest of this codegen (as
+      an operand of arithmetic, as another call's own argument, ...) with
+      zero special-casing anywhere else.
+
+      **Grammar added** (see `tools/cc_src/main.rs`'s own top doc comment
+      for the full BNF): `program := function+` (a real production for
+      the first time -- Milestone 67-71 only ever had ONE function per
+      source, parsed directly via `parse_function()`); `function := "int"
+      IDENT "(" params? ")" "{" stmt* "}"` (widened from Milestone 67's
+      fixed `"(" ")"`); `params := "int" IDENT ("," "int" IDENT)*`;
+      `factor := INTLIT | IDENT | IDENT "(" args? ")" | "(" cond_expr
+      ")"` (IDENT is now genuinely ambiguous between a variable reference
+      and a call expression, resolved with one token of lookahead after
+      the IDENT itself); `args := cond_expr ("," cond_expr)*`. New AST:
+      `FuncDef` gained `params_ptr`/`param_count` (a function's own
+      parameters, in real malloc()ed external-buffer storage -- see below)
+      and `next` (linking several `FuncDef`s into one real program-level
+      list, threaded together by the new `parse_program()`, not
+      `parse_function()` itself, which still only ever builds one
+      unlinked `FuncDef` exactly as before); `ExprNode` gained
+      `call_args_ptr`/`call_argc` for a new `EXPR_CALL` kind, reusing the
+      existing `ident_off`/`ident_len` fields for the callee's own name
+      (the same field-reuse discipline `STMT_IF`/`STMT_WHILE`'s
+      `expr`/`then_body` already established in Milestones 70/71). Every
+      new fixed-size collection (a function's own parameter list, a call's
+      own argument list) is a real malloc()ed EXTERNAL buffer accessed via
+      raw-pointer read/write helpers (`param_write`/`param_read`,
+      `call_arg_write`/`call_arg_read`) -- deliberately NOT an embedded
+      `[T; N]` array field indexed by a runtime-variable index, for the
+      exact reason this file's own top doc comment already gives and a
+      prior milestone already hit for real: `[]` indexing on a
+      runtime-variable index inserts a bounds-check panic path that pulls
+      `core::fmt` into this freestanding `panic=abort` binary and fails to
+      link at this kernel's high `USER_CODE_ADDR`. No standalone
+      call-as-statement (a call may only appear inside an assign_stmt/
+      return_stmt/another call's own argument) -- this subset still has no
+      "expression statement" production at all, an existing gap since
+      Milestone 67, unwidened here, and a real, disclosed scope cut, not
+      an oversight.
+
+      **Real codegen** (`gen_program()`, `collect_vars_for_function()`,
+      the new `EXPR_CALL` arm in `gen_expr()`, and three new `CodeBuf`
+      encodings, all in `tools/cc_src/main.rs`): `gen_program()` compiles
+      an entire `function+` list into ONE shared `CodeBuf`, building a real
+      function-symbol table (`FuncSym`: name, own code offset, own
+      parameter count) incrementally as each function is compiled --
+      recording a function's own symbol entry BEFORE compiling ITS OWN
+      body (not after) is what makes a LATER function's own calls resolve
+      against an already-real, already-written target with a real `call
+      rel32` computed and written in a single pass, exactly the same
+      "target already known, no placeholder/patch needed" technique
+      Milestone 71's own `emit_jmp_back()` established for a backward
+      jump, generalized here from a jump within one function to a call
+      between two different functions. This is also the source of this
+      milestone's own real, deliberate, disclosed dependency-order scope
+      cut: a callee must be defined at or before its own caller in source
+      order -- a forward call (to a function defined LATER in the source)
+      or mutual recursion both hit a real, deterministic
+      `CodeGenError::UndeclaredFunction` today, since neither callee's
+      symbol exists in the table yet at the point the caller's own call
+      site is compiled; direct self-recursion (a function calling itself)
+      is, as a real and disclosed CONSEQUENCE of the "register before
+      compiling my own body" ordering, mechanically reachable by this
+      codegen, but is NOT exercised by any of this milestone's own
+      self-test cases and its correctness has not been independently
+      verified -- an honest, disclosed unknown, not a claimed capability,
+      even though the underlying mechanism (an ordinary `call`, a full
+      per-invocation stack frame allocated fresh by that call's own
+      prologue, an ordinary `ret`) is the same real hardware mechanism
+      ordinary recursive functions rely on in general. Both would need the
+      same real forward-patch machinery `if`/`else`'s `jz`/`jmp` already
+      uses, generalized to call sites -- a real, disclosed, smaller next
+      increment, not attempted here.
+
+      Every function's own epilogue is the ordinary `leave; ret` shape
+      EXCEPT the entry function itself ("main"), which uses the
+      caller-supplied `CodegenMode` (Standalone's real `sys_exit(result)`
+      sequence, or Callable's own `leave; ret`, itself indistinguishable
+      from an ordinary callee's epilogue since a Callable-mode entry point
+      IS invoked as an ordinary function-pointer call from Rust) -- a
+      non-entry function's own `return` must always genuinely return
+      control to its real caller (the `call` instruction's own return
+      address, already on the stack), never `sys_exit()` the whole process
+      out from under that caller. `collect_vars_for_function()` seeds a
+      function's own parameters into the SAME flat rbp-relative slot
+      namespace its local `int` declarations already share (param 0 gets
+      rbp-8, param 1 rbp-16, ..., the first local DECL continuing right
+      after the last parameter), then the callee's own prologue spills
+      each incoming argument register to its own slot via the new
+      `CodeBuf::emit_mov_rbp_off_reg()` (`mov [rbp+disp8], reg64`, REX.W
+      `89 /r`, generalizing the existing RAX-only
+      `emit_mov_rbp_off_rax()`'s ModRM shape to any of the four argument
+      registers). A call site's own codegen (the new `EXPR_CALL` arm in
+      `gen_expr()`) evaluates every argument left-to-right into RAX,
+      PUSHing each one immediately after -- the same "stack machine"
+      technique `EXPR_BINARY` already uses for its own two operands,
+      generalized past two operands to however many a call has -- then
+      pops them back off in REVERSE order via the new
+      `CodeBuf::emit_pop_reg()` (`pop reg64`, single-byte `0x58+reg`, no
+      REX needed for any of RAX/RCX/RDX/RSI/RDI) into the real argument
+      registers (the stack is LIFO, so the last-pushed/highest-index
+      argument comes off first -- this loop counts DOWN from the last
+      argument index to the first, assigning each popped value to the
+      register matching ITS OWN original argument index, exactly undoing
+      the push order), a real arity check against the callee's own
+      recorded `param_count` (`CodeGenError::ArgCountMismatch` -- real, but
+      genuinely NOT exercised by any self-test case below, every call site
+      being deliberately arity-correct; honestly disclosed rather than
+      silently left untested, the same status
+      `ParseError::TooManyParams`/`TooManyArgs`/`TooManyFunctions` above
+      also carry), and finally the new `CodeBuf::emit_call()` (`call
+      rel32`, opcode `0xE8`). Every encoding was individually hand-checked
+      against the Intel SDM's own encoding tables before being written,
+      the same discipline every prior codegen milestone in this file
+      already used.
+
+      **Real verification loop**: `cargo build` from the repo root, then
+      the project's own pinned-nightly `rustc` recipe (unchanged, see
+      `tools/cc_src/README.md`) to rebuild `kernel/assets/cc.elf` (grown
+      from Milestone 71's 27112 bytes to 34896 bytes; the real number that
+      matters for the page cap, the one `PT_LOAD` segment's own
+      `p_memsz`, is 25984 bytes -- 7 pages, inspected directly via the ELF
+      program header rather than inferred from file size -- still
+      comfortably under Milestone 70's 64-page per-segment cap and
+      128-page total cap, so **no cap change was needed this milestone**),
+      then two real QEMU boots (`qemu-system-x86_64` launched directly
+      with `-serial file:<path>` and a `-monitor tcp:127.0.0.1:<port>`,
+      `quit` sent over that monitor port once the boot reached its own
+      steady-state `hlt_loop` after Milestone 25's line) -- one genuinely
+      fresh-disk boot (`target/persist.img`/`persist2.img` recreated blank
+      first) and one immediately-following boot reusing that same disk,
+      unmodified. Quoted from the fresh-disk boot's own serial log
+      (`m72_fresh_boot.log`; condensed from the raw per-syscall trace this
+      run captured by concatenating every real `milestone 31: syscall
+      WRITE` payload in order -- see that file for the full, uncondensed
+      record of every byte, hardware-recorded CPL included):
+      ```
+      milestone 72: cc function parameters and calls (real x86_64 calling convention) starting
+      case23_multifunction_ast_shape=PASS
+      case24 (combine(7,5) = 7*10+5, real 2-param call) returned=75 (expected 75)
+      case24_two_param_call_returns_75=PASS
+      case25 (mix(1,2,3), real 3-param call) returned=123 (expected 123)
+      case25_three_param_call_returns_123=PASS
+      case26 (mix4(1,2,3,4), real 4-param call) returned=1234 (expected 1234)
+      case26_four_param_call_returns_1234=PASS
+      case27 (add(x, add(1,2)) with x=5, nested call as argument) returned=8 (expected 8)
+      case27_nested_call_as_argument_returns_8=PASS
+      real on-disk ELF written, real fork()+exec()+wait() -- child exited=true real exit code=75 (expected exited=true code=75)
+      case28_real_elf_exec_two_param_call_returns_75=PASS
+      case29 real codegen error -- undeclared function at byte offset=20
+      case29_undeclared_function_error_at_offset20=PASS
+      OVERALL_M72=PASS
+      ```
+      CASE 23 hand-verifies the real multi-function AST shape itself (a
+      2-function list in real source order: "combine" first, with 2
+      real declared parameters "a"/"b", linked via its own `next` to
+      "main", 0 parameters, `next == 0`). CASE 24 hand-verifies the
+      ordinary 2-parameter call path with a result that is ONLY correct
+      if BOTH arguments were passed and read in the right order
+      (`combine(a,b) = a*10+b`; a swapped-argument bug would print 57, not
+      75 -- a real, distinguishing check, not just "some number came
+      back"). CASE 25/26 generalize the same idea to 3 and 4 parameters,
+      genuinely exercising RDX and RCX (registers CASE 24 alone never
+      reaches) -- `mix(1,2,3)=123`, `mix4(1,2,3,4)=1234`, each digit
+      position tied to a specific argument, so misordering any one would
+      change a specific, predictable digit. CASE 27 hand-verifies a call
+      used as another call's own argument expression PLUS a local
+      variable as an argument in the same call (`add(x, add(1,2))` with
+      `x=5` -> `add(1,2)=3` -> `add(5,3)=8`), combining `gen_expr()`'s own
+      recursion, a variable read, and two independent real `call` sites in
+      one program. CASE 28 re-runs CASE 24's own exact source through the
+      real on-disk-ELF + kernel `exec()` + `wait()` path Milestone 69
+      established (reusing PATH8's `'ccout1'` the same real reason
+      CASE 10/17/18/22's own doc comments already give), the strongest
+      verification this tier has -- directly quoted from that same boot,
+      the real kernel-side `exec()` teardown and `wait()` reap backing
+      CASE 28's own PASS show the same real `milestone 45: syscall EXEC`
+      teardown-and-rebuild and `milestone 43: syscall WAIT ... real exit
+      code 75` pattern CASE 22's own entry already established, with the
+      hand-predicted exit code (75) matched by the kernel's own real
+      `wait()` syscall. CASE 29 hand-verifies the new
+      `CodeGenError::UndeclaredFunction` error path is real (not just an
+      unexercised variant) -- a call to `foo`, a name matching no declared
+      function, fails at byte offset 20, the exact hand-predicted position
+      of `foo` in `"int main() { return foo(1, 2); }"`, independently
+      confirmed against the source with a real, separate script before
+      writing the test. In the same boot: `OVERALL=` PASS x4 (Milestones
+      1-66's own aggregate checks), `OVERALL_M68=PASS`, `OVERALL_M69=PASS`,
+      `OVERALL_M70=PASS`, `OVERALL_M71=PASS`, `fs self-test: permissions
+      OVERALL=PASS`, `fs self-test: symlinks OVERALL=PASS`,
+      `fread_real_buffering=PASS` (real on a genuinely fresh disk), zero
+      `EXCEPTION: DOUBLE FAULT`/`EXCEPTION: TRIPLE FAULT` and zero
+      `panicked at`/`kernel panicked` anywhere in the log (checked
+      case-sensitively -- a case-INsensitive grep for "double fault"
+      alone would have false-matched this same boot's own pre-existing
+      `self_test_cc()`-style "ran to completion... (no panic, no double
+      fault)" status lines, a real, caught-and-corrected methodology trap
+      this milestone's own verification ran into and fixed before trusting
+      the count). Independently re-confirmed on the immediately-following
+      reused-disk boot (`m72_reused_boot.log`): identical `OVERALL_M72=
+      PASS` with all seven cases individually `PASS`, the same real CASE
+      28 `exec()`/`wait()` teardown-and-reap unchanged, zero panics/
+      unhandled exceptions -- the only failures in that second boot were
+      the SAME two pre-existing, already-disclosed reused-disk gaps
+      Milestone 70/71's own entries already named (`stdiotest.elf`'s
+      `fread_real_buffering=FAIL`/`eof_semantics=FAIL`, the Milestone 61
+      O_TRUNC gap; `fs self-test: permissions`/`symlinks` both
+      `OVERALL=FAIL`, the Milestone 62-era `permtestdir`/`symtestdir`
+      fixture-cleanup gap) -- neither touched or caused by this milestone,
+      both real and unfixed, exactly as before. `tasklist` confirmed zero
+      `qemu-system-x86_64.exe` processes after each boot in this session
+      (both instances stopped cleanly via their own real monitor-port
+      `quit`, independently re-checked with `tasklist` each time). No
+      evidence of concurrent editing found: `git status`/`git diff --stat`
+      checked before, during, and after this milestone's own work matched
+      the exact same pre-existing modified/untracked file set throughout
+      (identical per-file insertion/deletion counts every time), with only
+      this milestone's own edits (`tools/cc_src/main.rs`,
+      `tools/cc_src/README.md`, `kernel/assets/cc.elf`, this README.md
+      entry, and the new `m72_*.log`/`m72_*_condensed.log` verification
+      logs) layered on top -- zero kernel-side (`kernel/src/*.rs`) changes
+      were needed for this milestone, confirmed both by design (function
+      calls are pure userspace codegen, executed directly by the CPU with
+      no new syscall or kernel-loader behavior) and by the unchanged
+      kernel/src diffstat throughout.
+
+      **Still genuinely open**: no forward calls and no mutual recursion
+      (a real, disclosed dependency-order scope cut -- see the codegen
+      section above); direct self-recursion is mechanically reachable by
+      this codegen but NOT tested or verified; up to 4 functions and up to
+      4 parameters/arguments (`MAX_FUNCS`/`MAX_PARAMS`), both real,
+      deliberately small, unraised caps -- `ParseError::TooManyParams`/
+      `TooManyArgs`/`TooManyFunctions` and
+      `CodeGenError::ArgCountMismatch` are real Err paths but genuinely
+      UNEXERCISED by this milestone's own self-test cases, honestly
+      disclosed rather than silently left untested; no 5th-or-later
+      argument (real SysV x86_64 would pass those on the stack -- not
+      attempted here); no standalone call-as-statement (a call may only
+      appear inside an assign/return/another call's own argument -- this
+      subset still has no "expression statement" production at all, an
+      existing gap since Milestone 67, unwidened here); no `break`/
+      `continue` (Milestone 71's own disclosed scope cut, unchanged); no
+      unary minus, no additional C types, no arrays/pointers, no
+      preprocessor (all unchanged from Milestone 67's own grammar); no
+      comparison chaining and no bare `else if` (Milestone 70's own
+      disclosed scope cuts, unchanged); the `fs.rs` 8-entry directory cap
+      is real and unraised (CASE 28 reuses CASE 8/10/17/18/22's own
+      `ccout1` path, same real reason CASE 10's own doc comment already
+      gives); the trailing `leave; ret`/`sys_exit` safety backstop for a
+      missing `return` is unchanged from Milestone 68's own disclosed gap;
+      the `fs.rs` self-test reused-disk directory-already-exists gap
+      (permissions/symlinks) and the `stdiotest.elf` O_TRUNC gap Milestone
+      70/61 respectively already disclosed are both still real and
+      unfixed, untouched by this milestone. The natural next Tier 3
+      milestone: forward calls and mutual recursion (real forward-patch
+      call-site machinery, generalizing `if`/`else`'s own `jz`/`jmp`
+      forward-patch technique to `call` sites), or growing the grammar
+      itself (arrays/pointers, more C types) -- either a legitimate next
+      dependency-ordered step, not attempted here.
+
 ## Building and running
 
 Requires:

@@ -3835,6 +3835,250 @@ self-test suite, genuinely open for a future pass.
       in-process function-pointer shortcut -- a future milestone's own
       honest scoping judgment should decide which, after checking the
       actual tractability of each against the code that exists by then.
+- [x] **Milestone 69**: Tier 3's third slice -- a real, from-scratch ELF64
+      *writer*, closing the gap Milestone 68's own closing disclosure named:
+      compiled subset-C output now becomes a genuine, standalone, on-disk
+      executable, run through the kernel's own real, pre-existing `exec()`
+      syscall (Milestone 36/45) rather than only via Milestone 68's
+      in-process function-pointer shortcut.
+
+      **The real decision this milestone had to make: write a minimal ELF64
+      LINKER-shaped step, not an assembler.** Checked directly against this
+      repo's actual state before deciding, not just Milestone 68's own two
+      named options: no x86_64 assembler exists anywhere in this codebase
+      (Milestone 67/68 both independently deferred it as premature), and
+      Milestone 68's own codegen already emits real machine-code BYTES
+      directly, not textual assembly -- so there is nothing for an
+      assembler to assemble. What's genuinely missing is a real container
+      format the kernel's own real ELF64 parser (`kernel/src/elf.rs`,
+      Milestone 36) and loader (`process::create_process_from_elf()`) can
+      load -- and that parser already documents the exact ELF64 field
+      layout (e_type@16, e_machine@18, e_entry@24, e_phoff@32, ... for a
+      64-byte Ehdr; p_type@0, p_flags@4, p_offset@8, p_vaddr@16, ... for
+      each 56-byte Phdr) byte-for-byte, real, pre-existing, directly
+      reusable knowledge for writing the inverse operation. No relocations
+      are needed either -- this subset's codegen never emits a reference to
+      an external symbol or a linker-resolved address -- so a real linker's
+      usual relocation-processing job is genuinely absent here, not
+      skipped. `build_elf64_standalone()` in `tools/cc_src/main.rs` is that
+      writer: a single real `PT_LOAD` segment (header+Phdr+code all one
+      file, matching how real linker output already looks), `p_vaddr`
+      hardcoded to the same `0x0000555550000000` this project's own
+      `usertest::USER_CODE_ADDR` and every `tools/*_src/linker.ld` already
+      use, `e_entry` computed as the real first byte of code right after
+      the header+Phdr. A NEW codegen mode, `CodegenMode::Standalone`
+      (`gen_function()`/`emit_epilogue()` in `main.rs`, `CodegenMode::
+      Callable` -- Milestone 68's own original shape, completely UNCHANGED
+      -- still used by CASE 4/5/6/7's in-process calls), ends a compiled
+      function in a real `sys_exit(result)` sequence instead of `leave;
+      ret`, since the compiled bytes now ARE a whole process's own entry
+      point, not a callee returning to existing Rust code.
+
+      **Real mechanism, real verification loop**: `write_exec_and_check!`
+      (a `macro_rules!` in `main.rs`, not a plain function -- see the real,
+      hard-won reason below) writes a `Standalone`-mode-compiled program's
+      real ELF64 bytes to a real path on the on-disk filesystem via
+      ordinary `open()`/`fdwrite()`/`close()` syscalls, then `fork()`s: the
+      CHILD calls the kernel's own real, completely UNCHANGED `exec()`
+      syscall against that exact file -- on success this never returns (the
+      child's whole process image is replaced, jumping into the real,
+      freshly-compiled entry), so `sys_exit(250)` is reached only on a real
+      exec() FAILURE, a marker value none of this subset's own arithmetic
+      could produce. The PARENT (still the original cc.elf process) real
+      `sys_wait()`s for the child and decodes the real WAIT encoding
+      usertest.rs's own syscall-8 doc comment establishes (bits 8-15 = the
+      real exit code, bit 16 = 1 iff the child genuinely reached its own
+      `exit()`), checking the exit code against the exact hand-computed
+      expected value. Three cases: (8) reuses CASE 1's already-verified
+      `func1` AST, recompiled in `Standalone` mode, expected exit code 42;
+      (9) a fresh source (`int p; int q; p = 9; q = p * 3; return q - 2;`),
+      expected 25, proving the real on-disk/exec/wait path is general, not
+      hard-coded to CASE 8's own shape; (10) a fresh source exercising `/`
+      (`int x; x = 100; return x / 4 + 3;`), expected 28, reusing CASE 8's
+      own on-disk path (see the real, disclosed reason below) rather than a
+      third fresh one.
+
+      **Three real, pre-existing kernel bugs this milestone found and
+      fixed, each confirmed the hard way via an actual QEMU boot, not
+      guessed at** -- the genuinely deepest verification work in this
+      project's history, because "a forked child calls `exec()`" was never
+      exercised by any earlier milestone's own self-test in this exact
+      combination:
+
+      1. **fork() silently dropped a multi-page process's code beyond page
+         0.** `Process::extra_frames` (Milestone 36, tracking a multi-page
+         ELF-loaded process's PT_LOAD pages beyond `code_frame`) was real,
+         live state that NOTHING ever read back out except reclaim-on-exit
+         -- `fork()`'s own snapshot only ever copied `code_frame` and
+         `stack_frame`, so a forked child of a multi-page process (cc.elf
+         itself, now 3 real code pages) got NO mapping at all for pages 1/2.
+         Invisible before this milestone because every process that ever
+         called `fork()` fit in one page. Confirmed via a real, hardware-
+         recorded `SIGSEGV`/`INSTRUCTION_FETCH` fault the moment the
+         child's own fork()-time `rip` happened to land past page 0. Fixed
+         by making `extra_frames` carry each page's real `VirtAddr`
+         alongside its frame (`Vec<(VirtAddr, PhysFrame<Size4KiB>)>`, was
+         `Vec<PhysFrame<Size4KiB>>`), and giving `fork_build_child()` a new
+         loop -- the same "map a fresh child frame at a known vaddr, copy
+         the parent's bytes" shape its own pre-existing heap-frame loop
+         already used -- to remap+copy every extra page into the child.
+      2. **The forked-child ring-0 syscall stack was undersized for
+         exec()'s own real call depth.** `gdt::CHILD_EXCURSION_STACK_SIZE`
+         (Milestone 37, a dedicated ring-0 stack used only while a forked
+         child is making its OWN syscalls) was still `4096 * 5` (20 KiB) --
+         the EXACT SAME real bug already found and fixed ONCE for the
+         kernel's MAIN syscall stack (`privilege_stack_table[0]`, see that
+         stack's own "POST-MILESTONE-65 FIX" comment: bumped 20 KiB -> 64
+         KiB because "`exec()`... is structurally deeper than any other
+         syscall this kernel has, and 20 KiB was not enough real room for
+         it in this unoptimized debug build") -- never propagated to this
+         SECOND stack, because no forked child had ever called `exec()`
+         through it before. Confirmed via a genuinely corrupted LOCAL
+         variable (`phys_mem_offset`, read fresh from an unchanging global
+         atomic moments earlier, observed as a bogus `0x100001992b0`
+         instead of the real `0x28000000000` every other call site on the
+         same boot printed) inside `create_process_from_elf()`, followed by
+         a real `misaligned pointer dereference` panic building the new
+         process's PML4 -- the identical "stack-frame corruption, not a
+         page-fault-handling logic bug" signature the Post-Milestone-65 fix
+         already diagnosed once. Fixed by bumping it to the SAME `4096 *
+         16` (64 KiB) value that fix independently re-verified sufficient,
+         rather than re-deriving a new number from scratch.
+      3. **A forked child's OWN registers beyond `rip`/`rsp` are never
+         restored -- `Process::pending_resume` only ever captures those
+         two.** A real, disclosed dead end came first: an early version
+         passed the on-disk path through an ordinary `path: &[u8]`
+         function parameter, trusting the normal Rust/SysV assumption that
+         a value read before a call survives after it -- true for the
+         PARENT (a real `int 0x80` return genuinely restores every
+         register), false for the CHILD (whose "return" from `fork()` is a
+         kernel-synthesized resume with only rip/rsp real). This produced a
+         real, hardware-recorded page fault (`Accessed Address: 0x13`, a
+         small leftover register value, not a real pointer) the instant the
+         child read a register-cached copy of the path pointer that never
+         survived. A SECOND real attempt -- round-tripping the pointer
+         through a dedicated `static mut` via `write_volatile`/
+         `read_volatile` (a link-time-constant ADDRESS, immune to the
+         register problem in theory) -- fixed the ORIGINAL symptom but kept
+         reproducing the exact same fault intermittently on independent
+         re-testing, never fully root-caused, and is disclosed here rather
+         than erased from the milestone's own history. **The real, robust
+         fix actually shipped**: never pass the path bytes through ANY
+         value that has to cross the `sys_fork()` boundary at all -- not a
+         register, not a static's content. `write_exec_and_check!` is a
+         `macro_rules!`, not a function, specifically so each of CASE
+         8/9/10's own call sites splices its OWN path literal directly into
+         the CHILD branch's own source text -- since each is always a
+         `const PATHn: &[u8] = b"..."` reference, the compiler materializes
+         its address as a fresh immediate at that exact point in the
+         child's own compiled code, exactly like the plain diagnostic
+         `w(b"...")` messages elsewhere in this file already do successfully
+         in the child on every run -- zero dependence on any register or
+         memory content surviving `fork()`, only on the CODE ITSELF being
+         present, which real fix #1 above already independently guarantees.
+
+      **A real, disclosed, non-kernel scope wrinkle found and worked
+      around**: `fs.rs`'s real on-disk directory has a fixed `MAX_ENTRIES`
+      cap (8) -- confirmed the hard way via a real `fs::write_file
+      ('ccout3') FAILED: directory full (max 8 entries)` on an actual boot,
+      once every OTHER milestone's own seeded test file plus CASE 8/9's own
+      `ccout1`/`ccout2` filled it. CASE 10 reuses CASE 8's own `ccout1` path
+      rather than a third fresh one -- by the time CASE 10 runs, CASE 8's
+      own child has already exec()'d and exited, so `ccout1` is an
+      ordinary, unopened file; `open()`/`fdwrite()`/`close()` overwrite its
+      content in place, no new directory entry needed, and CASE 10 still
+      exercises the exact same real on-disk-ELF + real kernel exec() path
+      CASE 8/9 already proved.
+
+      **A real, pre-existing self-test this milestone's own testing
+      genuinely broke, found, and fixed -- not silently left failing**:
+      `process::self_test_frame_reclaim()` (Milestone 54)'s second check
+      hardcoded a literal `expected 0` for the free list's size after its
+      own second fork()+kill() cycle -- correct only because, until this
+      milestone, nothing running earlier in the SAME boot (per
+      `main.rs`'s own existing, UNCHANGED call order, `self_test_cc()`
+      always ran before `self_test_frame_reclaim()`) had ever reclaimed any
+      frames onto the shared global free list first. Milestone 69's own
+      cc.elf self-test is the first in this codebase to fork()+exec()+
+      wait() a multi-page process three full times, genuinely and
+      correctly reclaiming real physical frames -- leaving a nonzero
+      residual on the free list by the time Milestone 54's self-test reads
+      it, and turning its hardcoded `expected 0` into a real, reproducible
+      `OVERALL: FAIL`. Fixed by making that check compare against `before`
+      (the SAME self-test's own real free-list size measured immediately
+      before its own first fork(), already computed and already correctly
+      used by its FIRST check) instead of a hardcoded 0 -- the same real
+      intent the test's own comments already articulated ("the free list
+      holds EXACTLY `cost` frames... free list drains to exactly zero"),
+      now correctly self-relative rather than assuming an absolute boot-wide
+      baseline no earlier milestone was ever actually entitled to assume.
+
+      Verified with a real, new self-test extension inside the SAME cc.elf
+      ring-3 process (CASE 8/9/10, immediately after Milestone 68's own
+      OVERALL_M68). Quoted from the actual serial log (fresh-disk boot):
+      ```
+      milestone 69: cc ELF64 writer + real exec() (real on-disk executable, real kernel exec()) starting
+      case8_real_elf_exec_returns_42=PASS
+      case9_fresh_source_real_elf_exec_returns_25=PASS
+      case10_division_real_elf_exec_returns_28=PASS
+      OVERALL_M69=PASS
+      ```
+      with real, hardware-confirmed evidence behind each PASS -- e.g. CASE
+      9's own real log line: `milestone 45: syscall EXEC (process 14) --
+      REAL teardown-and-rebuild complete... jumping directly into the real
+      parsed entry 0x555550000078` immediately followed by `milestone 43:
+      syscall WAIT (process 3) -- reaped child pid 14, exited normally with
+      code 25` -- the real kernel exec() path and the real wait() syscall,
+      not a simulation of either. In the SAME boot, Milestone 67's own
+      `OVERALL=PASS` (all ten checks) and Milestone 68's own
+      `OVERALL_M68=PASS` (all four checks) printed immediately before this,
+      completely unmodified; zero `kernel panicked`/`panicked at`, zero
+      unhandled `EXCEPTION: PAGE FAULT`/`DOUBLE FAULT`/`TRIPLE FAULT`
+      anywhere in the log (the real, expected `milestone 41: SIGSEGV`
+      recoverable-fault lines from Milestones 41/57/65's own deliberate
+      self-tests still appear, unrelated to this milestone, exactly as
+      those milestones' own write-ups describe -- CASE 8/9/10 themselves
+      produce zero fault lines of any kind in the final, fixed state);
+      every prior
+      milestone's own self-test still independently confirmed `OVERALL:
+      PASS`/`OVERALL=PASS` with zero regressions: `fs self-test:
+      permissions`, `fs self-test: symlinks`, milestones 42, 43, 44, 45, 51
+      (malloctest.elf), 53, 54 (real fix #4 above, independently
+      re-confirmed `OVERALL: PASS`), 57, 59, 60, 64, 65, 66, and 5c's real
+      preemptive-multitasking demo. Independently re-verified on a SECOND,
+      immediately-following boot reusing both disks: identical
+      `case8_real_elf_exec_returns_42=PASS` /
+      `case9_fresh_source_real_elf_exec_returns_25=PASS` /
+      `case10_division_real_elf_exec_returns_28=PASS` / `OVERALL_M69=PASS`,
+      `milestone 54: self-test -- OVERALL: PASS`, zero panics/unhandled
+      exceptions; the one and only `FAIL` observed in that second boot was
+      `stdiotest.elf`'s own `fread_real_buffering=FAIL` -- exactly the
+      pre-existing, already-disclosed Milestone 61 O_TRUNC gap named in
+      this milestone's own process rules, independently re-confirmed here
+      and NOT touched by this milestone. `tasklist` confirmed zero orphaned
+      `qemu-system-x86_64.exe`/`spikeling-os.exe` processes after both
+      verification boots.
+
+      **Still genuinely open**: no unary minus, no additional C types, no
+      control flow, no function parameters/calls/multiple functions, no
+      arrays/pointers, no preprocessor (all unchanged from Milestone 67's
+      own grammar -- this milestone adds a real linking/exec target for the
+      EXISTING grammar, not new frontend surface); no real x86_64 assembler
+      exists yet (genuinely not needed by anything built so far -- codegen
+      emits machine code directly -- but would become real work the moment
+      a future milestone needs textual assembly as an intermediate
+      representation, e.g. for hand-written or externally-sourced asm); the
+      `fs.rs` 8-entry directory cap is real and unraised (CASE 10's path
+      reuse works around it for this milestone, not a general fix); the
+      trailing `leave; ret`/`sys_exit` safety backstop for a missing
+      `return` is unchanged from Milestone 68's own disclosed gap. The
+      natural next Tier 3 milestone: grow the subset-C grammar itself
+      (control flow, function calls) now that a real compile-to-disk-to-
+      exec() loop exists to point it at, or work toward the actual Tier 3
+      capstone (self-hosting) by teaching this toolchain to read its OWN
+      source -- a future milestone's own honest scoping judgment should
+      decide which, after checking the actual tractability of each against
+      the code that exists by then.
 ## Building and running
 
 Requires:

@@ -5476,6 +5476,120 @@ self-test suite, genuinely open for a future pass.
       milestone -- a pure userspace toolchain change, unlike Milestone
       75's own kernel-side diagnostic.
 
+- [x] **Milestone 77**: a real heterogeneous neuron-type ensemble
+      (`kernel/src/hetero_ensemble.rs`, new, self-contained) applied to
+      this kernel's own ATA disk I/O -- a direct kernel-side application
+      of a research finding from the SAME real project this kernel's
+      LIF/STDP engine (`neurons.rs`/`network.rs`, Milestones 9-56) was
+      always ported from: `Spikeling/compute_ontology/
+      heterogeneous_ontology_test.py` (2026-08-29), a pre-registered
+      test of the architectural claim that resources differing in KIND
+      need handling designed for their differences, rather than being
+      forced through one homogenized abstraction. That Python study
+      found a HETEROGENEOUS typed ensemble (four independently-verified
+      Spikeling neuron models -- LIF/Izhikevich/AdEx/Resonator, each
+      specialized per `Spikeling/tribe/NEURON_TYPES.md` on magnitude/
+      burst/repetition/frequency respectively) detected 100% of a
+      combined 4-anomaly-type synthetic test set, vs 50% for a
+      homogeneous all-LIF ensemble of the same neuron count. This
+      milestone re-tests that SAME hypothesis against a genuinely
+      different real system: this kernel's own ATA PIO driver, not a
+      synthetic Python signal -- and deliberately does NOT touch
+      `network.rs`'s GenericNetwork (the heavily-verified engine
+      Milestones 9-56 depend on); it is a new, independent module.
+
+      **Real mechanism**: all four neuron dynamics are faithfully ported
+      from `Spikeling/pyspike_neuron_models.py` (Izhikevich/AdEx/
+      LIFReference, unchanged equations) and the Python study's own
+      `ResonatorNeuron` (itself a port of `core/runtime/runtime.py`'s
+      real `ResonatorState.step()` -- symplectic Euler, `energy_ema`
+      RMS-threshold edge trigger). Four workload functions
+      (`magnitude_raw`/`burst_raw`/`repetition_raw`/`frequency_raw`)
+      each issue REAL `ata::read_sector()` PIO reads against a dedicated
+      scratch LBA range (600..604 -- clear of `fs.rs`'s LBA 1..66 and
+      `ata.rs`'s own Milestone 66 self-test at LBA 500; read-only, so
+      this self-test cannot corrupt anything else's on-disk state), timed
+      via real RDTSC cycle counts. The anomaly SHAPES are produced by
+      controlling WHEN those real disk operations are issued (one
+      sustained run / four short bursts / ten rapid repeats / a fixed
+      periodic cadence), not by inventing the resulting numbers -- the
+      drive value fed to every neuron each step is the REAL measured
+      RDTSC cost of that step's disk activity (0 if none), rescaled
+      per-type same as the Python file's own `SCALE` table. Thresholds
+      are calibrated the same way the Python study did it: real
+      quiet-baseline windows, mean + 3*sigma, floored at 1.0.
+
+      **Disclosed adaptations** (see the module's own doc comment for
+      the full reasoning): (1) no fine-grained wall clock exists in this
+      freestanding kernel (only the ~18.2Hz PIT), so "time" here is
+      STEPS, not seconds, and "frequency" is steps-per-cycle, not Hz --
+      the neuron equations are unchanged, only what one simulated time
+      unit means changes, the same kind of substitution the Python
+      file's own per-kind `DT_FOR_KIND` table already made. (2) N_PER_
+      TYPE=3/N_TRIALS=4/N_CALIB_WINDOWS=4 here, vs. 8/15/10 in the
+      Python study, which spent real minutes per condition off-kernel --
+      this self-test runs during one bounded QEMU boot, where every
+      sample costs a real PIO round trip, not a float multiply; real,
+      independently-seeded trials either way, just fewer of them, so
+      this milestone's own confidence interval is genuinely wider than
+      the Python study's. (3) RDTSC gives real elapsed CPU cycles, used
+      strictly as a relative magnitude (elevated vs. baseline), never
+      converted to a calibrated time unit.
+
+      **Real, measured result** (two fresh QEMU boots, `bios`,
+      byte-identical `milestone 77:` output both times): heterogeneous
+      typed ensemble (3 neurons/type x 4 types = 12 total) detected
+      16/16 (100.0%) across all four anomaly types on this kernel's own
+      real disk signal; homogeneous ensemble (12x LIF, same total
+      neuron count) detected 12/16 (75.0%) -- specifically missing the
+      frequency anomaly entirely (0/4; the LIF-only ensemble has nothing
+      tuned to periodic structure, so it never distinguishes the target
+      cadence from the baseline's own distractor cadence), while every
+      other anomaly type was detected 4/4 by both ensembles. `OVERALL_
+      M77=PASS` per the module's own honest verdict rule (heterogeneous
+      strictly beat homogeneous on the combined total; the module logs
+      `OVERALL_M77=FAIL` and reports it just as plainly if it ever
+      doesn't -- see `self_test_hetero_ensemble()`'s own doc comment
+      quoting the Python study's DISCONFIRM clause). Smaller than the
+      Python study's 100%-vs-50% split, and on a smaller trial count, but
+      the same qualitative finding: the heterogeneous ensemble beat
+      homogeneous, and did so specifically on the anomaly type
+      (frequency) that requires a neuron type genuinely different in
+      kind from LIF -- not a coincidence this milestone forced.
+
+      **Verified**: `cargo build --target x86_64-unknown-none` clean, no
+      warnings. Two full QEMU boots (`cargo run bios`), serial output
+      diffed -- every `milestone 77:` line byte-identical between them
+      (this self-test reads a fixed scratch LBA range and never writes
+      it, so a fresh vs. reused disk makes no difference here, unlike
+      several earlier milestones' own disclosed reused-disk gaps).
+      `grep`-checked both full boot logs for `FAIL`/`PANIC`: the only
+      matches are the same pre-existing, already-disclosed cases every
+      milestone since 70 has named (the two `permissions`/`symlinks`
+      reused-disk `OVERALL=FAIL` entries, `stdiotest.elf`'s own O_TRUNC
+      gap, and the deliberately-negative-tested syscalls that are
+      SUPPOSED to fail) plus `milestone 6: FAILED -- no keystrokes
+      received` (expected -- no interactive typing was sent in this
+      automated run, same as any other non-interactive boot). No new
+      regressions; every other milestone's `OVERALL`/`OVERALL_M*`
+      marker present and PASSing exactly as before.
+
+      **Still genuinely open**: this is a NEW subsystem, not a
+      generalization of `network.rs`'s existing GenericNetwork -- a
+      future milestone could unify them (a real `Kind`-typed neuron
+      enum inside `GenericNetwork` itself, so `addneuron` could build a
+      genuinely mixed network at the shell), but that would touch the
+      Milestone 9-56 engine directly and wasn't attempted here on
+      purpose. The 4x4 cross-tabulation the Python study also ran (does
+      each type specifically win on its OWN named anomaly column, not
+      just the combined total) was not reproduced here -- only the
+      combined heterogeneous-vs-homogeneous total this milestone's own
+      verdict rule checks. RDTSC cycle counts are QEMU-TCG-emulated, not
+      real silicon timing -- the qualitative shape (some workloads
+      produce more real PIO cycles than others) is genuine, but the
+      exact cycle numbers themselves are a property of this emulation,
+      not a physical disk.
+
 ## Building and running
 
 Requires:

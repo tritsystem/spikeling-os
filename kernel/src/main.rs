@@ -19,6 +19,7 @@ mod console;
 mod elf;
 mod errno;
 mod gdt;
+mod hetero_ensemble;
 mod interrupts;
 mod keyboard;
 mod loader;
@@ -1056,6 +1057,15 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // touched), but placed right after self_test_fault_status() since it
     // reuses the exact same FAULT_TEST_PROCESS_ID fork source.
     process::self_test_frame_reclaim();
+
+    // MILESTONE 77: real heterogeneous neuron-type ensemble applied to
+    // this kernel's own ATA disk I/O -- no ring-3/RFLAGS.IF ordering
+    // constraint (pure kernel-space computation plus real
+    // ata::read_sector() PIO calls, no ELF process involved), so no
+    // placement dependency on the enable() call above. Placed here,
+    // after ata.rs has been exercised many times already by every
+    // earlier fs/persistence self-test, so the disk is definitely live.
+    hetero_ensemble::self_test_hetero_ensemble();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

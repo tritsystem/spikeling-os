@@ -2082,6 +2082,152 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       granularity exists where the underlying `process.rs` functions
       don't yet return it.
 
+- [x] **Milestone 60**: real signal delivery -- the last remaining Tier 1
+      gap, exactly as Milestone 59's own closing disclosure named it
+      ("SIGKILL is still the only signal, still an immediate-terminate
+      special case"), verified directly against the actual code (not
+      doc comments) before starting: `process.rs`/`interrupts.rs` had no
+      `sigaction`-equivalent, no handler table, no `sigreturn` -- SIGKILL
+      (unconditional `kill()`) and hardware-fault termination (SIGSEGV/
+      #GP, Milestone 41) were the only two "signal" mechanisms that
+      existed, both pre-existing and unchanged here. A real libc (the
+      OTHER unclaimed Tier 1 item) was also checked directly, not
+      assumed: `tools/libc_test_src/libc.rs` (Milestone 39/51) already
+      has real syscall wrappers and a real `malloc`/`free`, but no
+      `string.h` (`memcpy`/`strlen`/...) and no buffered `stdio` --
+      genuinely still open, but a strictly smaller, lower-risk gap than
+      a brand-new control-transfer mechanism, so signal delivery is the
+      real Tier 1 completion this milestone targets.
+
+      **Real, working, complete slice** (not scoped down further): a
+      genuine trampoline into a user-registered handler, real per-process
+      handler-table bookkeeping, and a real `sigreturn`-equivalent that
+      unwinds back out to the EXACT interrupted instruction with the
+      FULL register file intact -- proven end to end, not just "the
+      syscalls exist". Two new syscalls plus a real dispatch-time
+      mechanism:
+      - **18 (SIGACTION)**: `process::sigaction(id, signum, handler)` --
+        registers (or, `handler=0`, clears) a real user-space handler
+        address in a new `Process::signal_handlers[32]` table. Real
+        POSIX rule actually enforced: `signal::SIGKILL` (9) is refused
+        outright, not just documented as uncatchable.
+      - **19 (SIGSEND)**: `process::raise_signal(caller, target, signum)`
+        -- real `kill(2)`-shaped signal raising. `SIGKILL` routes to the
+        PRE-EXISTING Milestone 41 `kill()` path unchanged (not
+        reimplemented); every other signal sets `Process::pending_signal`
+        if (and only if) the target already has a handler registered.
+        Authorization mirrors `setpgid()`'s own already-established real
+        rule (self, or a live child of the caller) -- reused by shape,
+        not refactored into a shared helper, to avoid touching a
+        previously-verified function for this milestone's sake.
+      - **20 (SIGRETURN)**: `process::take_saved_signal_context()` --
+        restores the complete stashed register/PC/flags/stack-pointer
+        snapshot, resuming exactly where the signal preempted execution.
+      - **Real delivery mechanism** (`usertest.rs`'s `syscall_dispatch`,
+        checked once at the tail of EVERY syscall's return-to-userspace
+        -- the one real kernel/user boundary this synchronous, one-
+        ring-3-excursion-at-a-time kernel actually has, since there is
+        no preemptive mid-instruction redelivery here): when a process
+        has a real pending signal AND a registered handler AND is not
+        already inside one (this milestone's own disclosed simplification
+        of POSIX's per-signal `sa_mask` -- ALL further delivery is
+        blocked while one handler is in flight, not just the same
+        signal), the live, hardware-produced `SyscallRegs` (already
+        holding the complete interrupted GPR/rip/rflags/rsp state) is
+        first copied into a new kernel-side `Process::in_signal_handler:
+        Option<SavedSignalContext>` stash, then genuinely overwritten
+        in place: `rip` -> the handler, `rdi` -> the real signal number
+        (the SysV first-argument convention a C `void handler(int)`
+        expects), `rsp` -> a real, freshly-built fake-call-frame written
+        directly onto the SAME process's own already-mapped user stack
+        (the identical direct-user-pointer-write technique the
+        `read`/`fdwrite` syscalls already use, since no CR3 switch
+        happens for an ordinary syscall return -- the kernel is already
+        running under the interrupted process's own page tables at this
+        exact point) containing a genuine 7-byte `mov eax,20 ; int 0x80`
+        trampoline plus a correctly-16-aligned fake return address
+        pointing at it, so the handler's own ordinary `ret` lands on a
+        real `SIGRETURN` call, not a hand-waved "and then it returns"
+        gap.
+
+      **Real, disclosed scope cuts for this first slice** (not silently
+      done and not silently skipped): (1) `SavedSignalContext` is a
+      KERNEL-side stash (one slot per process), not a real POSIX
+      `ucontext_t` written onto the process's own user stack -- that
+      would need a safe copy-to/from-user path with fault recovery this
+      kernel has never had (the same gap `MAX_WRITE_LEN`'s own doc
+      comment already discloses for ordinary syscall pointers); (2) no
+      default-disposition table -- a signal sent to a process with no
+      handler registered is a real, documented no-op (`Err`, checked by
+      `raise_signal()` before ever setting `pending_signal`), not a
+      silently-pretended delivery, real POSIX default-terminate/ignore
+      semantics remain future work; (3) blocks ALL signals (not just the
+      one in flight) while inside a handler, real per-signal `sa_mask`
+      semantics remain future work; (4) a forked child does NOT inherit
+      its parent's registered handlers (`fork_build_child()` goes
+      through the same fresh-process constructor as every other new
+      process, which zeroes `signal_handlers` uniformly) -- real POSIX
+      `fork()` does inherit signal disposition; disclosed on the new
+      field's own doc comment, not fixed here.
+
+      Verified with a genuinely new hand-assembled test payload,
+      `process::SIGNAL_TEST_PROGRAM` (a fourteenth hardcoded process
+      slot, pid 18) -- and, since this program's control flow (a handler
+      whose own `ret` must land on a kernel-injected on-stack trampoline
+      at exactly the right runtime address) has real, genuine
+      off-by-one risk no earlier straight-line hand-assembled test
+      program in this codebase had, **every byte was produced by a real
+      assembler, not hand-encoded by counting opcode lengths by eye**:
+      assembled via `as --64` (Intel syntax, GNU binutils, already
+      present via this machine's mingw64 toolchain) from real x86_64
+      assembly source, symbol offsets read back from the object file's
+      own symbol table (`nm`), the `HANDLER_ADDR` immediate patched in
+      from the REAL relocation record `as` emitted for it (not guessed),
+      then independently re-disassembled with `objdump -D -b binary -m
+      i386:x86-64` against the FINAL patched bytes to confirm every
+      instruction -- including the patched absolute address -- decodes
+      back to exactly what was intended, before a single byte went into
+      `process.rs`. The program: registers a real `SIGUSR1` handler,
+      self-signals (real POSIX `raise()`), gets genuinely redirected
+      mid-execution, and unwinds back out via a real `SIGRETURN` --
+      proven via FOUR independent, kernel-side-checked physical-heap
+      markers (read directly through `phys_mem_offset`, not trusted from
+      the process's own say-so, the same real technique
+      `self_test_demand_paging_heap()` already established): a
+      before-signal marker, a handler-genuinely-ran marker, a
+      resumed-after-`SIGRETURN` marker, AND a canary register (`r12`)
+      the handler deliberately clobbers with a different value, proving
+      the FULL register file -- not just the instruction pointer --
+      round-trips correctly.
+
+      Real, fresh build (from repo root) + fresh QEMU boot (persist disk
+      attached), quoted from the actual serial log:
+      ```
+      milestone 60: syscall SIGACTION (process 18) -- hardware-recorded CS=0x1b (CPL=3) -- signum 10 (SIGUSR1), handler=0x555550000064
+      milestone 60: syscall SIGSEND (process 18) -- hardware-recorded CS=0x1b (CPL=3) -- target pid 18, signum 10 (SIGUSR1) raised
+      milestone 60: real signal delivery -- process 18 redirected into handler 0x555550000064 for signum 10 (SIGUSR1), interrupted rip=0x555550000046 saved, trampoline frame at 0x555560000f00
+      milestone 60: syscall SIGRETURN (process 18) -- real context restored, resuming at rip=0x555550000046 rsp=0x555560001000
+      milestone 60: self-test -- SIGNAL_TEST_PROCESS ran to completion (its own exit() syscall returned normally)
+      milestone 60: self-test -- HEAP_START markers: main-before-signal ran=true (expect true), handler genuinely ran=true (expect true), canary register (0x1234ABCD, clobbered by the handler to 0xDEADBEEF in between) survived SIGRETURN intact=true (expect true), resumed-after-handler code ran=true (expect true), handler received the real signum (10, SIGUSR1) as its SysV first argument=true (expect true)
+      milestone 60: self-test -- OVERALL: PASS
+      ```
+      No regressions: milestones 42/43/44/45/53/54/57/59 all still
+      self-report `OVERALL: PASS` in the same boot, the Milestone 51
+      malloc test and Milestone 58 argv/envp test both still print their
+      own real `OVERALL=PASS`, zero panics anywhere in the log, zero
+      `MISMATCH`, zero unexpected `FAIL` (the only `FAIL` line is the
+      pre-existing, disclosed-unrelated "milestone 6: no keystrokes
+      received" interactive-only check), zero compiler warnings on a
+      full build, boot reaches the interactive shell and background task
+      scheduling normally afterward. `tasklist` confirmed zero orphaned
+      `qemu-system-x86_64.exe` processes after verification.
+
+      **Still genuinely open** (disclosed, not silently dropped): the
+      three scope cuts named above (no user-stack `ucontext_t`, no
+      default-disposition table, coarse all-signals-blocked masking, no
+      fork() handler inheritance), and the real libc gap named at the
+      top of this entry (`string.h`, buffered `stdio`) -- Tier 1's own
+      remaining, smaller items.
 ## Building and running
 
 Requires:

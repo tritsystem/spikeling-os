@@ -76,10 +76,10 @@ use core::fmt::Write;
 // reproducibility property the Python study's `random.Random(seed)`
 // calls relied on.
 // ---------------------------------------------------------------------
-struct Xorshift64(u64);
+pub(crate) struct Xorshift64(u64);
 
 impl Xorshift64 {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Xorshift64(if seed == 0 { 0xdead_beef_cafe_babe } else { seed })
     }
     fn next_u64(&mut self) -> u64 {
@@ -110,7 +110,7 @@ impl Xorshift64 {
 // adaptation #1 above).
 // ---------------------------------------------------------------------
 
-struct LifRef {
+pub(crate) struct LifRef {
     v: f32,
     threshold: f32,
     leak: f32,
@@ -128,7 +128,7 @@ impl LifRef {
     }
 }
 
-struct Izhikevich {
+pub(crate) struct Izhikevich {
     a: f32,
     b: f32,
     c: f32,
@@ -167,7 +167,7 @@ impl Izhikevich {
     }
 }
 
-struct AdEx {
+pub(crate) struct AdEx {
     tau_w: f32,
     a: f32,
     b: f32,
@@ -207,7 +207,7 @@ impl AdEx {
     }
 }
 
-struct Resonator {
+pub(crate) struct Resonator {
     period_steps: f32, // steps-per-cycle, this kernel's stand-in for freq_hz (see adaptation #1)
     damping: f32,
     coupling: f32,
@@ -239,7 +239,14 @@ impl Resonator {
     }
 }
 
-enum Neuron {
+/// MILESTONE 78 reuses this enum (and everything below it up to
+/// `make_neuron`) from `kernel/src/hetero_stdp.rs` rather than copying
+/// the four neuron dynamics a second time -- the exact discipline
+/// `network.rs`'s own module doc names as a hard-won lesson (Milestone
+/// 21's history: two independently-implemented copies of the same LIF
+/// dynamics silently drifted out of sync for several milestones before
+/// being unified into one engine).
+pub(crate) enum Neuron {
     Lif(LifRef),
     Izh(Izhikevich),
     Adex(AdEx),
@@ -247,7 +254,7 @@ enum Neuron {
 }
 
 impl Neuron {
-    fn step(&mut self, drive: f32, dt: f32) -> bool {
+    pub(crate) fn step(&mut self, drive: f32, dt: f32) -> bool {
         match self {
             Neuron::Lif(n) => n.step(drive, dt),
             Neuron::Izh(n) => n.step(drive, dt),
@@ -258,16 +265,16 @@ impl Neuron {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     Lif,
     Izhikevich,
     Adex,
     Resonator,
 }
 
-const KINDS: [Kind; 4] = [Kind::Lif, Kind::Izhikevich, Kind::Adex, Kind::Resonator];
+pub(crate) const KINDS: [Kind; 4] = [Kind::Lif, Kind::Izhikevich, Kind::Adex, Kind::Resonator];
 
-fn kind_name(k: Kind) -> &'static str {
+pub(crate) fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::Lif => "lif",
         Kind::Izhikevich => "izhikevich",
@@ -295,7 +302,7 @@ fn scale_for(k: Kind) -> f32 {
     }
 }
 
-fn make_neuron(k: Kind, rng: &mut Xorshift64) -> Neuron {
+pub(crate) fn make_neuron(k: Kind, rng: &mut Xorshift64) -> Neuron {
     match k {
         Kind::Lif => Neuron::Lif(LifRef { v: 0.0, threshold: rng.uniform(0.8, 1.3), leak: 0.05 }),
         Kind::Izhikevich => Neuron::Izh(Izhikevich::new(rng.pick3())),

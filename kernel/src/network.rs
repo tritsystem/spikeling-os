@@ -148,7 +148,17 @@ const STDP_RATE: f32 = 0.1;
 const STDP_TAU_MS: f32 = 20.0;
 const TICK_PERIOD_MS: f32 = 1000.0 / 18.2;
 
-fn apply_stdp(weight: &mut f32, pre_last_fire: Option<u64>, post_last_fire: Option<u64>) {
+/// MILESTONE 78: made `pub(crate)` so `hetero_stdp.rs` can drive this
+/// SAME formula directly off the heterogeneous neuron types'
+/// (`hetero_ensemble.rs`) own real fire ticks, rather than maintaining
+/// a second copy of the STDP rule -- the exact discipline this file's
+/// own module doc names as a hard-won lesson from Milestone 21 (two
+/// independently-implemented copies of the same dynamics silently
+/// drifting out of sync). `network.rs`'s own GenericNetwork/LeftKey/
+/// RightKey/Motor engine is completely untouched by this reuse -- the
+/// heterogeneous types still live entirely outside this file's Neuron/
+/// Synapse representation.
+pub(crate) fn apply_stdp(weight: &mut f32, pre_last_fire: Option<u64>, post_last_fire: Option<u64>) {
     if let (Some(pre_t), Some(post_t)) = (pre_last_fire, post_last_fire) {
         let dt_ticks = post_t as i64 - pre_t as i64;
         let dt_ms = dt_ticks as f32 * TICK_PERIOD_MS;

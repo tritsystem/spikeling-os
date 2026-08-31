@@ -20,6 +20,7 @@ mod elf;
 mod errno;
 mod gdt;
 mod hetero_ensemble;
+mod hetero_stdp;
 mod interrupts;
 mod keyboard;
 mod loader;
@@ -1066,6 +1067,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // after ata.rs has been exercised many times already by every
     // earlier fs/persistence self-test, so the disk is definitely live.
     hetero_ensemble::self_test_hetero_ensemble();
+
+    // MILESTONE 78: same reasoning as Milestone 77 immediately above --
+    // pure kernel-space computation (network.rs::apply_stdp() plus the
+    // heterogeneous neuron types' own step() calls), no ELF process, no
+    // ring-3/RFLAGS.IF ordering constraint.
+    hetero_stdp::self_test_hetero_stdp();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

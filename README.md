@@ -5590,6 +5590,130 @@ self-test suite, genuinely open for a future pass.
       exact cycle numbers themselves are a property of this emulation,
       not a physical disk.
 
+- [x] **Milestone 78**: does spike-timing-dependent plasticity (STDP)
+      -- this kernel's own real learning rule, `network.rs::apply_stdp()`,
+      verified since Milestone 17/21 on LIF-only LeftKey/RightKey->Motor
+      -- still produce a real weight trajectory when driven by the three
+      OTHER neuron dynamics Milestone 77 introduced (`kernel/src/
+      hetero_stdp.rs`, new, self-contained)? `apply_stdp()` is
+      neuron-model-agnostic by construction -- it only ever reads two
+      `Option<u64>` fire ticks, never a neuron's internal state -- so it
+      is now `pub(crate)` and reused directly rather than re-implemented
+      a second time (the exact discipline `network.rs`'s own module doc
+      names as a hard-won Milestone 21 lesson: two independently-built
+      copies of the same mechanism silently drifted apart before being
+      unified). `hetero_ensemble.rs`'s four neuron structs are likewise
+      now `pub(crate)` and reused, not copied. Neither `network.rs`'s
+      GenericNetwork nor `hetero_ensemble.rs`'s own Milestone 77
+      disk-anomaly self-test is touched.
+
+      **Real mechanism**: for each of the four types, a fresh pre/post
+      neuron pair (own RNG-seeded parameters, same per-type diversity
+      convention as Milestone 77) runs 20 real trials. Each trial: pulse
+      `pre` with one real strong step of type-scaled drive, a real
+      2-tick quiet gap (the SAME gap `network.rs`'s own bare `train`
+      shell command already uses and has verified), one real strong step
+      pulsing `post`, then a cooldown. If (and only if) BOTH neurons
+      actually fired from their own real stimulus this trial, their real
+      first-fire ticks are handed to the SAME `apply_stdp()` LeftKey/
+      Motor already trusts.
+
+      **A real bug found and fixed before any result counted**: the
+      first working version used a 6-step pulse and recorded each
+      neuron's LAST fire in the window (matching `Neuron.last_fire_tick`
+      naming elsewhere) -- and produced weight 0.5000 -> 0.5000 for
+      EVERY type, including LIF and Izhikevich's own 20/20-reliable
+      trials. Root cause, confirmed by hand-computing `apply_stdp()`'s
+      real formula: a neuron driven hard enough fires on nearly every
+      step of a 6-step pulse, so its LAST fire lands at the END of the
+      window -- pushing the real tick gap between pre's and post's
+      recorded fires out to ~8 ticks (~439ms at this kernel's real
+      ~54.9ms/tick period), which `STDP_TAU_MS=20`'s exponential decays
+      to a delta on the order of 1e-11 per trial -- silently
+      indistinguishable from zero at 4 decimal places, for every type,
+      regardless of firing reliability. Fixed two ways: record each
+      neuron's FIRST fire in a window, not its last, and shrink the
+      pulse to one real step -- keeping the real pre/post tick gap close
+      to the already-verified `train`/DSL `gap_ticks=2` convention
+      instead of several ticks wider.
+
+      **Real, measured result** (two identical fresh QEMU boots, `bios`,
+      byte-identical `milestone 78:` output both times, `PULSE_DRIVE_
+      RAW=40.0` after recalibration -- an initial `8.0` reliably fired
+      LIF/Izhikevich too, but recalibrating upward first to separate
+      "won't fire from more drive" from "won't fire from more duration"
+      was worth the one extra boot):
+
+      ```
+      lif          pre_fired=20/20 post_fired=20/20 valid_trials=20/20 weight 0.5000 -> 0.5005
+      izhikevich   pre_fired=20/20 post_fired=20/20 valid_trials=20/20 weight 0.5000 -> 0.5005
+      adex         pre_fired=1/20  post_fired=1/20  valid_trials=1/20  weight 0.5000 -> 0.5000
+      resonator    pre_fired=1/20  post_fired=1/20  valid_trials=1/20  weight 0.5000 -> 0.5000
+      ```
+
+      Against the pre-registered hypothesis: (1) CONFIRMED for LIF and
+      Izhikevich -- both fire reliably from one real strong step and
+      produce an identical, real, non-zero STDP weight update (the two
+      simple threshold-crossing types behave the same way under this
+      formula, as predicted). (2) REVISED for AdEx: the prediction was
+      that it would fire reliably but show DECLINING reliability over
+      trials from its own `w`-adaptation ("fatigue"). What was actually
+      measured is different and more specific -- AdEx doesn't reliably
+      fire from a single strong step AT ALL (1/20, and raising
+      `PULSE_DRIVE_RAW` from 8.0 to 40.0, a 5x increase, changed nothing
+      -- confirmed a genuine duration-vs-magnitude distinction, not a
+      threshold that was merely too high). A separate, un-recalibrated
+      dev run with a 6-step pulse (same shape Milestone 77's own
+      workloads use) got AdEx to 7/20 -- real evidence that AdEx
+      specifically needs sustained integration time, not just strong
+      instantaneous drive, to cross its own exponential spike-generating
+      term. Not adopted for the reported comparison since it would break
+      the pre-registered "same pulse shape for every type" fairness
+      condition -- reported here only as an honest, real supplementary
+      data point, not folded into the headline result. (3) CONFIRMED for
+      Resonator: 1/20, unmoved by the 5x drive increase, exactly as
+      predicted -- its real firing mechanism (RMS-energy accumulated
+      over sustained oscillation, see `hetero_ensemble.rs`'s own module
+      doc) genuinely cannot be elicited by a single non-periodic pulse,
+      real or synthetic.
+
+      The honest bottom line: the SAME STDP formula is not the limiting
+      factor for any of the four types (it correctly does nothing when
+      handed no real paired timing, and correctly produces a real,
+      measured, non-zero update the moment LIF/Izhikevich hand it real
+      paired ticks). What differs by real, measured necessity is
+      elicitation -- getting each type to produce a countable spike in
+      the first place -- not the plasticity rule itself.
+
+      **Verified**: `cargo build --target x86_64-unknown-none` clean, no
+      warnings (including after making `apply_stdp()` and the four
+      neuron structs `pub(crate)` for reuse). Two full QEMU boots
+      (`cargo run bios`), serial output diffed -- every `milestone 78:`
+      line byte-identical between them (deterministic seeds, no disk
+      I/O in this self-test, so fresh vs. reused makes no difference
+      here, same as Milestone 77). `grep`-checked both full boot logs
+      for `FAIL`/`PANIC`: only the same pre-existing, already-disclosed
+      cases every milestone since 70 has named (the two `permissions`/
+      `symlinks` reused-disk `OVERALL=FAIL` entries, `stdiotest.elf`'s
+      O_TRUNC gap, deliberately-negative-tested syscalls, and `milestone
+      6: FAILED -- no keystrokes received`, expected for a
+      non-interactive boot). No new regressions; `OVERALL_M77=PASS`
+      still present and unchanged; `OVERALL_M78=PASS` present exactly
+      once.
+
+      **Still genuinely open**: only LTP (pre-before-post) was tested --
+      LTD (post-before-pre) is the same formula's other branch and would
+      be a natural, cheap follow-up, not attempted here. The four types'
+      elicitation gap (AdEx needing duration, Resonator needing a
+      periodic drive shape) is a real, disclosed limitation of THIS
+      protocol, not evidence about whether a differently-shaped
+      stimulus could train them -- genuinely untested. This module
+      creates its own throwaway pre/post pairs every self-test run; it
+      does not persist a trained weight anywhere or feed it back into
+      `hetero_ensemble.rs`'s own disk-anomaly detector, so there is no
+      real learned-vs-untrained detection comparison yet -- a natural
+      next milestone, not this one.
+
 ## Building and running
 
 Requires:

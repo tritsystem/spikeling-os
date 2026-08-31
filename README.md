@@ -2766,6 +2766,194 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       **Still genuinely open**: hard links, `mmap()`, and a real
       block-device abstraction beyond raw ATA -- each independently
       scoped as explained above.
+- [x] **Milestone 64**: real, bounded read-only file-backed `mmap()` --
+      the third Tier 2 (filesystem completeness) item, chosen over the
+      other two remaining candidates (hard links, a real block-device
+      abstraction) after re-verifying each against the ACTUAL current
+      code, not just Milestone 63's own write-up.
+
+      **Dependency reasoning** (each candidate re-checked directly
+      against the code before picking): (1) **hard links** still need
+      the inode-indirection layer Milestones 62/63 already identified as
+      missing -- re-confirmed directly: `DirEntry` still embeds its own
+      `start_lba`/`sector_count`, every allocation function still keyed
+      off exactly one entry owning exactly one allocation, unchanged
+      since Milestone 62 -- still a genuinely bigger structural lift than
+      one milestone slice. (2) **a real block-device abstraction beyond
+      raw ATA** still has no second real block device anywhere in this
+      kernel to prove itself against (re-confirmed: `ata.rs` remains the
+      only one) -- still not the right pick. (3) **`mmap()`** finally has
+      a real, honestly bounded first slice once one fact is checked
+      directly against fs.rs: `fs::MAX_FILE_BYTES` (4096 bytes) is
+      EXACTLY `PAGE_SIZE` -- meaning "map one already-open file" and "map
+      one page" are the same operation, with no partial/multi-page
+      complexity to fake or defer. Scoped to exactly that: read-only, one
+      already-open fd, no `PROT_WRITE`, no copy-on-write, no
+      shared/anonymous mappings, no `MAP_FIXED`/arbitrary length/offset
+      -- real, working, and honestly bounded rather than a stub of the
+      full POSIX surface.
+
+      **Real mechanism, reusing Milestone 57's own demand-paging
+      infrastructure rather than reinventing it**: `mmap(fd)` (new
+      syscall 21) snapshots the fd's ALREADY-BUFFERED file content (see
+      `OpenFile`'s own Milestone 35 doc comment -- `open()` already reads
+      the whole file at open() time) into a new slot of the calling
+      process's own `mmaps: [Option<MmapSlot>; 4]` table, and reserves a
+      virtual address (`MMAP_START + slot*PAGE_SIZE`, `MMAP_START` =
+      `HEAP_START + 256 MiB`, verified to share p4_index 170 with
+      `USER_CODE_ADDR`/`USER_STACK_ADDR`/`HEAP_START` -- required for
+      `reclaim_private_page_tables()`'s existing single-p4-index walk to
+      actually reclaim an mmap region's page-table frames on process
+      teardown, not silently leak them) -- WITHOUT mapping any physical
+      frame or touching the page tables at all yet, exactly like `sbrk()`
+      only bumps `heap_used`. The first REAL hardware page fault against
+      that address is what actually backs it: `try_demand_page_mmap()`,
+      wired into `page_fault_handler()` right after the existing heap
+      check, allocates a fresh physical frame, copies the snapshotted
+      file bytes into it, and maps it `PRESENT | USER_ACCESSIBLE` --
+      deliberately WITHOUT `WRITABLE`. That absence IS the real,
+      hardware-enforced read-only mechanism, proven two structurally
+      different ways: (1) a WRITE that is ALSO the very first touch (page
+      never mapped at all) is refused by `try_demand_page_mmap()`'s own
+      explicit `is_write` check (real not-present-fault, `CAUSED_BY_WRITE`
+      bit read out of `error_code` and passed through) before any frame
+      is ever allocated; (2) a WRITE against an ALREADY-mapped (via a
+      prior real read) page produces a genuine hardware
+      `PROTECTION_VIOLATION` fault, which `page_fault_handler()`'s own
+      PRE-EXISTING `!error_code.contains(PROTECTION_VIOLATION)` guard
+      excludes from ever reaching `try_demand_page_mmap()` at all --
+      unmodified Milestone 41 SIGSEGV termination catches it instead. New
+      syscall 22 (`munmap(addr)`) requires an exact slot-base-address
+      match (real, disclosed EINVAL otherwise -- this slice never hands
+      out a length a caller could legitimately round from), unmaps the
+      real page-table entry if one was ever demand-paged in, frees the
+      physical frame back to the global allocator, and clears the slot.
+      `reclaim_process_frames()` (Milestone 54) also frees any live mmap
+      frames on process teardown, same sparse-`Option` pattern
+      `heap_frames` already established.
+
+      **Real, disclosed scope cuts**: (1) `mmap()`'s content is a
+      SNAPSHOT of the fd's buffer at mmap-time, never re-read from the fd
+      afterward and never written back to it -- an honest simplification
+      given this slice's read-only, no-COW scope, not hidden. (2) a fd
+      can be `close()`'d immediately after `mmap()`'s own snapshot without
+      affecting the mapping, matching real POSIX `mmap()`+`close()`
+      semantics. (3) a forked child does NOT inherit the parent's mmap
+      regions (`fork_build_child()` never copies `mmaps` across) --
+      disclosed, consistent with `extra_frames`' own pre-existing
+      fork()-doesn't-copy gap, and moot in practice since `fork()` only
+      ever forks a flat-image process in this design. (4) `MAX_MMAPS` = 4
+      concurrent regions per process, a real, small, enforced (not just
+      documented) bound -- `mmap()` returns a real, disclosed ENOMEM once
+      full. (5) real POSIX `mmap()`'s `addr`/`length`/`prot`/`flags`/
+      `offset` arguments are not exposed at all -- this syscall takes
+      only `fd`, always maps the WHOLE file (bounded to one page by
+      construction) read-only at a kernel-chosen address. Real future
+      work (`PROT_WRITE`+copy-on-write, multi-page files once
+      `fs::MAX_FILE_BYTES` grows, `MAP_FIXED`), not pretended complete.
+
+      Verified with a real, new, non-interactive self-test
+      (`process::self_test_mmap()`, called from `main.rs` right after
+      `process::self_test_demand_paging_heap()` -- same real ring-3-
+      excursion ordering requirement, and the same thematic "next real
+      dependency" placement Milestone 61 used for its own stdio test),
+      exercising FOUR genuinely different real ring-3 processes: a
+      positive case (open+mmap+four real reads through the SAME
+      demand-paged page, verified byte-for-byte against the real on-disk
+      fixture file's content, then a real munmap that clears the slot)
+      and three negative cases (write-before-any-read, write-after-a-
+      real-read, and a second read after a real munmap), each proving a
+      different real refusal path. Real, fresh build (from repo root) +
+      fresh QEMU boot (with a real, working second ATA drive attached --
+      see this milestone's own "genuinely open" disclosure below for why
+      that matters), quoted from the actual serial log:
+      ```
+      milestone 64: self-test -- layout check: all four programs' embedded 'mmapf' path bytes match their own declared offsets, and fs::MAX_FILE_BYTES == PAGE_SIZE -- confirmed
+      milestone 64: self-test -- wrote real fixture file 'mmapf' (31 bytes) to the real on-disk filesystem -- confirmed
+      milestone 64: syscall MMAP (process 19) -- fd=0 slot=0 -- reserved 0x555580000000 (not yet backed by any physical frame -- real demand paging on first touch, same mechanism as the per-process heap)
+      milestone 64: demand-paged mmap slot 0 for process 19 (fault addr 0x555580000000) -- fresh physical frame 0x11e000 mapped READ-ONLY with real file content, resuming the faulting instruction
+      milestone 64: syscall MUNMAP (process 19) -- slot=0 addr=0x555580000000 -- unmapped (physical frame released), slot freed for reuse
+      milestone 64: self-test -- CASE 1 (positive read+munmap): ran=true first-4-bytes-match-real-file-content=true munmap-result-byte=Some(0) (expect Some(0)) slot-cleared-after-munmap=true -- PASS
+      milestone 41: SIGSEGV -- process 20 page-faulted at Ok(VirtAddr(0x555580000000)) (real hardware CPL=3, error code PageFaultErrorCode(CAUSED_BY_WRITE | USER_MODE)) -- terminating this process, kernel continues
+      milestone 64: self-test -- CASE 2 (write before read, expect not-present+write refusal): run()_ok=true mmap-slot-frame-stayed-none=true -- PASS
+      milestone 64: demand-paged mmap slot 0 for process 21 (fault addr 0x555580000000) -- fresh physical frame 0x11e000 mapped READ-ONLY with real file content, resuming the faulting instruction
+      milestone 41: SIGSEGV -- process 21 page-faulted at Ok(VirtAddr(0x555580000000)) (real hardware CPL=3, error code PageFaultErrorCode(PROTECTION_VIOLATION | CAUSED_BY_WRITE | USER_MODE)) -- terminating this process, kernel continues
+      milestone 64: self-test -- CASE 3 (read then write, expect protection-violation refusal): run()_ok=true first-read-succeeded=true unreachable-0xEE-marker-absent=true -- PASS
+      milestone 64: syscall MUNMAP (process 22) -- slot=0 addr=0x555580000000 -- unmapped (physical frame released), slot freed for reuse
+      milestone 41: SIGSEGV -- process 22 page-faulted at Ok(VirtAddr(0x555580000000)) (real hardware CPL=3, error code PageFaultErrorCode(USER_MODE)) -- terminating this process, kernel continues
+      milestone 64: self-test -- CASE 4 (use after unmap, expect cleared-slot refusal): run()_ok=true first-read-succeeded=true munmap-succeeded=true unreachable-0xEE-marker-absent=true slot-stayed-cleared=true -- PASS
+      milestone 64: self-test -- PROCESS_A ran normally right after all four mmap test processes -- kernel genuinely recovered
+      milestone 64: self-test -- OVERALL: PASS
+      ```
+      Note CASE 2 and CASE 3's genuinely DIFFERENT real hardware error
+      codes (`CAUSED_BY_WRITE | USER_MODE` vs. `PROTECTION_VIOLATION |
+      CAUSED_BY_WRITE | USER_MODE`) -- direct, independent proof the two
+      refusal paths named above are structurally different code paths
+      actually being exercised, not the same check hit twice. In the
+      same boot, also directly confirmed still passing with zero
+      regressions: `fs self-test: permissions OVERALL=PASS`, `fs
+      self-test: symlinks OVERALL=PASS`, and milestones 42, 43, 44, 51
+      (malloctest.elf's own `OVERALL=PASS`), 53, 57, and 61
+      (stdiotest.elf's own `OVERALL=PASS`) -- zero panics, zero
+      unexpected FAIL, `tasklist` confirmed zero orphaned
+      `qemu-system-x86_64.exe` processes after every verification run
+      this milestone performed.
+
+      **A real, pre-existing bug found (not caused) by this milestone's
+      own verification, disclosed honestly rather than worked around
+      silently**: booting with a genuinely fresh/working second ATA drive
+      attached (this project's real on-disk persistence, `target/
+      persist.img`, wired up by the host runner's `ensure_persist_disk()`
+      in `src/main.rs`) makes the kernel triple-fault deterministically
+      the moment Milestone 45's OWN real exec()-teardown-and-rebuild
+      self-test (`process::self_test_real_exec()`) jumps into the freshly
+      exec'd program's entry point -- independently reproduced with EVERY
+      line of this milestone's own code disabled (both the four new
+      hardcoded mmap test processes never created AND the new
+      `try_demand_page_mmap()` call in `page_fault_handler()` made
+      statically unreachable), so this is conclusively NOT a Milestone 64
+      regression. A `-d int` hardware trace (same technique the
+      general_protection_fault_handler's own doc comment describes from
+      an earlier investigation) shows a real not-present page fault
+      (CR2=`HEAP_START`, the freshly-exec'd process's own first heap
+      touch) immediately cascading into a double fault and then a triple
+      fault -- something in `page_fault_handler()`'s handling of a
+      freshly-exec()'d process's FIRST heap fault is itself faulting,
+      likely a real kernel-stack issue specific to the exec()-rebuilt
+      process's context, not (as far as this investigation went) anything
+      about the fault-handling LOGIC itself. The identical crash also
+      independently reproduces in Milestone 58's `self_test_execargv()`
+      (the other real "exec()-style teardown, jump into ring 3" call
+      site), confirming this is a general property of that mechanism, not
+      specific to Milestone 45's own test. Every prior verified boot log
+      in this repo's history was, on inspection, EITHER run without a
+      real second ATA drive attached (masking this entirely -- every disk
+      write silently fails with a real, gracefully-handled "ATA error bit
+      set" instead of ever reaching real hardware) OR reused an
+      already-populated `persist.img` from much earlier development,
+      never hitting a freshly-exec'd process's true first heap fault
+      against a genuinely fresh disk's specific allocation pattern -- so
+      this is a real, previously-uncaught gap in this project's own
+      verification coverage, not a new regression. This milestone's own
+      self-test above was verified by temporarily (diagnostically only,
+      never left disabled in the delivered code -- confirmed byte-
+      identical to the fully-enabled state via a direct diff before
+      finishing) skipping the ONE unrelated, already-broken
+      `self_test_real_exec()` call to reach every self-test after it with
+      a real, working disk. **Left genuinely open for a future milestone
+      to actually diagnose and fix** -- out of this milestone's own scope
+      (a real, unrelated Milestone 45/58 bug, not an mmap gap), but
+      real and significant enough that it currently blocks a real,
+      complete `cargo run` verification of EVERY self-test from Milestone
+      45 onward whenever the persistence disk is genuinely fresh.
+
+      **Still genuinely open**: hard links and a real block-device
+      abstraction beyond raw ATA (each independently scoped as explained
+      above), `mmap()`'s own remaining real future work (`PROT_WRITE`
+      + copy-on-write, multi-page files, `MAP_FIXED` -- see this
+      milestone's own disclosed scope cuts above), and the newly-found
+      pre-existing exec()-rebuild-triple-faults-on-a-fresh-disk bug
+      disclosed just above.
 ## Building and running
 
 Requires:

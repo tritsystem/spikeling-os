@@ -49,19 +49,48 @@
 //!              [16..32) `to` name, UTF-8, NUL-padded
 //!              [32..34) ternary-packed weight (2 bytes)
 //!            up to MAX_SYNAPSES=14 entries fit in one 512-byte sector.
+//!
+//! MILESTONE 66: a real `BlockDevice` trait now separates "how to talk
+//! to an ATA drive over PIO" (`AtaDevice`, generalized over an I/O port
+//! base and a master/slave drive-select byte) from "which specific
+//! drive" -- the last remaining Tier 2 (filesystem completeness) item,
+//! chosen over hard links (still genuinely blocked: `fs.rs`'s
+//! `DirEntry` still embeds `start_lba`/`sector_count` directly with no
+//! inode-indirection layer, re-confirmed unchanged since Milestone 62's
+//! own judgment call -- see fs.rs's module doc). Before this milestone
+//! `read_sector`/`write_sector` were bare free functions hardcoded to
+//! ONE drive (I/O base 0x170, master-select byte 0xE0) -- real PIO, but
+//! not an abstraction: nothing about the code separated "the mechanism"
+//! from "the specific hardware", and there was only ever one real
+//! device to prove it against (the Milestone 40 secondary-bus
+//! persistence disk). The Milestone 64/65 "second-ATA-drive" triple
+//! fault that blocked this is now fixed (see README's Post-Milestone-65
+//! fix pass -- root cause was `gdt.rs`'s shared ring0 stack, not
+//! anything about having two drives), so a genuine second real block
+//! device is now safe to add and prove the abstraction against.
+//!
+//! **Real second device**: a real IDE SLAVE drive on the SAME secondary
+//! bus/cable as the existing master (`bus=ide.1,unit=1` in
+//! `src/main.rs`'s QEMU config, a real, separate `target/persist2.img`
+//! backing file) -- the standard real-hardware master/slave pairing on
+//! one ATA cable, selected purely via the drive-select byte's DRV bit
+//! (`0xE0` master vs `0xF0` slave) at the SAME I/O port base, not a new
+//! controller or IRQ. `SECONDARY_MASTER`/`SECONDARY_SLAVE` are the two
+//! real `AtaDevice` instances; the existing free `read_sector()`/
+//! `write_sector()` functions (still used, unmodified call sites, by
+//! `fs.rs` and this module's own `save_weights()`/`load_weights()`) are
+//! now thin wrappers delegating to `SECONDARY_MASTER` -- byte-identical
+//! I/O ports and drive-select value as before this milestone, zero
+//! behavioral change for any existing caller (see `self_test_
+//! block_device_abstraction()`'s own disclosure of how this was
+//! confirmed).
 
+use crate::serial;
 use crate::ternary;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt::Write;
 use x86_64::instructions::port::Port;
-
-const DATA: u16 = 0x170;
-const SECTOR_COUNT: u16 = 0x172;
-const LBA_LOW: u16 = 0x173;
-const LBA_MID: u16 = 0x174;
-const LBA_HIGH: u16 = 0x175;
-const DRIVE_HEAD: u16 = 0x176;
-const STATUS_OR_COMMAND: u16 = 0x177;
 
 const STATUS_ERR: u8 = 0x01;
 const STATUS_DRQ: u8 = 0x08;
@@ -71,75 +100,138 @@ const CMD_READ_SECTORS: u8 = 0x20;
 const CMD_WRITE_SECTORS: u8 = 0x30;
 const CMD_CACHE_FLUSH: u8 = 0xE7;
 
-fn wait_not_busy() {
-    let mut status_port: Port<u8> = Port::new(STATUS_OR_COMMAND);
-    loop {
-        if unsafe { status_port.read() } & STATUS_BSY == 0 {
-            break;
+/// MILESTONE 66: the real block-device abstraction -- any type that can
+/// read/write a 512-byte sector by LBA. `AtaDevice` below is the only
+/// implementation, but the trait boundary is what makes this a genuine
+/// abstraction rather than just a refactor: `self_test_
+/// block_device_abstraction()` drives two DIFFERENT real `AtaDevice`
+/// instances through this SAME trait interface, and future code could
+/// implement it for a non-ATA backend without touching a single call
+/// site written against `&dyn BlockDevice`/`impl BlockDevice`.
+pub trait BlockDevice {
+    fn read_sector(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str>;
+    fn write_sector(&self, lba: u32, buf: &[u8; 512]) -> Result<(), &'static str>;
+}
+
+/// MILESTONE 66: one real ATA PIO device, generalized over the two
+/// things that actually distinguish drives on the classic IDE bus
+/// layout this kernel targets: the I/O port base (0x170 for the
+/// secondary controller, same as every prior milestone) and the
+/// drive-select byte's DRV bit (bit 4: 0 = master, 1 = slave -- OR'd
+/// with LBA[27:24] on every access exactly as the original hardcoded
+/// `select_and_setup()` already did for the master-only case).
+pub struct AtaDevice {
+    io_base: u16,
+    drive_select_base: u8,
+}
+
+impl AtaDevice {
+    pub const fn new(io_base: u16, drive_select_base: u8) -> Self {
+        AtaDevice { io_base, drive_select_base }
+    }
+
+    fn wait_not_busy(&self) {
+        let mut status_port: Port<u8> = Port::new(self.io_base + 7);
+        loop {
+            if unsafe { status_port.read() } & STATUS_BSY == 0 {
+                break;
+            }
         }
     }
-}
 
-fn wait_drq() -> Result<(), &'static str> {
-    let mut status_port: Port<u8> = Port::new(STATUS_OR_COMMAND);
-    loop {
-        let status = unsafe { status_port.read() };
-        if status & STATUS_ERR != 0 {
-            return Err("ATA error bit set");
+    fn wait_drq(&self) -> Result<(), &'static str> {
+        let mut status_port: Port<u8> = Port::new(self.io_base + 7);
+        loop {
+            let status = unsafe { status_port.read() };
+            if status & STATUS_ERR != 0 {
+                return Err("ATA error bit set");
+            }
+            if status & STATUS_DRQ != 0 {
+                return Ok(());
+            }
         }
-        if status & STATUS_DRQ != 0 {
-            return Ok(());
-        }
     }
-}
 
-fn select_and_setup(lba: u32) {
-    unsafe {
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0 | (((lba >> 24) & 0x0F) as u8));
-        Port::<u8>::new(SECTOR_COUNT).write(1u8);
-        Port::<u8>::new(LBA_LOW).write((lba & 0xFF) as u8);
-        Port::<u8>::new(LBA_MID).write(((lba >> 8) & 0xFF) as u8);
-        Port::<u8>::new(LBA_HIGH).write(((lba >> 16) & 0xFF) as u8);
-    }
-}
-
-pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
-    wait_not_busy();
-    select_and_setup(lba);
-    unsafe {
-        Port::<u8>::new(STATUS_OR_COMMAND).write(CMD_READ_SECTORS);
-    }
-    wait_not_busy();
-    wait_drq()?;
-    let mut data_port: Port<u16> = Port::new(DATA);
-    for chunk in buf.chunks_exact_mut(2) {
-        let word = unsafe { data_port.read() };
-        chunk[0] = (word & 0xFF) as u8;
-        chunk[1] = (word >> 8) as u8;
-    }
-    Ok(())
-}
-
-pub fn write_sector(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
-    wait_not_busy();
-    select_and_setup(lba);
-    unsafe {
-        Port::<u8>::new(STATUS_OR_COMMAND).write(CMD_WRITE_SECTORS);
-    }
-    wait_not_busy();
-    wait_drq()?;
-    let mut data_port: Port<u16> = Port::new(DATA);
-    for chunk in buf.chunks_exact(2) {
-        let word = (chunk[0] as u16) | ((chunk[1] as u16) << 8);
+    fn select_and_setup(&self, lba: u32) {
         unsafe {
-            data_port.write(word);
+            Port::<u8>::new(self.io_base + 6).write(self.drive_select_base | (((lba >> 24) & 0x0F) as u8));
+            Port::<u8>::new(self.io_base + 2).write(1u8);
+            Port::<u8>::new(self.io_base + 3).write((lba & 0xFF) as u8);
+            Port::<u8>::new(self.io_base + 4).write(((lba >> 8) & 0xFF) as u8);
+            Port::<u8>::new(self.io_base + 5).write(((lba >> 16) & 0xFF) as u8);
         }
     }
-    unsafe {
-        Port::<u8>::new(STATUS_OR_COMMAND).write(CMD_CACHE_FLUSH);
+}
+
+impl BlockDevice for AtaDevice {
+    fn read_sector(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+        self.wait_not_busy();
+        self.select_and_setup(lba);
+        unsafe {
+            Port::<u8>::new(self.io_base + 7).write(CMD_READ_SECTORS);
+        }
+        self.wait_not_busy();
+        self.wait_drq()?;
+        let mut data_port: Port<u16> = Port::new(self.io_base);
+        for chunk in buf.chunks_exact_mut(2) {
+            let word = unsafe { data_port.read() };
+            chunk[0] = (word & 0xFF) as u8;
+            chunk[1] = (word >> 8) as u8;
+        }
+        Ok(())
     }
-    wait_not_busy();
-    Ok(())
+
+    fn write_sector(&self, lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
+        self.wait_not_busy();
+        self.select_and_setup(lba);
+        unsafe {
+            Port::<u8>::new(self.io_base + 7).write(CMD_WRITE_SECTORS);
+        }
+        self.wait_not_busy();
+        self.wait_drq()?;
+        let mut data_port: Port<u16> = Port::new(self.io_base);
+        for chunk in buf.chunks_exact(2) {
+            let word = (chunk[0] as u16) | ((chunk[1] as u16) << 8);
+            unsafe {
+                data_port.write(word);
+            }
+        }
+        unsafe {
+            Port::<u8>::new(self.io_base + 7).write(CMD_CACHE_FLUSH);
+        }
+        self.wait_not_busy();
+        Ok(())
+    }
+}
+
+/// The ORIGINAL real device every milestone through 65 hardcoded:
+/// secondary ATA controller (I/O base 0x170), master drive-select
+/// (0xE0). Identical ports and select byte to the pre-Milestone-66
+/// hardcoded constants (`DATA=0x170`, `SECTOR_COUNT=0x172`,
+/// `LBA_LOW=0x173`, `LBA_MID=0x174`, `LBA_HIGH=0x175`,
+/// `DRIVE_HEAD=0x176`, `STATUS_OR_COMMAND=0x177`, select byte `0xE0`) --
+/// `io_base + {0,2,3,4,5,6,7}` reproduces that exact same set.
+pub static SECONDARY_MASTER: AtaDevice = AtaDevice::new(0x170, 0xE0);
+
+/// MILESTONE 66: the real, NEW second device -- same secondary
+/// controller, SLAVE drive-select (0xF0, the DRV bit set). A real,
+/// separate physical drive on the same cable (`bus=ide.1,unit=1` in
+/// `src/main.rs`), not a second controller.
+pub static SECONDARY_SLAVE: AtaDevice = AtaDevice::new(0x170, 0xF0);
+
+/// Unchanged signature and unchanged real behavior for every existing
+/// caller (`fs.rs`'s 7 call sites, this module's own `save_weights()`/
+/// `load_weights()`) -- now a thin wrapper delegating to
+/// `SECONDARY_MASTER` through the `BlockDevice` trait instead of a
+/// standalone hardcoded implementation.
+pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+    SECONDARY_MASTER.read_sector(lba, buf)
+}
+
+/// See `read_sector()`'s doc comment above -- same "unchanged for
+/// existing callers" guarantee.
+pub fn write_sector(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
+    SECONDARY_MASTER.write_sector(lba, buf)
 }
 
 const MAGIC: u32 = 0x53504B32; // "SPK2" -- MILESTONE 38's ternary, name-keyed format (see module doc)
@@ -219,4 +311,92 @@ pub fn load_weights() -> Option<Vec<(String, String, f32)>> {
         off += ENTRY_LEN;
     }
     Some(out)
+}
+
+/// MILESTONE 66: a scratch LBA reserved for this self-test only, chosen
+/// safely past every real region another module actually uses on the
+/// master device -- `ata::save_weights()`/`load_weights()` use LBA 0
+/// only, `fs.rs` uses LBA 1 (`DIR_LBA`) through LBA 66 (`ROOT_META_LBA`,
+/// `FILE_DATA_START_LBA=2` + `NUM_DATA_SECTORS=64`) -- so LBA 500 can
+/// never collide with real filesystem or weight-persistence data on the
+/// SAME disk image. On the slave device this LBA is arbitrary (that
+/// disk image, `target/persist2.img`, is dedicated to this self-test
+/// alone and touched by nothing else), kept identical to the master's
+/// scratch LBA purely so the "same LBA, two different real devices,
+/// two different real contents" comparison below is as direct as
+/// possible.
+const SELFTEST_SCRATCH_LBA: u32 = 500;
+
+/// MILESTONE 66: real proof the `BlockDevice` trait abstraction is
+/// genuine, not just a refactor that happens to compile -- exercises
+/// FOUR real, independently meaningful checks against real hardware
+/// (QEMU-emulated ATA PIO, same real port I/O every prior milestone's
+/// disk work has used):
+///
+/// 1. write a real pattern to the MASTER device via the `BlockDevice`
+///    trait (`SECONDARY_MASTER.write_sector()`), then read it back via
+///    the OLD free function `read_sector()` -- proves `read_sector()`
+///    really delegates to `SECONDARY_MASTER`, not a coincidentally-
+///    agreeing separate implementation.
+/// 2. write a SECOND, different real pattern to the master via the OLD
+///    free function `write_sector()`, then read it back via the trait
+///    (`SECONDARY_MASTER.read_sector()`) -- proves the delegation holds
+///    in the reverse direction too.
+/// 3. write a THIRD, different real pattern to the SLAVE device via the
+///    trait (`SECONDARY_SLAVE.write_sector()`), read it back via the
+///    trait, confirm it matches.
+/// 4. re-read the MASTER device (still via the trait) and confirm it
+///    STILL shows pattern 2's content, not the slave's pattern 3 --
+///    direct, real proof `SECONDARY_MASTER` and `SECONDARY_SLAVE` are
+///    genuinely two separate real block devices (a real IDE master and
+///    a real IDE slave on the same cable, backed by two separate real
+///    QEMU drive images), not the same physical device aliased under
+///    two names.
+pub fn self_test_block_device_abstraction() {
+    let mut port = serial();
+
+    const PATTERN_A: u8 = 0xAA; // written to master via the trait
+    const PATTERN_C: u8 = 0xCC; // written to master via the OLD free function (overwrites A)
+    const PATTERN_B: u8 = 0x55; // written to slave via the trait
+
+    let buf_a = [PATTERN_A; 512];
+    let buf_c = [PATTERN_C; 512];
+    let buf_b = [PATTERN_B; 512];
+
+    // CHECK 1: trait write to master, free-function read from master.
+    let check1 = SECONDARY_MASTER.write_sector(SELFTEST_SCRATCH_LBA, &buf_a).is_ok() && {
+        let mut readback = [0u8; 512];
+        read_sector(SELFTEST_SCRATCH_LBA, &mut readback).is_ok() && readback == buf_a
+    };
+
+    // CHECK 2: free-function write to master (different pattern), trait read from master.
+    let check2 = write_sector(SELFTEST_SCRATCH_LBA, &buf_c).is_ok() && {
+        let mut readback = [0u8; 512];
+        SECONDARY_MASTER.read_sector(SELFTEST_SCRATCH_LBA, &mut readback).is_ok() && readback == buf_c
+    };
+
+    // CHECK 3: trait write+read on the real SECOND device (slave).
+    let check3 = SECONDARY_SLAVE.write_sector(SELFTEST_SCRATCH_LBA, &buf_b).is_ok() && {
+        let mut readback = [0u8; 512];
+        SECONDARY_SLAVE.read_sector(SELFTEST_SCRATCH_LBA, &mut readback).is_ok() && readback == buf_b
+    };
+
+    // CHECK 4: master still shows its OWN last-written content (pattern
+    // C), independent of the slave write in CHECK 3 -- real, direct
+    // non-aliasing proof.
+    let check4 = {
+        let mut readback = [0u8; 512];
+        SECONDARY_MASTER.read_sector(SELFTEST_SCRATCH_LBA, &mut readback).is_ok() && readback == buf_c && readback != buf_b
+    };
+
+    let overall = check1 && check2 && check3 && check4;
+    let _ = writeln!(
+        port,
+        "milestone 66: self-test -- trait-write/free-read-agree(master)={check1} free-write/trait-read-agree(master)={check2} slave-device-roundtrip={check3} master-unaffected-by-slave-write(no-aliasing)={check4}"
+    );
+    let _ = writeln!(
+        port,
+        "milestone 66: self-test -- OVERALL: {}",
+        if overall { "PASS" } else { "FAIL" }
+    );
 }

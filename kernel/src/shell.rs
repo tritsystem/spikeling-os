@@ -150,11 +150,30 @@ fn print_listing(result: Result<alloc::vec::Vec<(String, bool, u16)>, String>) {
     }
 }
 
+// MILESTONE 62: real rwxrwxrwx rendering of a 9-bit unix mode, for
+// `stat`'s human-readable output.
+fn format_mode_rwx(mode: u16) -> String {
+    let bit = |shift: u16, ch: char| -> char {
+        if (mode >> shift) & 1 != 0 { ch } else { '-' }
+    };
+    let mut s = String::with_capacity(9);
+    s.push(bit(8, 'r'));
+    s.push(bit(7, 'w'));
+    s.push(bit(6, 'x'));
+    s.push(bit(5, 'r'));
+    s.push(bit(4, 'w'));
+    s.push(bit(3, 'x'));
+    s.push(bit(2, 'r'));
+    s.push(bit(1, 'w'));
+    s.push(bit(0, 'x'));
+    s
+}
+
 fn run_command(cmd: &str) {
     match cmd {
         "" => {}
         "help" => crate::console::write_str(
-            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, ping, udpsend, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest, seedmalloctest\n",
+            "commands: help, about, tasks, spawn, kill, neurons, train, save, net, addneuron, addsynapse, stim, beep, silence, date, mouse, ls, cd, mkdir, rmdir, write, read, rm, stat, chmod, chown, whoami, setid, ln, readlink, clear, lspci, nic, nicinfo, sendpacket, recvpacket, arp, ping, udpsend, pixel, line, rect, fillrect, draw, stopdraw, usertest, runproc, seedtestprog, runfile, seedfdtest, runfdtest, seedtestelf, runelf, runfork, seedpipetest, runsigsegv, runsigkill, seedaltentry, runexectest, seedmalloctest, seedargvtarget, seedargvlauncher, seedstdiotest\n",
         ),
         "usertest" => {
             // MILESTONE 27: drops to real CPL=3 and back. setup() at
@@ -260,6 +279,19 @@ fn run_command(cmd: &str) {
             crate::console::write_str(&format!(
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02} (real CMOS RTC, not the PIT tick count)\n",
                 dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+            ));
+        }
+        // MILESTONE 62: reports the real kernel-global "current
+        // identity" every fs.rs permission check runs against -- see
+        // fs.rs's own module doc comment for why this is a single
+        // global identity (no real per-process/login model yet), not a
+        // stub.
+        "whoami" => {
+            let uid = crate::fs::current_uid();
+            let gid = crate::fs::current_gid();
+            crate::console::write_str(&format!(
+                "uid={uid} gid={gid}{}\n",
+                if uid == 0 { " (root)" } else { "" }
             ));
         }
         "speakerstatus" => crate::console::write_str(&format!(
@@ -577,6 +609,56 @@ fn run_command(cmd: &str) {
                 Err(e) => crate::console::write_str(&format!("seedmalloctest FAILED: {e}\n")),
             }
         }
+        "seedargvtarget" => {
+            // MILESTONE 58: writes this milestone's REAL, externally-
+            // built "receiver" ELF64 test executable
+            // (loader::ARGVTARGET_ELF_BYTES, rustc+rust-lld, not hand-
+            // assembled) to a real file ("argvtarget") on the real
+            // on-disk filesystem -- the exact path
+            // ARGVLAUNCHER_ELF_BYTES's own real EXECARGV syscall call
+            // targets. The boot-time self-test already seeds+runs the
+            // SAME embedded bytes non-interactively; this is the
+            // interactive re-seed path (run this BEFORE
+            // 'seedargvlauncher'/'runelf argvlauncher', or the
+            // launcher's own exec() will fail with a real, honest
+            // "file not found").
+            match crate::loader::seed_argvtarget_elf() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedargvtarget: wrote {len} real bytes to 'argvtarget' on disk (a genuine ELF64 executable reading real argv/envp off its own initial stack, not hand-assembled)\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedargvtarget FAILED: {e}\n")),
+            }
+        }
+        "seedargvlauncher" => {
+            // MILESTONE 58: same reasoning as seedmalloctest above --
+            // writes the "caller" half (loader::ARGVLAUNCHER_ELF_BYTES)
+            // to a real file ("argvlauncher") on disk. `runelf` (already
+            // generic over any path) is what actually runs it -- no new
+            // run-command needed.
+            match crate::loader::seed_argvlauncher_elf() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedargvlauncher: wrote {len} real bytes to 'argvlauncher' on disk (a genuine ELF64 executable calling the real EXECARGV syscall, not hand-assembled) -- run 'seedargvtarget' first, then 'runelf argvlauncher'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedargvlauncher FAILED: {e}\n")),
+            }
+        }
+        "seedstdiotest" => {
+            // MILESTONE 61: writes this milestone's REAL, externally-
+            // built ELF64 test executable (loader::STDIOTEST_ELF_BYTES,
+            // rustc+rust-lld, not hand-assembled) to a real file
+            // ("stdiotest") on the real on-disk filesystem, exercising
+            // the new string.h + buffered stdio added to libc.rs this
+            // milestone. `runelf` (already generic over any path) is
+            // what actually runs it -- no new run-command needed. The
+            // boot-time self-test already runs the SAME embedded bytes
+            // non-interactively; this is the interactive re-run path.
+            match crate::loader::seed_stdiotest_elf() {
+                Ok(len) => crate::console::write_str(&format!(
+                    "seedstdiotest: wrote {len} real bytes to 'stdiotest' on disk (a genuine ELF64 executable exercising string.h + buffered stdio, not hand-assembled) -- try 'runelf stdiotest'\n"
+                )),
+                Err(e) => crate::console::write_str(&format!("seedstdiotest FAILED: {e}\n")),
+            }
+        }
         "clear" => crate::console::clear_screen(),
         other => {
             // MILESTONE 12/17: variable-argument DSL commands can't be
@@ -699,6 +781,98 @@ fn run_command(cmd: &str) {
             } else if let Some(dir) = other.strip_prefix("ls ") {
                 let target = resolve_arg(dir.trim());
                 print_listing(crate::fs::list(Some(&target)));
+            } else if let Some(rest) = other.strip_prefix("setid ") {
+                // MILESTONE 62: changes the kernel-global "current
+                // identity" -- deliberately NO password/authentication
+                // check (see fs.rs module doc comment for why this is
+                // an explicit testing lever, not a login system).
+                let mut parts = rest.split_whitespace();
+                match (parts.next().and_then(|s| s.parse::<u16>().ok()), parts.next().and_then(|s| s.parse::<u16>().ok()))
+                {
+                    (Some(uid), Some(gid)) => {
+                        crate::fs::set_current_identity(uid, gid);
+                        crate::console::write_str(&format!("identity set to uid={uid} gid={gid}\n"));
+                    }
+                    _ => crate::console::write_str("usage: setid UID GID\n"),
+                }
+            } else if let Some(name) = other.strip_prefix("stat ") {
+                // MILESTONE 63: stat is lstat-shaped -- a symlink shows
+                // as "symlink", not "file"/"directory", and never
+                // follows (see fs.rs module doc comment).
+                let target = resolve_arg(name.trim());
+                match crate::fs::stat(&target) {
+                    Ok(m) => crate::console::write_str(&format!(
+                        "{} {} mode={:o} ({}) uid={} gid={} size={} ctime={} mtime={}\n",
+                        if m.is_symlink { "symlink" } else if m.is_dir { "directory" } else { "file" },
+                        name.trim(),
+                        m.mode,
+                        format_mode_rwx(m.mode),
+                        m.uid,
+                        m.gid,
+                        m.len,
+                        m.ctime,
+                        m.mtime
+                    )),
+                    Err(e) => crate::console::write_str(&format!("stat FAILED: {e}\n")),
+                }
+            } else if let Some(rest) = other.strip_prefix("ln -s ") {
+                // MILESTONE 63: real `ln -s TARGET LINKPATH` -- TARGET
+                // is stored completely verbatim (no CWD resolution, no
+                // existence check), exactly like real symlink(2); only
+                // LINKPATH (where the link itself is created) is
+                // resolved against CWD like every other path argument.
+                match rest.split_once(' ') {
+                    Some((target, linkpath)) => {
+                        let link_target = resolve_arg(linkpath.trim());
+                        match crate::fs::symlink(target, &link_target) {
+                            Ok(()) => crate::console::write_str(&format!(
+                                "created symlink '{}' -> '{target}'\n",
+                                linkpath.trim()
+                            )),
+                            Err(e) => crate::console::write_str(&format!("ln FAILED: {e}\n")),
+                        }
+                    }
+                    None => crate::console::write_str("usage: ln -s TARGET LINKPATH\n"),
+                }
+            } else if let Some(name) = other.strip_prefix("readlink ") {
+                let target = resolve_arg(name.trim());
+                match crate::fs::readlink(&target) {
+                    Ok(t) => crate::console::write_str(&format!("{t}\n")),
+                    Err(e) => crate::console::write_str(&format!("readlink FAILED: {e}\n")),
+                }
+            } else if let Some(rest) = other.strip_prefix("chmod ") {
+                match rest.split_once(' ') {
+                    Some((mode_str, name)) => match u16::from_str_radix(mode_str.trim(), 8) {
+                        Ok(mode) => {
+                            let target = resolve_arg(name.trim());
+                            match crate::fs::chmod(&target, mode) {
+                                Ok(()) => crate::console::write_str(&format!(
+                                    "chmod {:o} '{}'\n",
+                                    mode & 0o777,
+                                    name.trim()
+                                )),
+                                Err(e) => crate::console::write_str(&format!("chmod FAILED: {e}\n")),
+                            }
+                        }
+                        Err(_) => crate::console::write_str("usage: chmod OCTAL_MODE PATH (e.g. chmod 644 file)\n"),
+                    },
+                    None => crate::console::write_str("usage: chmod OCTAL_MODE PATH (e.g. chmod 644 file)\n"),
+                }
+            } else if let Some(rest) = other.strip_prefix("chown ") {
+                let mut parts = rest.split_whitespace();
+                let uid = parts.next().and_then(|s| s.parse::<u16>().ok());
+                let gid = parts.next().and_then(|s| s.parse::<u16>().ok());
+                let name = parts.next();
+                match (uid, gid, name) {
+                    (Some(uid), Some(gid), Some(name)) => {
+                        let target = resolve_arg(name);
+                        match crate::fs::chown(&target, uid, gid) {
+                            Ok(()) => crate::console::write_str(&format!("chown {uid}:{gid} '{name}'\n")),
+                            Err(e) => crate::console::write_str(&format!("chown FAILED: {e}\n")),
+                        }
+                    }
+                    _ => crate::console::write_str("usage: chown UID GID PATH\n"),
+                }
             } else if let Some(rest) = other.strip_prefix("kill ") {
                 // MILESTONE 25: terminates a live task for real -- its
                 // stack gets freed (immediately, or deferred until it's

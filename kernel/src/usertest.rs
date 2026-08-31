@@ -51,9 +51,23 @@
 //! already was for syscall 0: validate/cap the raw pointer+length
 //! arguments and cross the user/kernel memory boundary safely, nothing
 //! filesystem-specific.
+//!
+//! MILESTONE 59: real `errno` -- every syscall arm in `syscall_dispatch`
+//! below that has a real, distinguishable failure reason now calls
+//! `process::set_errno()` alongside its existing bare `u64::MAX`/`0`/`1`
+//! return-value sentinel, using the real POSIX/Linux x86_64 constants
+//! `errno.rs` defines (see that module's own doc comment for exactly
+//! which value applies where and why -- checked call-by-call against
+//! this file). A NEW syscall, 17 (GETERRNO, no arguments), reads a
+//! process's own current errno back -- the thing that actually lets a
+//! userspace program (see `process::ERRNO_TEST_PROGRAM`) distinguish
+//! WHICH of several real failure reasons a bare sentinel used to
+//! collapse into one indistinguishable value.
 
+use crate::errno;
 use crate::gdt;
 use crate::serial;
+use crate::signal;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use x86_64::VirtAddr;
@@ -414,6 +428,61 @@ const MAX_PATH_LEN: u64 = 64;
 /// today.
 const MAX_FD_IO_LEN: u64 = 4096;
 
+/// MILESTONE 60: real headroom (bytes) subtracted from a process's
+/// current, real, hardware-interrupted `rsp` before real signal delivery
+/// injects its trampoline+fake-return-address frame there -- clears the
+/// real 128-byte SysV "red zone" a leaf function may have been using
+/// below its own rsp at the moment it was interrupted (real ABI rule:
+/// a leaf function may use that space without adjusting rsp), plus real,
+/// disclosed extra headroom, same "generous, real, disclosed, not a
+/// tight fit" spirit as MAX_PATH_LEN's own doc comment. The actual frame
+/// this milestone ever writes is 15 bytes (7-byte trampoline + 8-byte
+/// return-address slot) -- 256 is not a tight computation, it's real
+/// safety margin against this kernel's single-page (4 KiB,
+/// `usertest::USER_STACK_SIZE`) user stack ever running this frame off
+/// the mapped page's own bottom for a process that was already deep in
+/// its own stack usage when the signal arrived.
+const SIGNAL_FRAME_GAP: u64 = 256;
+
+/// MILESTONE 59: maps one of `process::exec_elf()`/`exec_elf_with_args()`'s
+/// `Err(&str)` messages (which also cover their shared
+/// `create_process_from_elf()`/`build_argv_envp_stack()` helpers) to the
+/// real errno.rs value that best describes it -- these two functions run
+/// AFTER `elf::parse()` has already succeeded (that earlier failure is
+/// reported as ENOEXEC directly at its own call site, not through this
+/// helper), so every message reaching here is either a genuine resource
+/// exhaustion or a structural rejection of an otherwise-parseable ELF:
+/// - "no such process" / "slot vanished" (defensive -- should not be
+///   reachable in practice, since both call sites already checked
+///   `active != 0` before ever calling in) -> ESRCH, the same
+///   "no live process to operate on" bucket every other defensive
+///   not-actually-reachable case in this file uses.
+/// - "out of physical frames" / "frame allocator not installed" (a real
+///   resource-exhaustion condition, checked against the actual message
+///   text `create_process_from_elf()` returns) -> ENOMEM, the same real
+///   POSIX bucket a real `execve()` uses for "insufficient kernel memory".
+/// - "argv"/"envp" (build_argv_envp_stack()'s own defensive re-check of
+///   the exact same EXEC_ARGV_MAX_COUNT/EXEC_ARG_MAX_LEN bounds syscall 16
+///   already validates before ever calling in) -> E2BIG, matching syscall
+///   16's own E2BIG usage for the identical real cause.
+/// - everything else (create_process_from_elf()'s own structural ELF
+///   rejections: bad segment count/alignment/p4 index/entry-not-in-
+///   segment/etc) -> ENOEXEC, the real POSIX "exec format error" bucket --
+///   the same family as the earlier elf::parse() failure this same
+///   syscall already reports as ENOEXEC, just caught one validation pass
+///   later.
+fn exec_err_errno(msg: &str) -> u64 {
+    if msg.contains("no such process") || msg.contains("slot vanished") {
+        errno::ESRCH
+    } else if msg.contains("out of physical frames") || msg.contains("frame allocator not installed") {
+        errno::ENOMEM
+    } else if msg.contains("argv") || msg.contains("envp") {
+        errno::E2BIG
+    } else {
+        errno::ENOEXEC
+    }
+}
+
 /// Ordinary Rust, called (via a plain "call") from syscall_entry's asm
 /// with rdi = pointer to the just-saved SyscallRegs. Reads the syscall
 /// number from the saved rax; for syscall 0 (MILESTONE 31: write(ptr,
@@ -516,14 +585,36 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 // into its own private heap, at the identical virtual
                 // address HEAP_START every process uses. This is the
                 // real per-process-heap isolation proof.
-                let heap_marker = crate::process::read_active_heap_marker();
-                let _ = writeln!(
-                    serial(),
-                    "milestone 33: syscall WRITE (process {active}) also reads its own private heap at {:#x} -- marker byte {:#04x} ('{}')",
-                    crate::process::HEAP_START,
-                    heap_marker,
-                    heap_marker as char
-                );
+                //
+                // MILESTONE 57: a REAL, pre-existing bug found and fixed
+                // during this milestone's own verification (see
+                // process::heap_page0_mapped()'s own doc comment for the
+                // full story) -- heap page 0 is no longer guaranteed to
+                // be mapped just because a process exists (demand paging
+                // means it's only backed once something actually touches
+                // it), so this now checks FIRST rather than
+                // unconditionally dereferencing it. Most hardcoded test
+                // processes (SIGSEGV_TEST_PROCESS, FAULT_TEST_PROCESS,
+                // WAITSTATUS_TEST_PROCESS, EXEC_TEST_PROCESS, etc.) never
+                // call sbrk() at all, so this is the common case now, not
+                // an edge case -- reported honestly rather than papered
+                // over with a fabricated marker value.
+                if crate::process::heap_page0_mapped(active) {
+                    let heap_marker = crate::process::read_active_heap_marker();
+                    let _ = writeln!(
+                        serial(),
+                        "milestone 33: syscall WRITE (process {active}) also reads its own private heap at {:#x} -- marker byte {:#04x} ('{}')",
+                        crate::process::HEAP_START,
+                        heap_marker,
+                        heap_marker as char
+                    );
+                } else {
+                    let _ = writeln!(
+                        serial(),
+                        "milestone 57: syscall WRITE (process {active}) -- heap page 0 at {:#x} is not mapped yet (this process has never touched its heap -- demand paging means no physical frame exists there to read)",
+                        crate::process::HEAP_START
+                    );
+                }
             }
         }
         1 => {
@@ -604,6 +695,11 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 33: syscall SBRK (process {active}) -- FAILED (requested {size} bytes would exceed this process's fixed per-process heap) -- returning 0"
                         );
+                        // MILESTONE 59: real ENOMEM -- errno.rs's own doc
+                        // comment on ENOMEM names exactly this case
+                        // ("sbrk()'s request would exceed this process's
+                        // fixed per-process heap reservation").
+                        crate::process::set_errno(active, errno::ENOMEM);
                         regs.rax = 0;
                     }
                 }
@@ -612,7 +708,10 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                     serial(),
                     "milestone 33: syscall SBRK called with no active process (plain usertest excursion has no per-process heap mapped) -- ignoring, returning 0"
                 );
-                regs.rax = 0;
+                // MILESTONE 59: no errno set here -- the legacy
+                // ACTIVE_PROCESS==0 excursion has no Process struct at
+                // all to hold one (set_errno(0, ...) would be a real,
+                // silent no-op, not a meaningful ESRCH report).
             }
         }
         3 => {
@@ -643,10 +742,16 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                         serial(),
                         "milestone 35: syscall OPEN called with no active process (plain usertest excursion has no fd table) -- ignoring, returning u64::MAX"
                     );
+                    // MILESTONE 59: no errno storage for the legacy
+                    // ACTIVE_PROCESS==0 path -- see syscall 2's own
+                    // comment above for why.
                     regs.rax = u64::MAX;
                 }
                 (_, Err(_)) => {
                     let _ = writeln!(serial(), "milestone 35: syscall OPEN (process {active}) -- path is not valid UTF-8, returning u64::MAX");
+                    // MILESTONE 59: real EINVAL -- a malformed argument,
+                    // not one of the more specific codes above.
+                    crate::process::set_errno(active, errno::EINVAL);
                     regs.rax = u64::MAX;
                 }
                 (_, Ok(path)) => match crate::process::open_file(active, path) {
@@ -664,6 +769,9 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             "milestone 35: syscall OPEN (process {active}) -- FAILED for path='{path}' (fd table full -- max {} open files per process) -- returning u64::MAX",
                             crate::process::MAX_OPEN_FILES
                         );
+                        // MILESTONE 59: real EMFILE -- errno.rs's own doc
+                        // comment on EMFILE names this exact case.
+                        crate::process::set_errno(active, errno::EMFILE);
                         regs.rax = u64::MAX;
                     }
                 },
@@ -714,6 +822,11 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 35: syscall READ (process {active}) -- FAILED, fd {fd} is not open -- returning u64::MAX"
                         );
+                        // MILESTONE 59: real EBADF -- errno.rs's own doc
+                        // comment on EBADF names read/fdwrite/close/dup/
+                        // dup2 given an fd that doesn't name a
+                        // currently-open descriptor.
+                        crate::process::set_errno(active, errno::EBADF);
                         regs.rax = u64::MAX;
                     }
                 }
@@ -770,6 +883,9 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 35: syscall FDWRITE (process {active}) -- FAILED, fd {fd} is not open -- returning u64::MAX"
                         );
+                        // MILESTONE 59: real EBADF -- same reasoning as
+                        // syscall 4 (READ)'s own EBADF arm above.
+                        crate::process::set_errno(active, errno::EBADF);
                         regs.rax = u64::MAX;
                     }
                 }
@@ -800,6 +916,15 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                         regs.rax = 0;
                     }
                     Some(false) => {
+                        // MILESTONE 59: real EIO -- errno.rs's own doc
+                        // comment on EIO names exactly this case (the
+                        // fd was released, but its real on-disk persist
+                        // failed).
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 35: syscall CLOSE (process {active}) -- fd={fd} released but its real on-disk persist FAILED -- returning status 2"
+                        );
+                        crate::process::set_errno(active, errno::EIO);
                         regs.rax = 2;
                     }
                     None => {
@@ -807,6 +932,9 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 35: syscall CLOSE (process {active}) -- FAILED, fd {fd} was not open -- returning status 1"
                         );
+                        // MILESTONE 59: real EBADF -- same reasoning as
+                        // syscall 4 (READ)'s own EBADF arm above.
+                        crate::process::set_errno(active, errno::EBADF);
                         regs.rax = 1;
                     }
                 }
@@ -845,6 +973,11 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 37: syscall FORK (process {active}) -- FAILED (see process.rs's own log line just above for the real reason) -- returning u64::MAX"
                         );
+                        // MILESTONE 59: real EAGAIN -- errno.rs's own doc
+                        // comment on EAGAIN covers every real cause
+                        // fork() can fail for today (table full, out of
+                        // physical frames, or nested-excursion refusal).
+                        crate::process::set_errno(active, errno::EAGAIN);
                         regs.rax = u64::MAX;
                     }
                 }
@@ -865,6 +998,10 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 let child_pid_arg = regs.rdi;
                 if child_pid_arg > u8::MAX as u64 {
                     let _ = writeln!(serial(), "milestone 37: syscall WAIT (process {active}) -- pid argument {child_pid_arg} out of range -- returning u64::MAX");
+                    // MILESTONE 59: real EINVAL -- the pid argument
+                    // doesn't fit u8, errno.rs's own EINVAL doc names
+                    // this exact case.
+                    crate::process::set_errno(active, errno::EINVAL);
                     regs.rax = u64::MAX;
                 } else {
                     // MILESTONE 43: rax encoding for a successful wait()
@@ -927,6 +1064,11 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                                 serial(),
                                 "milestone 37: syscall WAIT (process {active}) -- FAILED (pid {child_pid_arg} is not a live child of this process, or see process.rs's own log line above) -- returning u64::MAX"
                             );
+                            // MILESTONE 59: real ECHILD -- errno.rs's own
+                            // doc comment on ECHILD names exactly this
+                            // case (wait()'s target pid is not a live
+                            // child of the caller).
+                            crate::process::set_errno(active, errno::ECHILD);
                             regs.rax = u64::MAX;
                         }
                     }
@@ -998,6 +1140,10 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                                         serial(),
                                         "milestone 45: syscall EXEC (process {active}) -- FAILED, {e} -- returning u64::MAX, old program continues running"
                                     );
+                                    // MILESTONE 59: see exec_err_errno()'s
+                                    // own doc comment for the real
+                                    // reasoning behind this mapping.
+                                    crate::process::set_errno(active, exec_err_errno(e));
                                     regs.rax = u64::MAX;
                                 }
                             },
@@ -1006,6 +1152,10 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                                     serial(),
                                     "milestone 45: syscall EXEC (process {active}) -- FAILED, '{path}' is not a valid ELF64 image ({e}) -- returning u64::MAX, old program continues running"
                                 );
+                                // MILESTONE 59: real ENOEXEC -- errno.rs's
+                                // own doc comment on ENOEXEC names
+                                // exactly this case.
+                                crate::process::set_errno(active, errno::ENOEXEC);
                                 regs.rax = u64::MAX;
                             }
                         },
@@ -1014,11 +1164,17 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                                 serial(),
                                 "milestone 37: syscall EXEC (process {active}) -- FAILED, could not read '{path}' off the real on-disk filesystem: {e} -- returning u64::MAX, old program continues running"
                             );
+                            // MILESTONE 59: real ENOENT -- errno.rs's own
+                            // doc comment on ENOENT names exactly this
+                            // case.
+                            crate::process::set_errno(active, errno::ENOENT);
                             regs.rax = u64::MAX;
                         }
                     },
                     Err(_) => {
                         let _ = writeln!(serial(), "milestone 37: syscall EXEC (process {active}) -- path is not valid UTF-8 -- returning u64::MAX");
+                        // MILESTONE 59: real EINVAL -- malformed argument.
+                        crate::process::set_errno(active, errno::EINVAL);
                         regs.rax = u64::MAX;
                     }
                 }
@@ -1060,6 +1216,11 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 40: syscall PIPE (process {active}) -- FAILED (fd table full, or all MAX_PIPES global pipe slots already in use) -- returning u64::MAX"
                         );
+                        // MILESTONE 59: real EMFILE -- errno.rs's own doc
+                        // comment on EMFILE explicitly names pipe()'s fd-
+                        // table-full/pipe-table-full causes alongside
+                        // open()'s.
+                        crate::process::set_errno(active, errno::EMFILE);
                         regs.rax = u64::MAX;
                     }
                 }
@@ -1090,6 +1251,15 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 40: syscall DUP (process {active}) -- FAILED, fd {oldfd} not open or fd table full -- returning u64::MAX"
                         );
+                        // MILESTONE 59: real EBADF -- errno.rs's own doc
+                        // comment on EBADF explicitly names dup/dup2
+                        // alongside read/fdwrite/close (the single
+                        // best-fit real errno for this fd-table
+                        // implementation's collapsed "not open OR table
+                        // full" Option, same disclosed-collapse
+                        // reasoning as EMFILE's own doc comment uses for
+                        // open()/pipe()).
+                        crate::process::set_errno(active, errno::EBADF);
                         regs.rax = u64::MAX;
                     }
                 }
@@ -1123,6 +1293,9 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                             serial(),
                             "milestone 40: syscall DUP2 (process {active}) -- FAILED, fd {oldfd} not open or newfd {newfd} out of range -- returning u64::MAX"
                         );
+                        // MILESTONE 59: real EBADF -- same reasoning as
+                        // syscall 11 (DUP)'s own EBADF arm above.
+                        crate::process::set_errno(active, errno::EBADF);
                         regs.rax = u64::MAX;
                     }
                 }
@@ -1143,6 +1316,9 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 let target_pid_arg = regs.rdi;
                 if target_pid_arg > u8::MAX as u64 {
                     let _ = writeln!(serial(), "milestone 41: syscall KILL (process {active}) -- pid argument {target_pid_arg} out of range -- returning 0");
+                    // MILESTONE 59: real EINVAL -- pid argument doesn't
+                    // fit u8.
+                    crate::process::set_errno(active, errno::EINVAL);
                     regs.rax = 0;
                 } else {
                     let ok = crate::process::kill(active, target_pid_arg as u8);
@@ -1151,6 +1327,12 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                         "milestone 41: syscall KILL (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- target pid {target_pid_arg}, result={ok}",
                         regs.cs
                     );
+                    if !ok {
+                        // MILESTONE 59: real ESRCH -- errno.rs's own doc
+                        // comment on ESRCH explicitly names kill()'s
+                        // target-pid failure alongside getpgid/setpgid.
+                        crate::process::set_errno(active, errno::ESRCH);
+                    }
                     regs.rax = if ok { 1 } else { 0 };
                 }
             }
@@ -1169,6 +1351,9 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 let new_pgid_arg = regs.rsi;
                 if target_pid_arg > u8::MAX as u64 || new_pgid_arg > u8::MAX as u64 {
                     let _ = writeln!(serial(), "milestone 42: syscall SETPGID (process {active}) -- argument out of range -- returning 0");
+                    // MILESTONE 59: real EINVAL -- an argument doesn't
+                    // fit u8.
+                    crate::process::set_errno(active, errno::EINVAL);
                     regs.rax = 0;
                 } else {
                     let ok = crate::process::setpgid(active, target_pid_arg as u8, new_pgid_arg as u8);
@@ -1177,6 +1362,14 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                         "milestone 42: syscall SETPGID (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- target pid {target_pid_arg}, new pgid {new_pgid_arg}, result={ok}",
                         regs.cs
                     );
+                    if !ok {
+                        // MILESTONE 59: real EPERM -- errno.rs's own doc
+                        // comment on EPERM names exactly this case
+                        // (setpgid on a pid that is neither self nor a
+                        // live child of the caller -- process::setpgid()'s
+                        // real authorization check).
+                        crate::process::set_errno(active, errno::EPERM);
+                    }
                     regs.rax = if ok { 1 } else { 0 };
                 }
             }
@@ -1195,6 +1388,9 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 let target_pid_arg = regs.rdi;
                 if target_pid_arg > u8::MAX as u64 {
                     let _ = writeln!(serial(), "milestone 42: syscall GETPGID (process {active}) -- pid argument {target_pid_arg} out of range -- returning u64::MAX");
+                    // MILESTONE 59: real EINVAL -- pid argument doesn't
+                    // fit u8.
+                    crate::process::set_errno(active, errno::EINVAL);
                     regs.rax = u64::MAX;
                 } else {
                     match crate::process::getpgid(target_pid_arg as u8) {
@@ -1208,8 +1404,468 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                         }
                         None => {
                             let _ = writeln!(serial(), "milestone 42: syscall GETPGID (process {active}) -- FAILED, pid {target_pid_arg} not a live process -- returning u64::MAX");
+                            // MILESTONE 59: real ESRCH -- errno.rs's own
+                            // doc comment on ESRCH explicitly names
+                            // getpgid's target-pid failure alongside
+                            // kill/setpgid.
+                            crate::process::set_errno(active, errno::ESRCH);
                             regs.rax = u64::MAX;
                         }
+                    }
+                }
+            }
+        }
+        16 => {
+            // MILESTONE 58: execargv(path_ptr, path_len, argv_ptr,
+            // argv_count, envp_ptr, envp_count) -- rdi=path_ptr,
+            // rsi=path_len (identical to syscall 9's own first two
+            // args), rdx=argv_ptr, r10=argv_count, r8=envp_ptr,
+            // r9=envp_count. `argv_ptr`/`envp_ptr` each point to a
+            // caller-owned array of `argv_count`/`envp_count` 16-byte
+            // entries -- (str_ptr: u64, str_len: u64), the SAME
+            // ptr+len idiom this kernel already uses for every other
+            // string-bearing syscall argument (path, write buffers,
+            // etc.) rather than NUL-terminated C strings -- matching
+            // `#[repr(C)] struct ArgSpec { ptr: u64, len: u64 }` on the
+            // userspace side (see tools/argvlauncher_src/main.rs).
+            // Deliberately a NEW syscall number rather than changing
+            // syscall 9's own ABI: EXEC_TEST_PROGRAM (Milestone 45,
+            // hand-assembled raw machine code) calls syscall 9 with
+            // only rdi/rsi ever set, so extending syscall 9 in place
+            // would have left rdx/r10/r8/r9 as whatever garbage
+            // happened to be in those registers at that hand-assembled
+            // call site -- a real regression risk for zero benefit.
+            // This path is entirely additive; syscall 9's own arm above
+            // is completely unchanged.
+            let path_ptr = regs.rdi;
+            let requested_len = regs.rsi;
+            let argv_ptr = regs.rdx;
+            let argv_count = regs.r10;
+            let envp_ptr = regs.r8;
+            let envp_count = regs.r9;
+            let truncated = requested_len > MAX_PATH_LEN;
+            let len = if truncated { MAX_PATH_LEN } else { requested_len } as usize;
+
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 58: syscall EXECARGV called with no active process -- ignoring, returning u64::MAX");
+                regs.rax = u64::MAX;
+            } else if argv_count as usize > crate::process::EXEC_ARGV_MAX_COUNT || envp_count as usize > crate::process::EXEC_ARGV_MAX_COUNT {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 58: syscall EXECARGV (process {active}) -- FAILED, argv_count={argv_count}/envp_count={envp_count} exceeds this loader's fixed cap {} -- returning u64::MAX",
+                    crate::process::EXEC_ARGV_MAX_COUNT
+                );
+                // MILESTONE 59: real E2BIG -- errno.rs's own doc comment
+                // on E2BIG explicitly names this exact case.
+                crate::process::set_errno(active, errno::E2BIG);
+                regs.rax = u64::MAX;
+            } else {
+                let mut path_bytes = alloc::vec::Vec::with_capacity(len);
+                for i in 0..len {
+                    path_bytes.push(unsafe { core::ptr::read((path_ptr as *const u8).wrapping_add(i)) });
+                }
+
+                // Real strings read through the CALLING process's own
+                // still-active CR3 (this happens BEFORE
+                // process::exec_elf_with_args() tears anything down),
+                // same "read through current CR3" technique syscall 9
+                // already uses for `path` above -- each entry's own
+                // `str_len` is capped at EXEC_ARG_MAX_LEN before the
+                // read, never trusted un-bounded.
+                let read_arg_array = |arr_ptr: u64, count: u64| -> Result<alloc::vec::Vec<alloc::vec::Vec<u8>>, &'static str> {
+                    let mut out = alloc::vec::Vec::with_capacity(count as usize);
+                    for i in 0..count {
+                        let entry_ptr = (arr_ptr as *const u64).wrapping_add((i * 2) as usize);
+                        let str_ptr = unsafe { core::ptr::read(entry_ptr) };
+                        let str_len = unsafe { core::ptr::read(entry_ptr.wrapping_add(1)) };
+                        if str_len as usize > crate::process::EXEC_ARG_MAX_LEN {
+                            return Err("exec: an argv/envp string's declared length exceeds this loader's fixed per-string cap");
+                        }
+                        let mut bytes = alloc::vec::Vec::with_capacity(str_len as usize);
+                        for j in 0..str_len as usize {
+                            bytes.push(unsafe { core::ptr::read((str_ptr as *const u8).wrapping_add(j)) });
+                        }
+                        out.push(bytes);
+                    }
+                    Ok(out)
+                };
+
+                match (read_arg_array(argv_ptr, argv_count), read_arg_array(envp_ptr, envp_count)) {
+                    (Ok(argv), Ok(envp)) => match core::str::from_utf8(&path_bytes) {
+                        Ok(path) => match crate::fs::read_file(path) {
+                            Ok(bytes) => match crate::elf::parse(&bytes) {
+                                Ok(elf_image) => match crate::process::exec_elf_with_args(active, &bytes, &elf_image, argv, envp) {
+                                    Ok((new_entry, new_rsp)) => {
+                                        let _ = writeln!(
+                                            serial(),
+                                            "milestone 58: syscall EXECARGV (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- REAL teardown-and-rebuild from '{path}' WITH real argv/envp, new entry={:#x}, new rsp={:#x}, never returning to the old one",
+                                            regs.cs,
+                                            new_entry,
+                                            new_rsp
+                                        );
+                                        exec_replace_and_enter_with_rsp(new_entry, new_rsp);
+                                    }
+                                    Err(e) => {
+                                        let _ = writeln!(serial(), "milestone 58: syscall EXECARGV (process {active}) -- FAILED, {e} -- returning u64::MAX, old program continues running");
+                                        // MILESTONE 59: see
+                                        // exec_err_errno()'s own doc
+                                        // comment for the real reasoning
+                                        // behind this mapping.
+                                        crate::process::set_errno(active, exec_err_errno(e));
+                                        regs.rax = u64::MAX;
+                                    }
+                                },
+                                Err(e) => {
+                                    let _ = writeln!(serial(), "milestone 58: syscall EXECARGV (process {active}) -- FAILED, '{path}' is not a valid ELF64 image ({e}) -- returning u64::MAX, old program continues running");
+                                    // MILESTONE 59: real ENOEXEC -- same
+                                    // reasoning as syscall 9 (EXEC)'s own
+                                    // elf::parse() failure arm.
+                                    crate::process::set_errno(active, errno::ENOEXEC);
+                                    regs.rax = u64::MAX;
+                                }
+                            },
+                            Err(e) => {
+                                let _ = writeln!(serial(), "milestone 58: syscall EXECARGV (process {active}) -- FAILED, could not read '{path}' off the real on-disk filesystem: {e} -- returning u64::MAX, old program continues running");
+                                // MILESTONE 59: real ENOENT -- same
+                                // reasoning as syscall 9 (EXEC)'s own
+                                // read_file() failure arm.
+                                crate::process::set_errno(active, errno::ENOENT);
+                                regs.rax = u64::MAX;
+                            }
+                        },
+                        Err(_) => {
+                            let _ = writeln!(serial(), "milestone 58: syscall EXECARGV (process {active}) -- path is not valid UTF-8 -- returning u64::MAX");
+                            // MILESTONE 59: real EINVAL -- malformed
+                            // argument.
+                            crate::process::set_errno(active, errno::EINVAL);
+                            regs.rax = u64::MAX;
+                        }
+                    },
+                    (Err(e), _) | (_, Err(e)) => {
+                        let _ = writeln!(serial(), "milestone 58: syscall EXECARGV (process {active}) -- FAILED reading argv/envp from the calling process's own memory: {e} -- returning u64::MAX");
+                        // MILESTONE 59: real E2BIG -- this specific `Err`
+                        // (from `read_arg_array`'s own closure above) is
+                        // ALWAYS a per-string length exceeding
+                        // EXEC_ARG_MAX_LEN, the same real cause
+                        // errno.rs's own E2BIG doc comment already names
+                        // for this syscall.
+                        crate::process::set_errno(active, errno::E2BIG);
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
+        17 => {
+            // MILESTONE 59: geterrno() -- takes no arguments. Returns
+            // this process's own real, sticky `Process::errno` field
+            // (see that field's own doc comment for the exact "process-
+            // local, never cleared on success" semantics) -- u64::MAX if
+            // there is no active process to query (the legacy
+            // ACTIVE_PROCESS==0 excursion has no Process struct at all,
+            // so there is genuinely no errno to read back, the same
+            // honest "nothing meaningful to report" reasoning every
+            // other no-active-process arm above already uses, just with
+            // u64::MAX instead of 0 since a real errno value IS being
+            // returned here, not a yes/no result).
+            if active == 0 {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 59: syscall GETERRNO called with no active process (plain usertest excursion has no errno field) -- ignoring, returning u64::MAX"
+                );
+                regs.rax = u64::MAX;
+            } else {
+                let value = crate::process::get_errno(active);
+                let _ = writeln!(
+                    serial(),
+                    "milestone 59: syscall GETERRNO (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- errno={value} ({})",
+                    regs.cs,
+                    errno::name(value)
+                );
+                regs.rax = value;
+            }
+        }
+        18 => {
+            // MILESTONE 60: sigaction(signum, handler) -- rdi=signum,
+            // rsi=handler (a real user-space address; 0 clears back to
+            // SIG_DFL). Returns 1 on success, 0 on failure, same
+            // convention KILL/SETPGID already established. See
+            // process::sigaction()'s own doc comment for the real
+            // SIGKILL-refusal rule this enforces.
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 60: syscall SIGACTION called with no active process -- ignoring, returning 0");
+                regs.rax = 0;
+            } else {
+                let signum_arg = regs.rdi;
+                let handler_arg = regs.rsi;
+                if signum_arg > u8::MAX as u64 {
+                    let _ = writeln!(serial(), "milestone 60: syscall SIGACTION (process {active}) -- signum argument {signum_arg} out of range -- returning 0");
+                    crate::process::set_errno(active, errno::EINVAL);
+                    regs.rax = 0;
+                } else {
+                    match crate::process::sigaction(active, signum_arg as u8, handler_arg) {
+                        Ok(()) => {
+                            let _ = writeln!(
+                                serial(),
+                                "milestone 60: syscall SIGACTION (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- signum {signum_arg} ({}), handler={:#x}",
+                                regs.cs,
+                                signal::name(signum_arg as u8),
+                                handler_arg
+                            );
+                            regs.rax = 1;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(serial(), "milestone 60: syscall SIGACTION (process {active}) -- REFUSED, {e} -- returning 0");
+                            // MILESTONE 60: real EINVAL for both of
+                            // sigaction()'s own reject reasons (signum
+                            // out of range, or SIGKILL) -- "no such
+                            // process" is defensively unreachable here
+                            // (active != 0 was already checked above),
+                            // same discipline errno.rs's own ESRCH doc
+                            // comment already applies elsewhere.
+                            crate::process::set_errno(active, errno::EINVAL);
+                            regs.rax = 0;
+                        }
+                    }
+                }
+            }
+        }
+        19 => {
+            // MILESTONE 60: sigsend(target_pid, signum) -- real signal
+            // raising -- rdi=target pid, rsi=signum. Returns 1 on
+            // success, 0 on failure, same convention as KILL/SETPGID/
+            // SIGACTION above. See process::raise_signal()'s own doc
+            // comment for the real authorization rule (self or a live
+            // child), the SIGKILL special-case routing to the pre-
+            // existing kill() path, and this milestone's own disclosed
+            // "no default-disposition table" scope cut.
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 60: syscall SIGSEND called with no active process -- ignoring, returning 0");
+                regs.rax = 0;
+            } else {
+                let target_pid_arg = regs.rdi;
+                let signum_arg = regs.rsi;
+                if target_pid_arg > u8::MAX as u64 || signum_arg > u8::MAX as u64 {
+                    let _ = writeln!(serial(), "milestone 60: syscall SIGSEND (process {active}) -- argument out of range -- returning 0");
+                    crate::process::set_errno(active, errno::EINVAL);
+                    regs.rax = 0;
+                } else {
+                    match crate::process::raise_signal(active, target_pid_arg as u8, signum_arg as u8) {
+                        Ok(()) => {
+                            let _ = writeln!(
+                                serial(),
+                                "milestone 60: syscall SIGSEND (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- target pid {target_pid_arg}, signum {signum_arg} ({}) raised",
+                                regs.cs,
+                                signal::name(signum_arg as u8)
+                            );
+                            regs.rax = 1;
+                        }
+                        Err(e) => {
+                            let _ = writeln!(serial(), "milestone 60: syscall SIGSEND (process {active}) -- REFUSED, {e} -- returning 0");
+                            // MILESTONE 60: real errno picked by cause,
+                            // checked against raise_signal()'s own actual
+                            // Err messages -- "signum out of range" is a
+                            // real EINVAL; "not authorized" mirrors
+                            // SETPGID's own EPERM usage for the identical
+                            // real authorization rule; "SIGKILL delivery
+                            // failed"/"no such process" both mean no live
+                            // target, ESRCH, same bucket KILL/GETPGID
+                            // already use. "no handler registered" has no
+                            // precise real POSIX equivalent (a real
+                            // kill() always succeeds -- some default
+                            // disposition always exists there, which this
+                            // kernel doesn't implement yet, disclosed on
+                            // raise_signal()'s own doc comment) -- EINVAL
+                            // is the closest available real code, an
+                            // honestly imperfect fit, same disclosed-
+                            // imprecision spirit as errno.rs's own EMFILE
+                            // doc comment.
+                            let code = if e.contains("signum out of range") {
+                                errno::EINVAL
+                            } else if e.contains("not authorized") {
+                                errno::EPERM
+                            } else if e.contains("SIGKILL delivery failed") || e.contains("no such process") {
+                                errno::ESRCH
+                            } else {
+                                errno::EINVAL
+                            };
+                            crate::process::set_errno(active, code);
+                            regs.rax = 0;
+                        }
+                    }
+                }
+            }
+        }
+        20 => {
+            // MILESTONE 60: sigreturn() -- takes no arguments. Real
+            // unwind-back-out-of-a-handler mechanism: restores the FULL
+            // hardware-interrupted context (see process::
+            // SavedSignalContext's own doc comment) `usertest.rs` itself
+            // stashed the moment it redirected execution into the
+            // handler this call is unwinding out of, resuming exactly
+            // where the signal preempted it -- SysV argument/return
+            // registers included, not just rip/rflags/rsp.
+            if active == 0 {
+                let _ = writeln!(serial(), "milestone 60: syscall SIGRETURN called with no active process -- ignoring");
+            } else {
+                match crate::process::take_saved_signal_context(active) {
+                    Some(ctx) => {
+                        regs.r15 = ctx.r15;
+                        regs.r14 = ctx.r14;
+                        regs.r13 = ctx.r13;
+                        regs.r12 = ctx.r12;
+                        regs.r11 = ctx.r11;
+                        regs.r10 = ctx.r10;
+                        regs.r9 = ctx.r9;
+                        regs.r8 = ctx.r8;
+                        regs.rbp = ctx.rbp;
+                        regs.rdi = ctx.rdi;
+                        regs.rsi = ctx.rsi;
+                        regs.rdx = ctx.rdx;
+                        regs.rcx = ctx.rcx;
+                        regs.rbx = ctx.rbx;
+                        regs.rax = ctx.rax;
+                        regs.rip = ctx.rip;
+                        regs.rflags = ctx.rflags;
+                        regs.rsp = ctx.rsp;
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 60: syscall SIGRETURN (process {active}) -- real context restored, resuming at rip={:#x} rsp={:#x}",
+                            ctx.rip,
+                            ctx.rsp
+                        );
+                    }
+                    None => {
+                        // MILESTONE 60: a stray SIGRETURN with no matching
+                        // dispatch in flight -- real POSIX territory this
+                        // kernel just refuses honestly (see
+                        // take_saved_signal_context()'s own doc comment)
+                        // rather than restoring garbage: `regs` is left
+                        // completely untouched, so this int 0x80 simply
+                        // "returns" normally to whatever instruction
+                        // follows it in the CALLER's own code, same as any
+                        // other syscall that declines to act.
+                        let _ = writeln!(serial(), "milestone 60: syscall SIGRETURN (process {active}) -- REFUSED, no handler dispatch in flight for this process -- context left untouched");
+                        crate::process::set_errno(active, errno::EINVAL);
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
+        21 => {
+            // MILESTONE 64: mmap(fd) -> vaddr (u64::MAX on failure). rdi
+            // = fd. Real, bounded first slice -- see process.rs's own
+            // Milestone 64 module-level doc comment for the full scoping
+            // reasoning. Maps `fd`'s ALREADY-BUFFERED content (open()
+            // already read the whole file at open() time) read-only into
+            // a fresh slot of this process's own mmap table -- no
+            // physical frame is actually mapped until a real hardware
+            // page fault demand-pages it (process::try_demand_page_mmap(),
+            // wired into interrupts.rs's page_fault_handler()).
+            let fd = regs.rdi;
+            if active == 0 {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 64: syscall MMAP called with no active process (plain usertest excursion has no fd table or mmap table) -- ignoring, returning u64::MAX"
+                );
+                regs.rax = u64::MAX;
+            } else {
+                match crate::process::mmap_file(active, fd) {
+                    Some(addr) => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 64: syscall MMAP (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- fd={fd} -> {addr:#x}",
+                            regs.cs
+                        );
+                        regs.rax = addr;
+                    }
+                    None => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 64: syscall MMAP (process {active}) -- FAILED for fd={fd} (fd not open, not a real file, oversized content, or this process's mmap table is full) -- returning u64::MAX"
+                        );
+                        // MILESTONE 64: real ENOMEM -- best-fit real
+                        // errno for "no room for this mapping" (this
+                        // slice's None doesn't separately distinguish
+                        // "bad fd" from "table full", so the single
+                        // best-fit code is chosen honestly, same
+                        // reasoning as EMFILE's own doc comment in
+                        // errno.rs for a similarly-collapsed cause set).
+                        crate::process::set_errno(active, errno::ENOMEM);
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
+        22 => {
+            // MILESTONE 64: munmap(addr) -> status (0=success,
+            // u64::MAX=failure). rdi = addr. `addr` must be exactly a
+            // live slot's own base address -- see
+            // process::munmap_region()'s own doc comment for the full
+            // "why exact-match is the honest, complete check here"
+            // reasoning.
+            let addr = regs.rdi;
+            if active == 0 {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 64: syscall MUNMAP called with no active process (plain usertest excursion has no mmap table) -- ignoring, returning u64::MAX"
+                );
+                regs.rax = u64::MAX;
+            } else if crate::process::munmap_region(active, addr) {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 64: syscall MUNMAP (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- addr={addr:#x} unmapped successfully",
+                    regs.cs
+                );
+                regs.rax = 0;
+            } else {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 64: syscall MUNMAP (process {active}) -- FAILED, addr={addr:#x} does not name any of this process's own live mmap slots -- returning u64::MAX"
+                );
+                crate::process::set_errno(active, errno::EINVAL);
+                regs.rax = u64::MAX;
+            }
+        }
+        23 => {
+            // MILESTONE 65: mmap_writable(fd) -> vaddr (u64::MAX on
+            // failure). rdi = fd. Real `PROT_WRITE` first slice on top of
+            // Milestone 64's own read-only `mmap()` -- see process.rs's
+            // own Milestone 65 doc comments on `MmapSlot`/
+            // `mmap_file_writable()`/`try_demand_page_mmap()` for the full
+            // scoping reasoning. A DISTINCT syscall number from 21
+            // (deliberately, not a new argument bolted onto mmap(fd)'s
+            // existing rdi-only calling convention) so every one of
+            // Milestone 64's own four hand-assembled test programs stays
+            // byte-for-byte unmodified and their own self-test keeps
+            // proving exactly what it always did, with zero risk of an
+            // accidentally-nonzero leftover register in one of them being
+            // misread as a new argument.
+            let fd = regs.rdi;
+            if active == 0 {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 65: syscall MMAP_WRITABLE called with no active process (plain usertest excursion has no fd table or mmap table) -- ignoring, returning u64::MAX"
+                );
+                regs.rax = u64::MAX;
+            } else {
+                match crate::process::mmap_file_writable(active, fd) {
+                    Some(addr) => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 65: syscall MMAP_WRITABLE (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- fd={fd} -> {addr:#x}",
+                            regs.cs
+                        );
+                        regs.rax = addr;
+                    }
+                    None => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 65: syscall MMAP_WRITABLE (process {active}) -- FAILED for fd={fd} (fd not open, not a real file, oversized content, or this process's mmap table is full) -- returning u64::MAX"
+                        );
+                        // MILESTONE 65: same real, best-fit ENOMEM
+                        // reasoning as syscall 21's own MMAP arm.
+                        crate::process::set_errno(active, errno::ENOMEM);
+                        regs.rax = u64::MAX;
                     }
                 }
             }
@@ -1219,6 +1875,87 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 serial(),
                 "milestone 27: unknown syscall {other} from CPL={hardware_cpl} -- ignoring"
             );
+        }
+    }
+
+    // MILESTONE 60: real signal delivery -- checked ONCE, here, at the
+    // tail of EVERY syscall's return-to-userspace (the one real kernel/
+    // user boundary this synchronous, one-ring-3-excursion-at-a-time
+    // kernel actually has -- see process::take_deliverable_signal()'s own
+    // doc comment for why this is the correct, complete delivery point
+    // and not a partial stand-in). Naturally skipped for syscall 1
+    // (exit): that arm diverges straight into resume_kernel() and never
+    // reaches this point at all. Skipped when `active == 0` for the same
+    // reason every other process-scoped syscall above already skips it:
+    // the legacy bare `usertest` excursion has no Process struct to hold
+    // signal state in.
+    if active != 0 {
+        if let Some((signum, handler_addr)) = crate::process::take_deliverable_signal(active) {
+            // Stash the COMPLETE interrupted context before touching
+            // anything -- SIGRETURN (syscall 20, above) hands this back
+            // verbatim later.
+            let saved = crate::process::SavedSignalContext {
+                r15: regs.r15,
+                r14: regs.r14,
+                r13: regs.r13,
+                r12: regs.r12,
+                r11: regs.r11,
+                r10: regs.r10,
+                r9: regs.r9,
+                r8: regs.r8,
+                rbp: regs.rbp,
+                rdi: regs.rdi,
+                rsi: regs.rsi,
+                rdx: regs.rdx,
+                rcx: regs.rcx,
+                rbx: regs.rbx,
+                rax: regs.rax,
+                rip: regs.rip,
+                rflags: regs.rflags,
+                rsp: regs.rsp,
+            };
+            crate::process::stash_signal_context(active, saved);
+
+            // Real trampoline injection: builds a small, genuine "fake
+            // call frame" directly on the SAME process's own already-
+            // mapped user stack, through whatever CR3 is CURRENTLY
+            // loaded -- this kernel is already, at this exact point,
+            // running under the interrupted process's own page tables
+            // (no CR3 switch happens for an ordinary syscall return), so
+            // this is the SAME direct-user-pointer-write technique the
+            // `read`/`fdwrite` syscall arms above already use for a
+            // caller-supplied buffer, just writing fixed bytes instead of
+            // syscall-supplied ones. `SIGNAL_FRAME_GAP` clears the real
+            // 128-byte SysV red zone a leaf function may have been using
+            // below its own rsp at the moment it was interrupted, plus
+            // real headroom; 16-aligning `frame_top` and placing the
+            // pushed return-address VALUE 8 bytes below it gives the
+            // handler an entry `rsp` that is `frame_top - 8` -- exactly
+            // `rsp mod 16 == 8`, the real SysV ABI invariant a function
+            // expects to see immediately after being `call`ed.
+            let old_rsp = regs.rsp;
+            let frame_top = (old_rsp - SIGNAL_FRAME_GAP) & !0xF;
+            // mov eax, 20 (sigreturn); int 0x80 -- the real trampoline a
+            // handler's own `ret` lands on once it's done.
+            let trampoline: [u8; 7] = [0xB8, 20, 0x00, 0x00, 0x00, 0xCD, 0x80];
+            for (i, b) in trampoline.iter().enumerate() {
+                unsafe { core::ptr::write((frame_top as *mut u8).wrapping_add(i), *b) };
+            }
+            let return_addr_slot = frame_top - 8;
+            unsafe { core::ptr::write(return_addr_slot as *mut u64, frame_top) };
+
+            let _ = writeln!(
+                serial(),
+                "milestone 60: real signal delivery -- process {active} redirected into handler {:#x} for signum {signum} ({}), interrupted rip={:#x} saved, trampoline frame at {:#x}",
+                handler_addr,
+                signal::name(signum),
+                regs.rip,
+                frame_top
+            );
+
+            regs.rip = handler_addr;
+            regs.rdi = signum as u64;
+            regs.rsp = return_addr_slot;
         }
     }
 }
@@ -1542,5 +2279,26 @@ pub(crate) fn exec_replace_and_enter(user_rip: u64) -> ! {
     let rflags: u64 = 0x202;
     unsafe {
         exec_into_ring3(user_stack_top, user_rip, user_cs, user_ss, rflags);
+    }
+}
+
+/// MILESTONE 58: identical to `exec_replace_and_enter()` above (same
+/// `exec_into_ring3()` mechanism, same CS/SS/RFLAGS setup), except the
+/// caller supplies the exact initial RSP to enter with instead of this
+/// always defaulting to the bare `USER_STACK_ADDR + USER_STACK_SIZE`
+/// top-of-stack. Real reason this exists as its own function rather
+/// than a parameter added to `exec_replace_and_enter()`: the plain
+/// path's every call site (syscall 9) has nothing useful to pass but
+/// the fresh top-of-stack anyway, so keeping that call site's own
+/// signature unchanged is real, zero-risk backward compatibility, not
+/// just tidiness. Used by syscall 16 (EXECARGV) with the RSP
+/// `process::exec_elf_with_args()` -> `build_argv_envp_stack()` already
+/// computed and populated with a real argv/envp block.
+pub(crate) fn exec_replace_and_enter_with_rsp(user_rip: u64, user_rsp: u64) -> ! {
+    let user_cs = gdt::user_code_selector().0 as u64;
+    let user_ss = gdt::user_data_selector().0 as u64;
+    let rflags: u64 = 0x202;
+    unsafe {
+        exec_into_ring3(user_rsp, user_rip, user_cs, user_ss, rflags);
     }
 }

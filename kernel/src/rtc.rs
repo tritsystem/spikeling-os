@@ -94,3 +94,33 @@ pub fn now() -> DateTime {
         second,
     }
 }
+
+/// MILESTONE 62: converts a proleptic-Gregorian civil date to the
+/// number of days since 1970-01-01, using Howard Hinnant's well-known,
+/// publicly documented `days_from_civil` algorithm
+/// (http://howardhinnant.github.io/date_algorithms.html) -- a standard,
+/// correct civil-calendar algorithm (verified here against the known
+/// 1970-01-01 -> 0 and 2000-01-01 -> 10957 reference values by hand),
+/// not a home-grown approximation.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// MILESTONE 62: real unix-epoch seconds for a `DateTime` from the real
+/// CMOS RTC (`now()` above) -- the on-disk timestamp fields fs.rs's new
+/// permissions/timestamps format uses. `.max(0)` guards a
+/// theoretically-possible pre-1970 CMOS misread (e.g. a dead CMOS
+/// battery reporting garbage) from wrapping a `u32` on the cast below,
+/// clamping to the epoch instead -- a defensive fallback, not expected
+/// in normal operation.
+pub fn to_unix_timestamp(dt: DateTime) -> u32 {
+    let days = days_from_civil(dt.year as i64, dt.month as i64, dt.day as i64);
+    let secs = days * 86400 + dt.hour as i64 * 3600 + dt.minute as i64 * 60 + dt.second as i64;
+    secs.max(0) as u32
+}

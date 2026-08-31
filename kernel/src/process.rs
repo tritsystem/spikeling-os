@@ -218,9 +218,11 @@
 //! this milestone's own report for the real captured serial log.
 
 use crate::elf;
+use crate::errno;
 use crate::fs;
 use crate::memory;
 use crate::serial;
+use crate::signal;
 use crate::usertest;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -251,12 +253,110 @@ pub(crate) const MAX_CODE_IMAGE_BYTES: usize = PAGE_SIZE;
 /// or stack page, with 256 MiB of headroom either side. Fully disjoint
 /// from the kernel's own heap (`allocator::HEAP_START`, p4_index 136).
 pub const HEAP_START: u64 = 0x_5555_7000_0000;
-/// Four 4 KiB pages (16 KiB), pre-mapped once at create_process() time
-/// -- fixed and bounded on purpose: `sbrk` bumps within this pre-mapped
-/// region and fails cleanly once exhausted, it never grows the mapping
-/// itself. No free/realloc, bump-only.
-const HEAP_PAGE_COUNT: u64 = 4;
+/// MILESTONE 57: 64 4 KiB pages (256 KiB) of RESERVED virtual address
+/// space -- `sbrk` still bumps within this fixed bound and fails cleanly
+/// once exhausted (same "no free/realloc, bump-only" scope as before),
+/// but as of this milestone the pages themselves are no longer
+/// pre-mapped up front. Only bookkeeping (`heap_used`) claims virtual
+/// range at `sbrk()` time; a real physical frame is allocated and mapped
+/// for a given page ONLY the first time a real hardware page fault
+/// touches it (see `try_demand_page_heap()`) -- genuine demand paging,
+/// not "reserve == pay". This is why the reservation could grow 16x (4
+/// pages -> 64) for zero eager physical cost: before Milestone 57 this
+/// same 64-page bound would have cost every process 256 KiB of real
+/// physical memory at creation whether it ever touched its heap or not;
+/// now a process that never calls `sbrk()` maps zero heap frames, ever.
+const HEAP_PAGE_COUNT: u64 = 64;
 const HEAP_SIZE: u64 = HEAP_PAGE_COUNT * PAGE_SIZE as u64;
+
+/// MILESTONE 64: real, bounded read-only file-backed `mmap()` -- the
+/// "next real VM increment" the Tier 2 roadmap (see Milestone 63's own
+/// dependency-reasoning writeup) named as a bigger, multi-subsystem lift
+/// than a single milestone slice normally takes. Deliberately scoped down
+/// to the smallest HONEST first slice rather than attempted whole: no
+/// `PROT_WRITE`, no copy-on-write, no shared/anonymous mappings, no
+/// `MAP_FIXED`/arbitrary length/offset -- exactly ONE real property, done
+/// for real: mapping an already-open fd's file content READ-ONLY into a
+/// fresh virtual range, backed by a genuine hardware page fault on first
+/// touch (the SAME `try_demand_page_heap()`/`page_fault_handler()`
+/// mechanism Milestone 57 built, generalized to a second kind of
+/// eligible fault rather than a second unrelated implementation), with
+/// the read-only-ness enforced by REAL hardware page-table permission
+/// bits, not just an OS-level check -- proven by a write attempt genuinely
+/// hardware-faulting and terminating the process, exactly like Milestone
+/// 41's SIGSEGV path already does for every other illegal access.
+///
+/// **Why this is a real, bounded slice, not a stub**: `fs::MAX_FILE_BYTES`
+/// (4096 bytes -- see that constant's own comment) is EXACTLY `PAGE_SIZE`,
+/// so "map one already-open file" and "map one page" are the same
+/// operation here -- no partial-page/multi-page complexity to fake or
+/// defer. `OpenFile` (this file's own Milestone 35 struct) already
+/// buffers a file's ENTIRE real content in memory at open() time, so
+/// `mmap_file()` below needs no new disk-reading code at all -- it
+/// snapshots that already-real buffer into a new, dedicated per-slot
+/// store (see `MmapSlot`'s own doc comment for why a snapshot, not a
+/// live view, is this slice's one disclosed, honest simplification).
+///
+/// **Virtual range**: `MMAP_START` sits 256 MiB past `HEAP_START` --
+/// comfortably clear of the heap's own 64-page (256 KiB) reservation --
+/// while still sharing p4_index 170 with `USER_CODE_ADDR`/
+/// `USER_STACK_ADDR`/`HEAP_START` (verified the same way `HEAP_START`'s
+/// own comment already verifies theirs: `(addr >> 39) & 0x1FF == 170` for
+/// all four), which matters concretely: `reclaim_private_page_tables()`
+/// only ever walks `user_p4_index`'s own PML4 slot when freeing a dead
+/// process's P3/P2/P1 table frames (see its own doc comment on why that's
+/// safe) -- an mmap region living in a DIFFERENT p4_index would silently
+/// leak its own page-table frames on every process teardown, a real bug
+/// this milestone's own frame-reclaim self-test extension below is
+/// designed to catch.
+pub(crate) const MMAP_START: u64 = HEAP_START + 0x1000_0000;
+/// MILESTONE 64: real, small, fixed bound on concurrent mmap regions per
+/// process -- same "small fixed cap, not full generality" discipline as
+/// `MAX_OPEN_FILES`/`MAX_PROCESSES` elsewhere in this file. 4 is
+/// comfortably more than this milestone's own self-test ever has mapped
+/// at once (exactly one at a time, per test process) while leaving real
+/// headroom. `mmap_file()` returns a real, disclosed ENOMEM failure once
+/// a process's own table is full, rather than growing without bound.
+pub(crate) const MAX_MMAPS: usize = 4;
+/// MILESTONE 64: same real, enforced (not just documented) reasoning as
+/// `_ASSERT_MAX_OPEN_FILES_IS_4` -- both `Process` constructors hardcode
+/// `[None, None, None, None]` for `mmaps` (no `Clone`/`Copy` on
+/// `MmapSlot`'s `Vec<u8>` field means the `[None; N]` repeat shorthand
+/// isn't available), so a future change to `MAX_MMAPS` without updating
+/// those literals fails the BUILD, not silently truncating a process's
+/// mmap table.
+const _ASSERT_MAX_MMAPS_IS_4: () = assert!(MAX_MMAPS == 4);
+
+/// MILESTONE 64: one process's own mmap region -- `content` is a REAL
+/// snapshot of the backing fd's `OpenFile::buffer` at the moment
+/// `mmap()` was called (never re-read from the fd afterward, and never
+/// written back to it either -- see this struct's own "disclosed scope
+/// cuts" in the Milestone 64 module-level writeup for why that's an
+/// honest simplification given this slice's read-only, no-COW scope, not
+/// a hidden one), always `<= PAGE_SIZE` bytes since `fs::MAX_FILE_BYTES
+/// == PAGE_SIZE` (checked, not assumed, by `mmap_file()` before ever
+/// creating a slot). `frame` is `None` until the FIRST real hardware page
+/// fault demand-pages it (`try_demand_page_mmap()`) -- exactly
+/// `heap_frames`'s own `Option<PhysFrame<_>>` sparse-until-touched
+/// pattern, reused rather than reinvented.
+/// MILESTONE 65: `writable` extends Milestone 64's own `MmapSlot` with
+/// real, per-slot `PROT_WRITE` support -- a private (never written back
+/// to the fd, never shared with another mapping -- see `mmap_file()`'s
+/// own "why this is real `MAP_PRIVATE`, not `MAP_SHARED`" reasoning)
+/// writable mapping, the first item of Milestone 64's own disclosed
+/// "real future work" list. `false` (Milestone 64's original read-only
+/// behavior) for every slot created through `mmap_file()`; `true` only
+/// for a slot created through this milestone's new `mmap_file_writable()`
+/// -- `try_demand_page_mmap()` is the ONE place that reads this field,
+/// and only to decide the page-table `WRITABLE` bit and whether a
+/// first-touch WRITE fault is refused or serviced (see that function's
+/// own updated doc comment).
+#[derive(Clone)]
+struct MmapSlot {
+    content: Vec<u8>,
+    frame: Option<PhysFrame<Size4KiB>>,
+    writable: bool,
+}
 
 /// MILESTONE 33: hand-assembled machine code copied into each process's
 /// code page INSTEAD of usertest::USER_PROGRAM (which stays completely
@@ -381,8 +481,9 @@ struct OpenFile {
 
 /// MILESTONE 35: real, bounded per-process fd table size. Fixed at 4,
 /// matching this project's existing "small fixed bound with an honest
-/// disclosed limit" style (heap_frames' own HEAP_PAGE_COUNT=4 is the
-/// direct precedent) rather than a dynamically-growing Vec<Option<..>>
+/// disclosed limit" style (heap_frames' own HEAP_PAGE_COUNT is the
+/// direct precedent -- 4 at the time this comment was written, 64 as of
+/// Milestone 57) rather than a dynamically-growing Vec<Option<..>>
 /// of open files -- 4 is comfortably more than this milestone's own test
 /// program ever has open at once (at most 2: one read-only fd against an
 /// existing file, one write fd against a new one, opened and closed in
@@ -561,12 +662,21 @@ pub struct Process {
     pml4_frame: PhysFrame<Size4KiB>,
     code_frame: PhysFrame<Size4KiB>,
     stack_frame: PhysFrame<Size4KiB>,
-    /// MILESTONE 33: this process's own private heap frames, in mapping
-    /// order (heap_frames[0] backs HEAP_START, etc.) -- kept around (not
-    /// just mapped-and-forgotten) as real per-process kernel-side state,
-    /// the kind a future general program loader (Milestone 34) would
-    /// need for its own bookkeeping.
-    heap_frames: Vec<PhysFrame<Size4KiB>>,
+    /// MILESTONE 33/57: this process's own private heap frames, ALWAYS
+    /// exactly `HEAP_PAGE_COUNT` entries long, indexed by heap page number
+    /// (`heap_frames[i]` backs `HEAP_START + i*PAGE_SIZE`). As of
+    /// Milestone 57 this is genuinely sparse -- `None` means "reserved
+    /// virtual range, no physical frame backing it yet" (the common case
+    /// for most of a fresh process's life), `Some(frame)` means a real
+    /// hardware page fault already demand-paged that specific page (see
+    /// `try_demand_page_heap()`). Before Milestone 57 this was a plain
+    /// `Vec<PhysFrame<_>>`, always fully populated at process-creation
+    /// time -- callers that only cared about "how many heap frames does
+    /// this process actually have mapped right now" (e.g. Milestone 54's
+    /// own frame-reclaim self-test) now count `Some` entries rather than
+    /// reading `.len()` directly, since `.len()` is now always
+    /// `HEAP_PAGE_COUNT` regardless of how many pages are really backed.
+    heap_frames: Vec<Option<PhysFrame<Size4KiB>>>,
     /// MILESTONE 33: bump offset (bytes, from HEAP_START) of this
     /// process's next `sbrk` allocation -- persists across repeated
     /// `runproc` calls for the SAME process (never reset), so re-running
@@ -587,12 +697,29 @@ pub struct Process {
     /// is specifically whichever mapped page backs USER_CODE_ADDR --
     /// see create_process_from_elf()). Always empty for the flat-binary
     /// path (create_process_from_image/create_process): a flat image is
-    /// still exactly one code page, so it never needs this. Kept around
-    /// for the same "real per-process kernel-side bookkeeping, not
-    /// mapped-and-forgotten" reasoning as `heap_frames` above -- nothing
-    /// currently reads this back out, same as `heap_frames`, but it'''s
-    /// real, live state rather than silently dropped/leaked bookkeeping.
-    extra_frames: Vec<PhysFrame<Size4KiB>>,
+    /// still exactly one code page, so it never needs this.
+    ///
+    /// MILESTONE 69: now carries each page's real `VirtAddr` alongside
+    /// its frame (was `Vec<PhysFrame<Size4KiB>>` alone) -- a real, honest
+    /// bug found and fixed by this milestone's own end-to-end
+    /// verification, not a speculative generalization: `fork()` only ever
+    /// copied `code_frame` (page 0) and `stack_frame`, silently leaving a
+    /// forked child with NO mapping at all for any of a multi-page
+    /// ELF-loaded process's OTHER code pages -- invisible for every prior
+    /// milestone's own fork() self-test (every process that ever called
+    /// fork() before this one fit in a single 4 KiB code page), but a
+    /// real, hardware-recorded `SIGSEGV`/`INSTRUCTION_FETCH` page fault
+    /// the moment cc.elf (now 3 real code pages, Milestone 67/68/69
+    /// combined) forked itself to exec() a freshly-compiled program and
+    /// the child's resume `rip` happened to land on page 1 or 2. Fixed by
+    /// giving fork() (see `fork_build_child()`) the real vaddr it needs
+    /// to remap each extra page at the SAME address in the child's own
+    /// private PML4, not just its bytes -- previously nothing read this
+    /// field back out at all (a real, disclosed "kept for future
+    /// reclaim-path bookkeeping" gap since Milestone 36); reclaim
+    /// (`reclaim_process_frames()`) and this milestone's fork() fix are
+    /// now the two real readers.
+    extra_frames: Vec<(VirtAddr, PhysFrame<Size4KiB>)>,
     /// MILESTONE 37: `Some(parent_pid)` if this process was created by
     /// `fork()`; `None` for every process created any other way (all
     /// four pre-existing hardcoded/loaded-file paths). Checked by
@@ -632,6 +759,140 @@ pub struct Process {
     /// `usertest::enter_ring3_now(entry)` instead of that function
     /// hardcoding `USER_CODE_ADDR` itself.
     entry: u64,
+    /// MILESTONE 59: this process's own real, persistent errno --
+    /// `0` means "no error recorded yet" (this kernel's own honest
+    /// sentinel, never a value any real failure path below sets: every
+    /// `errno.rs` constant is >= 1, matching real errno.h, where 0 is
+    /// never a defined error code either). Set by `set_errno()` from
+    /// usertest.rs's syscall_dispatch on the SAME failure paths that
+    /// already return a bare `u64::MAX`/`0`/`1` sentinel today -- this
+    /// field is the thing that finally lets a caller tell WHICH of
+    /// several real failure reasons a bare sentinel used to collapse
+    /// into one indistinguishable value. Same real POSIX semantics as a
+    /// real libc's `errno`: NEVER implicitly cleared on a later
+    /// successful call (a caller that doesn't check its return value
+    /// first and reads errno anyway can see a stale value from an
+    /// earlier, unrelated failure -- exactly as real, exactly as
+    /// documented, not a bug this kernel needs to paper over). Persists
+    /// across repeated `runproc` calls for the SAME process, same
+    /// "never reset between runs" precedent `heap_used`/`fds` already
+    /// established.
+    errno: u64,
+    /// MILESTONE 60: real signal delivery -- this process's own handler
+    /// table, indexed by real POSIX signal number (`signal::NSIG`
+    /// entries, index 0 unused/never valid). `0` (this array's own
+    /// default) is `SIG_DFL` -- "no handler registered" -- the ONLY
+    /// disposition this milestone actually implements: there is no
+    /// default-action table yet (real POSIX default-terminates most
+    /// signals; this kernel does not, see `raise_signal()`'s own doc
+    /// comment for the honest reason and scope cut), so a signal raised
+    /// against a slot still holding `0` here is a real, documented no-op,
+    /// never a silently-pretended delivery. A nonzero value is a real
+    /// user-space virtual address (checked to be nonzero at registration
+    /// time only -- like every other raw user pointer this kernel already
+    /// hands to a syscall, e.g. `write`'s `ptr`, it is NOT validated to
+    /// actually be mapped/executable code until control genuinely
+    /// transfers there, same disclosed "no general copy-from-user
+    /// fault-recovery path" limitation `MAX_WRITE_LEN`'s own doc comment
+    /// already names elsewhere in this codebase).
+    signal_handlers: [u64; signal::NSIG],
+    /// MILESTONE 60: a signal raised against this process (`raise_signal()`)
+    /// but not yet actually delivered into its handler. Real POSIX
+    /// semantics for a NON-realtime signal: not queued -- a second raise
+    /// of the same (or a different) number before the first is delivered
+    /// simply overwrites this slot (the earlier one is lost), exactly
+    /// like a real kernel's single-bit-per-signal pending set collapses
+    /// repeat raises of the same signal; this kernel goes one step
+    /// further and collapses ACROSS different signal numbers too (a real,
+    /// disclosed scope cut for this first slice -- a full per-signal
+    /// pending bitmask is real future work, not silently pretended here).
+    /// Consumed (cleared) by `take_deliverable_signal()` the moment
+    /// delivery actually happens, not when the handler finishes running.
+    pending_signal: Option<u8>,
+    /// MILESTONE 60: `Some(saved context)` exactly while this process is
+    /// genuinely executing inside a real, kernel-dispatched signal
+    /// handler -- set by `stash_signal_context()` the moment
+    /// `take_deliverable_signal()` redirects a real hardware-interrupted
+    /// context into a handler, cleared by `take_saved_signal_context()`
+    /// (`SIGRETURN`, syscall 20) once that handler unwinds back out. A
+    /// real, disclosed simplification of POSIX's finer-grained per-signal
+    /// `sa_mask`/pending-set semantics: while this is `Some`,
+    /// `take_deliverable_signal()` refuses to deliver ANY further signal
+    /// to this process (not just the one currently being handled) --
+    /// real POSIX only blocks the signal(s) named in the handler's own
+    /// `sa_mask` (which defaults to just the signal itself, not all of
+    /// them) by default. Blocking everything is strictly safer (never
+    /// re-enters a handler this kernel has never made reentrant-safe) at
+    /// the real, honest cost of a signal that arrives DURING another's
+    /// handler being dropped rather than queued -- same "small, real,
+    /// honest" scope-cut discipline as `pending_signal`'s own doc comment
+    /// just above, not hidden.
+    in_signal_handler: Option<SavedSignalContext>,
+    /// MILESTONE 64: this process's own real, bounded mmap table -- `None`
+    /// is an unused slot, `Some(MmapSlot)` a live read-only file-backed
+    /// mapping (its index in this array determines its virtual address:
+    /// slot `i` lives at `MMAP_START + i*PAGE_SIZE`, exactly the same
+    /// index-determines-address convention `heap_frames` already
+    /// established for the heap). Never reset between runs of the SAME
+    /// process, matching `fds`/`heap_used`'s own persists-across-runs
+    /// precedent. **Disclosed, not hidden: a forked child does NOT
+    /// inherit the parent's mmap regions** -- `fork_build_child()` goes
+    /// through the same `create_process_from_image()` constructor every
+    /// fresh process does and never copies this field across afterward,
+    /// the exact same disclosed gap `extra_frames`' own doc comment
+    /// already carries for ELF segment frames (fork() only ever forks a
+    /// flat-image process in this design, so a REAL forked-parent-with-
+    /// live-mmaps case cannot occur yet either way).
+    mmaps: [Option<MmapSlot>; MAX_MMAPS],
+}
+
+/// MILESTONE 60: a real, complete snapshot of a process's hardware-
+/// interrupted register/PC/flags/stack-pointer state at the exact moment
+/// a signal handler was dispatched -- `usertest.rs`'s `syscall_dispatch`
+/// builds one (copied field-for-field from the SAME `SyscallRegs` the
+/// interrupted `int 0x80` itself produced) immediately before overwriting
+/// that live struct's `rip`/`rdi`/`rsp` to redirect execution into the
+/// handler, and `take_saved_signal_context()` (backing `SIGRETURN`,
+/// syscall 20) hands it right back so `usertest.rs` can restore every
+/// field verbatim, resuming the interrupted context exactly as if the
+/// signal had never arrived (SysV argument/return registers included --
+/// this is a full GPR snapshot, not just PC+flags).
+///
+/// Real, disclosed, deliberate scope cut for this first slice: this is a
+/// KERNEL-side stash (one slot per process, in `Process::
+/// in_signal_handler` itself), not a real POSIX `ucontext_t` written onto
+/// the process's OWN user stack the way a real kernel's `rt_sigreturn`
+/// reads its restore context back from user memory. That real design
+/// would need a safe copy-to/from-user path with fault recovery this
+/// kernel has never had (see `usertest.rs`'s own `MAX_WRITE_LEN` doc
+/// comment, which already discloses this exact gap for ordinary syscall
+/// pointers) -- a kernel-side stash sidesteps that entirely, at the real,
+/// honest cost that a signal can only ever unwind through EXACTLY the
+/// mechanism that dispatched it (no cross-process/cross-boot
+/// `sigreturn` forgery is even possible, which is its own small real
+/// upside), and only one handler can ever be "in flight" per process at
+/// a time (see `in_signal_handler`'s own doc comment on why that is
+/// enforced anyway, for an unrelated reason).
+#[derive(Clone, Copy)]
+pub(crate) struct SavedSignalContext {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub r11: u64,
+    pub r10: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub rbp: u64,
+    pub rdi: u64,
+    pub rsi: u64,
+    pub rdx: u64,
+    pub rcx: u64,
+    pub rbx: u64,
+    pub rax: u64,
+    pub rip: u64,
+    pub rflags: u64,
+    pub rsp: u64,
 }
 
 static PROCESS_A: Mutex<Option<Process>> = Mutex::new(None);
@@ -834,6 +1095,13 @@ pub(crate) const EXEC_TEST_PATH: &str = "altentry";
 /// runtime, same discipline as FORK_TEST_PROGRAM's own layout self-test.
 pub(crate) const EXEC_TEST_FALLBACK_MSG: &str = "milestone 45: EXEC_TEST fallback -- real exec() failed";
 
+/// MILESTONE 58: the real path `tools/argvlauncher_src/main.rs`'s
+/// ARGVLAUNCHER_ELF_BYTES exec()s into (via the new EXECARGV syscall) --
+/// see `loader::seed_argvtarget_elf()`, which must have already written
+/// `loader`'s ARGVTARGET_ELF_BYTES to this exact path before
+/// `loader::self_test_execargv()` runs the launcher.
+pub(crate) const EXECARGV_TARGET_PATH: &str = "argvtarget";
+
 /// MILESTONE 45: a NINTH hardcoded, boot-time-created process slot --
 /// runs EXEC_TEST_PROGRAM. See that constant's own doc comment.
 static EXEC_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
@@ -868,14 +1136,97 @@ pub(crate) const FAULT_TEST_PROGRAM: [u8; 15] = [
 static FAULT_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
 pub(crate) const FAULT_TEST_PROCESS_ID: u8 = 10;
 
+/// MILESTONE 57: the POSITIVE demand-paging case. `sbrk()`s 258056 bytes
+/// in one call (deliberately more than the pre-Milestone-57 16 KiB heap
+/// cap ever allowed -- proof the reservation genuinely grew), then
+/// touches a byte at offset 258048 (0x3F000) -- the FIRST byte of heap
+/// page index 63, the very LAST page of the new 64-page reservation, not
+/// an arbitrary early one -- via a plain `mov byte [rbx], 0x51`. That
+/// page has never been mapped by anything (create_process_from_image()
+/// no longer eagerly maps any heap page, see that function's own
+/// comment), so this deliberately triggers a real hardware #PF; this
+/// program has no idea whether that fault gets resolved transparently or
+/// terminates it -- `self_test_demand_paging_heap()` is what checks,
+/// from the kernel side, that it actually DID get resolved (real,
+/// specific frame now backing page 63, holding the exact marker byte)
+/// rather than merely "didn't crash".
+///
+///   offset  bytes                              instruction
+///    0      BF 08 F0 03 00                     mov edi, 258056   (sbrk request)
+///    5      B8 02 00 00 00                     mov eax, 2        (syscall 2 = sbrk)
+///   10      CD 80                              int 0x80          -- rax = heap ptr (HEAP_START+0)
+///   12      48 89 C3                           mov rbx, rax
+///   15      48 81 C3 00 F0 03 00                add rbx, 258048   (byte 0 of heap page 63)
+///   22      C6 03 51                           mov byte [rbx], 0x51   -- FAULTS HERE, then resumes
+///   25      B8 01 00 00 00                     mov eax, 1        (exit)
+///   30      CD 80                              int 0x80
+///   32      EB FE                              jmp $             (unreachable safety net)
+pub(crate) const DEMAND_PAGE_TEST_PROGRAM: [u8; 34] = [
+    0xBF, 0x08, 0xF0, 0x03, 0x00, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC3, 0x48,
+    0x81, 0xC3, 0x00, 0xF0, 0x03, 0x00, 0xC6, 0x03, 0x51, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80,
+    0xEB, 0xFE,
+];
+/// The exact heap byte-offset (from HEAP_START) DEMAND_PAGE_TEST_PROGRAM
+/// writes its marker byte to -- checked by self_test_demand_paging_heap()
+/// against its own independent arithmetic (258048 = 63 * PAGE_SIZE)
+/// before trusting it, same discipline as SIGSEGV_MSG_OFFSET's own
+/// pre-flight check.
+const DEMAND_PAGE_TEST_HEAP_OFFSET: u64 = 258048;
+const DEMAND_PAGE_TEST_MARKER: u8 = 0x51;
+
+/// MILESTONE 57: an ELEVENTH hardcoded, boot-time-created process slot --
+/// runs DEMAND_PAGE_TEST_PROGRAM.
+static DEMAND_PAGE_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const DEMAND_PAGE_TEST_PROCESS_ID: u8 = 11;
+
+/// MILESTONE 57: the NEGATIVE case, proving the committed-vs-reserved
+/// boundary `try_demand_page_heap()` checks is actually enforced, not
+/// just documented. `sbrk()`s a small, ordinary 64 bytes (heap_used
+/// becomes 64), then dereferences a FIXED absolute address deep inside
+/// the SAME heap page (page 63, HEAP_START+HEAP_SIZE-8) the positive-case
+/// test above successfully demand-pages -- except THIS process never
+/// grew its `heap_used` anywhere near that far, so the identical virtual
+/// page that was a legitimate lazy allocation for
+/// DEMAND_PAGE_TEST_PROCESS is an genuinely illegal access here: still
+/// inside the heap's RESERVED virtual range, but nowhere near what this
+/// process has actually committed via sbrk(). Expected outcome: a real
+/// SIGSEGV (Milestone 41's unchanged termination path), not a silently
+/// "helpful" demand-page.
+///
+///   offset  bytes                                    instruction
+///    0      BF 40 00 00 00                           mov edi, 64        (small, ordinary sbrk)
+///    5      B8 02 00 00 00                           mov eax, 2         (syscall 2 = sbrk)
+///   10      CD 80                                    int 0x80
+///   12      48 BB F8 FF 03 70 55 55 00 00            mov rbx, imm64     (HEAP_START+HEAP_SIZE-8, uncommitted)
+///   22      48 8B 03                                 mov rax, [rbx]     -- FAULTS HERE, should SIGSEGV
+///   25      EB FE                                    jmp $              (unreachable safety net)
+pub(crate) const DEMAND_PAGE_OOB_TEST_PROGRAM: [u8; 27] = [
+    0xBF, 0x40, 0x00, 0x00, 0x00, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0xBB, 0xF8, 0xFF,
+    0x03, 0x70, 0x55, 0x55, 0x00, 0x00, 0x48, 0x8B, 0x03, 0xEB, 0xFE,
+];
+
+/// MILESTONE 57: a TWELFTH hardcoded, boot-time-created process slot --
+/// runs DEMAND_PAGE_OOB_TEST_PROGRAM.
+static DEMAND_PAGE_OOB_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const DEMAND_PAGE_OOB_TEST_PROCESS_ID: u8 = 12;
+
 /// MILESTONE 37: real, dynamic PID allocation for `fork()`-created
-/// children. PIDs 1-10 stay permanently reserved for the ten
-/// pre-existing hardcoded/loaded-file ids above (1/2/3/4/5, with 6-10 now
-/// ALL used: Milestones 41/43/45/53 claim 6, 7, 8, 9, and 10 respectively
-/// -- no more headroom left in this range) so a forked child's PID can
-/// never collide with any of them; PROCESS_TABLE's own slot `i` is
-/// always PID `PID_TABLE_BASE + i`.
-pub(crate) const PID_TABLE_BASE: u8 = 11;
+/// children. PIDs 1-12 stay permanently reserved for the twelve
+/// pre-existing hardcoded/loaded-file ids above (1/2/3/4/5, with 6-12 now
+/// ALL used: Milestones 41/43/45/53/57 claim 6, 7, 8, 9, 10, 11, and 12
+/// respectively -- no more headroom left in this range) so a forked
+/// child's PID can never collide with any of them; PROCESS_TABLE's own
+/// slot `i` is always PID `PID_TABLE_BASE + i`.
+///
+/// MILESTONE 59: ERRNO_TEST_PROCESS_ID (below) deliberately picks 17, NOT
+/// the next free-looking number after 12 -- PIDs 13-16 are this exact
+/// dynamic range (`PID_TABLE_BASE` + 0..MAX_PROCESSES), already live,
+/// reusable `fork()` targets; claiming one of them as a FOURTEENTH
+/// permanent hardcoded id would silently alias a real forked child's own
+/// pid the next time `fork()` handed one out, a genuine collision bug,
+/// not a cosmetic numbering one. 17 is the first id strictly past this
+/// whole reserved block.
+pub(crate) const PID_TABLE_BASE: u8 = 13;
 
 /// MILESTONE 37: real, honest, small bound on concurrently-live forked
 /// processes -- same "small fixed cap, not full generality" spirit as
@@ -902,6 +1253,445 @@ pub(crate) const MAX_PROCESSES: usize = 4;
 /// have (and structurally can't have, since there can be arbitrarily
 /// many of them within the bound) their own named `static`.
 static PROCESS_TABLE: Mutex<[Option<Process>; MAX_PROCESSES]> = Mutex::new([const { None }; MAX_PROCESSES]);
+
+/// MILESTONE 59: hand-assembled x86_64 machine code -- deliberately
+/// triggers FOUR genuinely different syscall failure causes, back to
+/// back, in ONE continuous ring-3 excursion, reading errno back after
+/// each via the new syscall 17 (GETERRNO) so `usertest.rs`'s own serial
+/// log carries live, real proof that distinct failures really do produce
+/// distinct, correct errno values -- not just that the field exists.
+/// Never touches syscall 0 (write), so it needs no MESSAGE_OFFSET region
+/// installed (same as FAULT_TEST_PROGRAM's own minimal shape).
+///
+/// Sequence (each `mov r32, imm32` is opcode 0xB8+reg, `int 0x80` is
+/// `CD 80`, checked by hand against the actual encodings USER_PROGRAM/
+/// DEMAND_PAGE_OOB_TEST_PROGRAM above already use, not guessed):
+///
+///   read(fd=99, buf=0, len=1)   -- fd 99 was never open()ed by this
+///                                  process -- expect EBADF (9)
+///   geterrno()                  -- expect rax=9, logged
+///   wait(pid=250)                -- 250 is not a live child of this
+///                                  process (not even in the dynamic
+///                                  PID_TABLE_BASE..+MAX_PROCESSES range)
+///                                  -- expect ECHILD (10)
+///   geterrno()                  -- expect rax=10, logged
+///   sbrk(0xFFFFFFFF)             -- ~4 GiB request against a 64-page
+///                                  (256 KiB) fixed heap reservation --
+///                                  expect ENOMEM (12)
+///   geterrno()                  -- expect rax=12, logged
+///   getpgid(pid=250)             -- same not-a-live-process pid as the
+///                                  wait() above, different syscall --
+///                                  expect ESRCH (3)
+///   geterrno()                  -- expect rax=3, logged
+///   exit(0)
+///
+/// `buf=0`/`len=1` on the read() call are never actually dereferenced --
+/// syscall 4's own None arm (fd not open) returns before touching either
+/// argument, the same "failure path never reaches the pointer" property
+/// every other syscall's argument-validation-before-dereference ordering
+/// already relies on elsewhere in this file.
+pub(crate) const ERRNO_TEST_PROGRAM: [u8; 98] = [
+    // read(fd=99, buf=0, len=1) -> EBADF
+    0xBF, 0x63, 0x00, 0x00, 0x00, // mov edi, 99
+    0xBE, 0x00, 0x00, 0x00, 0x00, // mov esi, 0
+    0xBA, 0x01, 0x00, 0x00, 0x00, // mov edx, 1
+    0xB8, 0x04, 0x00, 0x00, 0x00, // mov eax, 4 (read)
+    0xCD, 0x80, // int 0x80
+    // geterrno() -> expect EBADF
+    0xB8, 0x11, 0x00, 0x00, 0x00, // mov eax, 17 (geterrno)
+    0xCD, 0x80, // int 0x80
+    // wait(pid=250) -> ECHILD
+    0xBF, 0xFA, 0x00, 0x00, 0x00, // mov edi, 250
+    0xB8, 0x08, 0x00, 0x00, 0x00, // mov eax, 8 (wait)
+    0xCD, 0x80, // int 0x80
+    // geterrno() -> expect ECHILD
+    0xB8, 0x11, 0x00, 0x00, 0x00, // mov eax, 17
+    0xCD, 0x80, // int 0x80
+    // sbrk(0xFFFFFFFF) -> ENOMEM
+    0xBF, 0xFF, 0xFF, 0xFF, 0xFF, // mov edi, 0xFFFFFFFF
+    0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2 (sbrk)
+    0xCD, 0x80, // int 0x80
+    // geterrno() -> expect ENOMEM
+    0xB8, 0x11, 0x00, 0x00, 0x00, // mov eax, 17
+    0xCD, 0x80, // int 0x80
+    // getpgid(pid=250) -> ESRCH
+    0xBF, 0xFA, 0x00, 0x00, 0x00, // mov edi, 250
+    0xB8, 0x0F, 0x00, 0x00, 0x00, // mov eax, 15 (getpgid)
+    0xCD, 0x80, // int 0x80
+    // geterrno() -> expect ESRCH
+    0xB8, 0x11, 0x00, 0x00, 0x00, // mov eax, 17
+    0xCD, 0x80, // int 0x80
+    // exit(0)
+    0xBF, 0x00, 0x00, 0x00, 0x00, // mov edi, 0
+    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (exit)
+    0xCD, 0x80, // int 0x80
+];
+
+/// MILESTONE 59: a THIRTEENTH hardcoded, boot-time-created process slot
+/// -- runs ERRNO_TEST_PROGRAM. Id 17, not 13-16 -- see PID_TABLE_BASE's
+/// own doc comment just above for why those four specifically are off
+/// limits (they're `fork()`'s own live, reusable dynamic range, not free
+/// numbering headroom).
+static ERRNO_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const ERRNO_TEST_PROCESS_ID: u8 = 17;
+
+/// MILESTONE 60: hand-assembled x86_64 machine code -- real, end-to-end
+/// proof of real signal delivery: register a handler, self-signal, get
+/// genuinely redirected into the handler mid-execution, and unwind back
+/// out via `SIGRETURN` to exactly the interrupted point, with the full
+/// register file (not just the instruction pointer) proven intact.
+///
+/// **Every byte below was produced by a real assembler, not hand-encoded
+/// by counting opcode lengths by eye** (this program's control flow --
+/// a handler whose own `ret` must land on a kernel-injected on-stack
+/// trampoline at exactly the right runtime address -- has far more real
+/// opportunity for a silent off-by-one than any earlier hand-assembled
+/// test program in this codebase, which are all straight-line syscall
+/// sequences): assembled via `as --64` (Intel syntax) from real x86_64
+/// assembly source, symbol offsets read back from the resulting object
+/// file's own symbol table (`nm`), and the `HANDLER_ADDR` immediate
+/// patched in afterward from the REAL relocation record `as` emitted for
+/// it (not guessed) -- then independently re-disassembled with `objdump
+/// -D -b binary -m i386:x86-64` against the FINAL patched bytes below to
+/// confirm every instruction decodes back to exactly what was intended,
+/// including the patched absolute address. See this milestone's own
+/// report for the exact source/toolchain commands used.
+///
+/// Layout (`SIGNAL_TEST_RESUME_OFFSET`/`SIGNAL_TEST_HANDLER_OFFSET`
+/// below name the two real jump targets a human reader needs to trust
+/// without re-disassembling by hand):
+///
+///   0x00  sbrk(64)                    -- commits the first real heap
+///                                        page (HEAP_START) so the raw
+///                                        stores below don't fault
+///   0x0c  r12d = 0x1234ABCD           -- the canary: must survive being
+///                                        redirected through the handler
+///                                        and back via SIGRETURN
+///   0x12  HEAP_START[0] = 0xAA        -- marker: main-before-signal code
+///                                        genuinely ran
+///   0x1f  sigaction(SIGUSR1, handler) -- registers the real handler
+///   0x35  sigsend(self_pid, SIGUSR1)  -- self-signal (real POSIX
+///                                        raise()); this int 0x80 is
+///                                        the ONE that never actually
+///                                        "returns" here -- the kernel
+///                                        redirects execution into
+///                                        `handler` instead
+///  =0x46  RESUME (SIGNAL_TEST_RESUME_OFFSET) -- reached ONLY via
+///                                        SIGRETURN restoring this exact
+///                                        rip, i.e. exactly where the
+///                                        sigsend() call's own int 0x80
+///                                        would have returned to had no
+///                                        signal ever been involved
+///         HEAP_START[16..24] = r12    -- proves r12 (the canary) came
+///                                        back with its ORIGINAL value,
+///                                        not the handler's clobbered one
+///         HEAP_START[24] = 0xCC       -- marker: main-after-resume code
+///                                        genuinely ran
+///         exit(0)
+///  =0x64  HANDLER (SIGNAL_TEST_HANDLER_OFFSET)
+///         HEAP_START[8] = 0xBB        -- marker: the handler itself
+///                                        genuinely ran
+///         r12d = 0xDEADBEEF           -- deliberately clobbers the
+///                                        canary, so RESUME's later
+///                                        check is a real proof of
+///                                        restoration, not an accident
+///         HEAP_START[32..40] = rdi    -- proves the handler received
+///                                        the real signal number (10,
+///                                        SIGUSR1) as its SysV first
+///                                        argument, the real convention
+///                                        a C `void handler(int signum)`
+///                                        expects
+///         ret                          -- pops the kernel-injected fake
+///                                        return address off the stack,
+///                                        landing on the kernel's own
+///                                        on-stack trampoline (built
+///                                        fresh at delivery time by
+///                                        usertest.rs, NOT part of this
+///                                        static image), which itself
+///                                        issues SIGRETURN
+pub(crate) const SIGNAL_TEST_PROGRAM: [u8; 125] = [
+    // -- 0x00: sbrk(64) --
+    0xBF, 0x40, 0x00, 0x00, 0x00, // mov edi, 64
+    0xB8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2 (sbrk)
+    0xCD, 0x80, // int 0x80
+    // -- 0x0c: canary register --
+    0x41, 0xBC, 0xCD, 0xAB, 0x34, 0x12, // mov r12d, 0x1234ABCD
+    // -- 0x12: HEAP_START[0] = 0xAA --
+    0x48, 0xB8, 0x00, 0x00, 0x00, 0x70, 0x55, 0x55, 0x00, 0x00, // movabs rax, 0x555570000000 (HEAP_START)
+    0xC6, 0x00, 0xAA, // mov byte [rax], 0xAA
+    // -- 0x1f: sigaction(SIGUSR1=10, HANDLER_ADDR) --
+    0xBF, 0x0A, 0x00, 0x00, 0x00, // mov edi, 10 (SIGUSR1)
+    0x48, 0xBE, 0x64, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, // movabs rsi, 0x555550000064 (USER_CODE_ADDR+0x64, HANDLER_ADDR)
+    0xB8, 0x12, 0x00, 0x00, 0x00, // mov eax, 18 (sigaction)
+    0xCD, 0x80, // int 0x80
+    // -- 0x35: sigsend(self_pid=18, SIGUSR1=10) -- self-signal --
+    0xBF, 0x12, 0x00, 0x00, 0x00, // mov edi, 18 (SIGNAL_TEST_PROCESS_ID, targeting self)
+    0xBE, 0x0A, 0x00, 0x00, 0x00, // mov esi, 10 (SIGUSR1)
+    0xB8, 0x13, 0x00, 0x00, 0x00, // mov eax, 19 (sigsend)
+    0xCD, 0x80, // int 0x80 -- redirected into HANDLER, does NOT fall through to the next byte
+    // == 0x46 == RESUME (SIGNAL_TEST_RESUME_OFFSET) -- reached only via SIGRETURN
+    0x48, 0xB8, 0x00, 0x00, 0x00, 0x70, 0x55, 0x55, 0x00, 0x00, // movabs rax, 0x555570000000 (HEAP_START)
+    0x4C, 0x89, 0x60, 0x10, // mov [rax+0x10], r12  -- proves the canary survived
+    0xC6, 0x40, 0x18, 0xCC, // mov byte [rax+0x18], 0xCC  -- marker: resume code ran
+    0xBF, 0x00, 0x00, 0x00, 0x00, // mov edi, 0
+    0xB8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1 (exit)
+    0xCD, 0x80, // int 0x80
+    // == 0x64 == HANDLER (SIGNAL_TEST_HANDLER_OFFSET)
+    0x48, 0xB8, 0x00, 0x00, 0x00, 0x70, 0x55, 0x55, 0x00, 0x00, // movabs rax, 0x555570000000 (HEAP_START)
+    0xC6, 0x40, 0x08, 0xBB, // mov byte [rax+0x8], 0xBB  -- marker: handler ran
+    0x41, 0xBC, 0xEF, 0xBE, 0xAD, 0xDE, // mov r12d, 0xDEADBEEF  -- deliberately clobbers the canary
+    0x48, 0x89, 0x78, 0x20, // mov [rax+0x20], rdi  -- proves rdi==signum was really delivered
+    0xC3, // ret -- pops the kernel-injected trampoline return address
+];
+
+/// See `SIGNAL_TEST_PROGRAM`'s own doc comment -- the real offset (within
+/// that image, i.e. relative to `usertest::USER_CODE_ADDR`) execution
+/// resumes at once `SIGRETURN` restores the interrupted context. Checked
+/// against the actual assembled bytes at boot by
+/// `self_test_signal_delivery()`, not just asserted here.
+const SIGNAL_TEST_RESUME_OFFSET: u64 = 0x46;
+/// See `SIGNAL_TEST_PROGRAM`'s own doc comment -- the real offset (within
+/// that image) of the handler entry point, baked into the program's own
+/// `sigaction()` call as `USER_CODE_ADDR + SIGNAL_TEST_HANDLER_OFFSET`.
+const SIGNAL_TEST_HANDLER_OFFSET: u64 = 0x64;
+/// Real POSIX signal number `SIGNAL_TEST_PROGRAM` registers/raises --
+/// `signal::SIGUSR1`, kept as its own local constant (rather than
+/// referencing `signal::SIGUSR1` directly from inside the byte array's
+/// own comments/self-test arithmetic) purely so this file's own layout
+/// doc comment above and `self_test_signal_delivery()` below both read
+/// the same literal `10` a hex-dump/serial-log reader would actually see.
+const SIGNAL_TEST_SIGNUM: u8 = signal::SIGUSR1;
+/// Canary value `SIGNAL_TEST_PROGRAM` loads into r12 before self-
+/// signaling -- must come back unchanged after SIGRETURN despite the
+/// handler deliberately overwriting r12 with `SIGNAL_TEST_CANARY_CLOBBER`
+/// in between.
+const SIGNAL_TEST_CANARY: u64 = 0x1234ABCD;
+const SIGNAL_TEST_CANARY_CLOBBER: u32 = 0xDEADBEEF;
+
+/// MILESTONE 60: a FOURTEENTH hardcoded, boot-time-created process slot
+/// -- runs SIGNAL_TEST_PROGRAM. Id 18, not 13-16 -- see PID_TABLE_BASE's
+/// own doc comment (those four are fork()'s own live, reusable dynamic
+/// range, not free numbering headroom); also baked directly into
+/// SIGNAL_TEST_PROGRAM's own hand-assembled `sigsend(self_pid=18, ...)`
+/// call, so this constant and that program's own bytes must stay in
+/// sync (checked by self_test_signal_delivery() at boot, not just
+/// asserted).
+static SIGNAL_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const SIGNAL_TEST_PROCESS_ID: u8 = 18;
+
+/// MILESTONE 64: the real on-disk file every one of the four mmap test
+/// programs below opens and maps -- written once at boot by
+/// `self_test_mmap()` itself (same self-contained-fixture pattern
+/// `fs::self_test_disk_write()` already established: the self-test sets
+/// up its own real data, rather than main.rs pre-seeding it). Exactly 32
+/// bytes, comfortably under `fs::MAX_FILE_BYTES`/`PAGE_SIZE`.
+pub(crate) const MMAP_TEST_FILE_PATH: &str = "mmapf";
+pub(crate) const MMAP_TEST_FILE_CONTENT: &str = "milestone64-mmap-selftest-real!";
+
+/// MILESTONE 64: hand-assembled x86_64 machine code, the POSITIVE case --
+/// `sbrk(64)` for scratch heap space, `open("mmapf")`, `mmap(fd)`, then
+/// FOUR real ring-3 byte reads through the mapped address (`mov al,
+/// [rdx+i]` for i in 0..4) each immediately persisted into the heap
+/// (`mov [rbx+i], al`) so `self_test_mmap()` can verify the exact real
+/// bytes afterward the same way `self_test_demand_paging_heap()` verifies
+/// its own marker byte. Only the FIRST read (offset 0) faults (real
+/// not-present -> demand-paged); the next three prove the mapping stays
+/// resident across repeated accesses, not re-faulted every time. Finally
+/// `munmap()`s the region and persists its (0 = success) result byte too.
+/// Regenerated deterministically by a standalone Python assembler script
+/// (same discipline as every other hand-assembled program in this file --
+/// each instruction's encoding hand-derived and cross-checked against
+/// this file's own already-verified encodings: `48 89 C3`-style
+/// register-to-register MOV, `8A`/`88`-style single-byte MOV, `CD 80`
+/// syscalls -- not hand-counted hex digits).
+///
+/// Layout (verified against the array below by self_test_mmap()):
+///   offset   0..112   the syscall sequence itself (117 bytes, padded to
+///                      112... see path_offset below -- code is 117 bytes,
+///                      rounded UP to the next 16-byte boundary for the
+///                      path region, so path starts at 112 only once the
+///                      code itself is confirmed <= 112; checked directly)
+///   offset 112..117   "mmapf" (PATH, 5 real bytes, path for syscall 3)
+pub(crate) const MMAP_READ_TEST_PROGRAM: [u8; 117] = [
+    0xBF, 0x40, 0x00, 0x00, 0x00, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC3, 0x48,
+    0xBF, 0x70, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x05, 0x00, 0x00, 0x00, 0xB8, 0x03,
+    0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC7, 0xB8, 0x15, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48,
+    0x89, 0xC2, 0x8A, 0x02, 0x88, 0x03, 0x8A, 0x42, 0x01, 0x88, 0x43, 0x01, 0x8A, 0x42, 0x02, 0x88,
+    0x43, 0x02, 0x8A, 0x42, 0x03, 0x88, 0x43, 0x03, 0xB8, 0x16, 0x00, 0x00, 0x00, 0x48, 0x89, 0xD7,
+    0xCD, 0x80, 0x88, 0x43, 0x04, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD,
+    0x80, 0xEB, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6D, 0x6D, 0x61, 0x70, 0x66,
+];
+const MMAP_READ_TEST_PATH_OFFSET: usize = 112;
+
+/// MILESTONE 64: a FIFTEENTH hardcoded, boot-time-created process slot --
+/// runs MMAP_READ_TEST_PROGRAM. `self_test_mmap()` `run()`s it directly
+/// (top-level excursion, not a fork() source) and inspects its heap
+/// afterward, same pattern as DEMAND_PAGE_TEST_PROCESS.
+static MMAP_READ_TEST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const MMAP_READ_TEST_PROCESS_ID: u8 = 19;
+
+/// MILESTONE 64: hand-assembled x86_64 machine code, NEGATIVE case #1 --
+/// `open("mmapf")`, `mmap(fd)`, then IMMEDIATELY attempts `mov byte
+/// [rdx], 0xFF` with NO prior read -- the page has never been mapped at
+/// all, so this is a not-present fault whose `CAUSED_BY_WRITE` bit is
+/// set. `try_demand_page_mmap()`'s own doc comment part (1) is exactly
+/// what this exercises: real refusal, real fall-through to Milestone
+/// 41's unmodified SIGSEGV termination. The `exit(0)`/`jmp $` tail is
+/// UNREACHABLE if the refusal works -- pure safety net, same convention
+/// FAULT_TEST_PROGRAM's own tail already established.
+pub(crate) const MMAP_WRITE_BEFORE_READ_FAULT_PROGRAM: [u8; 69] = [
+    0x48, 0xBF, 0x40, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x05, 0x00, 0x00, 0x00, 0xB8,
+    0x03, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC7, 0xB8, 0x15, 0x00, 0x00, 0x00, 0xCD, 0x80,
+    0x48, 0x89, 0xC2, 0xC6, 0x02, 0xFF, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00,
+    0xCD, 0x80, 0xEB, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6D, 0x6D, 0x61, 0x70, 0x66,
+];
+const MMAP_WRITE_BEFORE_READ_FAULT_PATH_OFFSET: usize = 64;
+
+/// MILESTONE 64: a SIXTEENTH hardcoded, boot-time-created process slot --
+/// runs MMAP_WRITE_BEFORE_READ_FAULT_PROGRAM. EXPECTED to fault and be
+/// terminated -- `self_test_mmap()` checks the mmap slot's own `frame`
+/// stayed `None` afterward (the real, direct proof the not-present+write
+/// refusal actually fired), not just "didn't hang".
+static MMAP_WRITE_BEFORE_READ_FAULT_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID: u8 = 20;
+
+/// MILESTONE 64: hand-assembled x86_64 machine code, NEGATIVE case #2 --
+/// `sbrk(64)`, `open("mmapf")`, `mmap(fd)`, a REAL read first (persisted
+/// to heap[0], proving it genuinely succeeded and demand-paged the page
+/// PRESENT-but-not-WRITABLE), THEN `mov byte [rdx], 0xFF` -- this time a
+/// genuine hardware PROTECTION_VIOLATION fault (the page IS present),
+/// exercising the SECOND, structurally different refusal path
+/// `page_fault_handler()`'s own pre-existing
+/// `!error_code.contains(PROTECTION_VIOLATION)` guard provides --
+/// `try_demand_page_mmap()` is never even CALLED for this fault, unlike
+/// case #1 above. An unreachable `0xEE` marker at heap[1] proves (by its
+/// ABSENCE) that execution never continued past the faulting write.
+pub(crate) const MMAP_WRITE_AFTER_READ_FAULT_PROGRAM: [u8; 85] = [
+    0xBF, 0x40, 0x00, 0x00, 0x00, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC3, 0x48,
+    0xBF, 0x50, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x05, 0x00, 0x00, 0x00, 0xB8, 0x03,
+    0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC7, 0xB8, 0x15, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48,
+    0x89, 0xC2, 0x8A, 0x02, 0x88, 0x03, 0xC6, 0x02, 0xFF, 0xC6, 0x43, 0x01, 0xEE, 0xBF, 0x00, 0x00,
+    0x00, 0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6D, 0x6D, 0x61, 0x70, 0x66,
+];
+const MMAP_WRITE_AFTER_READ_FAULT_PATH_OFFSET: usize = 80;
+
+/// MILESTONE 64: a SEVENTEENTH hardcoded, boot-time-created process slot
+/// -- runs MMAP_WRITE_AFTER_READ_FAULT_PROGRAM. EXPECTED to fault and be
+/// terminated AFTER its first heap marker is genuinely set --
+/// `self_test_mmap()` checks heap[0] (the read succeeded) AND heap[1]
+/// staying zero (the 0xEE marker was never reached).
+static MMAP_WRITE_AFTER_READ_FAULT_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID: u8 = 21;
+
+/// MILESTONE 64: hand-assembled x86_64 machine code, NEGATIVE case #3 --
+/// `sbrk(64)`, `open("mmapf")`, `mmap(fd)`, a real read (persisted to
+/// heap[0]), a real `munmap()` (its result persisted to heap[1]), THEN a
+/// SECOND read attempt at the SAME address -- proving `munmap()` didn't
+/// just release the physical frame but genuinely cleared the slot:
+/// `try_demand_page_mmap()` no longer finds a live `Some(MmapSlot)` at
+/// this address (real `unmap()` also removed the page-table entry
+/// itself), so this second access is a real not-present fault with no
+/// eligible slot behind it -- real refusal, real termination, not a
+/// silent re-grant of the just-released mapping. An unreachable `0xEE`
+/// marker at heap[2] proves execution never continued past it.
+pub(crate) const MMAP_USE_AFTER_UNMAP_FAULT_PROGRAM: [u8; 101] = [
+    0xBF, 0x40, 0x00, 0x00, 0x00, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC3, 0x48,
+    0xBF, 0x60, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x05, 0x00, 0x00, 0x00, 0xB8, 0x03,
+    0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC7, 0xB8, 0x15, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48,
+    0x89, 0xC2, 0x8A, 0x02, 0x88, 0x03, 0xB8, 0x16, 0x00, 0x00, 0x00, 0x48, 0x89, 0xD7, 0xCD, 0x80,
+    0x88, 0x43, 0x01, 0x8A, 0x02, 0x88, 0x43, 0x02, 0xBF, 0x00, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00,
+    0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x6D, 0x6D, 0x61, 0x70, 0x66,
+];
+const MMAP_USE_AFTER_UNMAP_FAULT_PATH_OFFSET: usize = 96;
+
+/// MILESTONE 64: an EIGHTEENTH hardcoded, boot-time-created process slot
+/// -- runs MMAP_USE_AFTER_UNMAP_FAULT_PROGRAM. EXPECTED to fault and be
+/// terminated AFTER both of its first two heap markers are genuinely
+/// set -- `self_test_mmap()` checks heap[0] (first read succeeded),
+/// heap[1] (munmap succeeded, byte 0), and heap[2] staying zero (the
+/// second, post-unmap read never got far enough to write its 0xEE
+/// marker).
+static MMAP_USE_AFTER_UNMAP_FAULT_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID: u8 = 22;
+
+/// MILESTONE 65: hand-assembled x86_64 machine code, the first WRITABLE
+/// positive case -- `sbrk(64)`, `open("mmapf")`, `mmap_writable(fd)`
+/// (syscall 23), a real READ first (`mov al, [rdx]`, persisted to
+/// heap[0] -- the real not-present fault, demand-paged WITH the
+/// `WRITABLE` bit this time), THEN a real WRITE (`mov byte [rdx], 0x99`)
+/// against the now-ALREADY-mapped page -- an ordinary hardware store,
+/// no second fault at all, unlike Milestone 64's own read-only
+/// MMAP_WRITE_AFTER_READ_FAULT_PROGRAM which genuinely faults at the
+/// analogous point. A second real read (`mov al, [rdx]`) immediately
+/// after, persisted to heap[1], proves the write's new byte (0x99)
+/// genuinely stuck in the mapped page rather than being silently
+/// discarded or faulting invisibly. Finally `munmap()`s the region and
+/// persists its (0 = success) result byte to heap[2].
+///
+/// Layout (verified against the array below by
+/// `self_test_mmap_writable()`):
+///   offset  0..89   the syscall sequence itself (89 bytes)
+///   offset 89..94   "mmapf" (PATH, 5 real bytes, path for syscall 3)
+pub(crate) const MMAP_WRITABLE_READ_THEN_WRITE_PROGRAM: [u8; 94] = [
+    0xBF, 0x40, 0x00, 0x00, 0x00, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC3, 0x48,
+    0xBF, 0x59, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x05, 0x00, 0x00, 0x00, 0xB8, 0x03,
+    0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC7, 0xB8, 0x17, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48,
+    0x89, 0xC2, 0x8A, 0x02, 0x88, 0x03, 0xC6, 0x02, 0x99, 0x8A, 0x02, 0x88, 0x43, 0x01, 0xB8, 0x16,
+    0x00, 0x00, 0x00, 0x48, 0x89, 0xD7, 0xCD, 0x80, 0x88, 0x43, 0x02, 0xBF, 0x00, 0x00, 0x00, 0x00,
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE,
+    0x6D, 0x6D, 0x61, 0x70, 0x66,
+];
+const MMAP_WRITABLE_READ_THEN_WRITE_PATH_OFFSET: usize = 89;
+
+/// MILESTONE 65: a NINETEENTH hardcoded, boot-time-created process slot --
+/// runs MMAP_WRITABLE_READ_THEN_WRITE_PROGRAM. `self_test_mmap_writable()`
+/// `run()`s it directly and inspects its heap afterward, same pattern as
+/// `MMAP_READ_TEST_PROCESS`.
+static MMAP_WRITABLE_READ_THEN_WRITE_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID: u8 = 23;
+
+/// MILESTONE 65: hand-assembled x86_64 machine code, the second WRITABLE
+/// positive case -- `sbrk(64)`, `open("mmapf")`, `mmap_writable(fd)`
+/// (syscall 23), then IMMEDIATELY a real WRITE (`mov byte [rdx], 0x77`)
+/// with NO prior read -- the page has never been mapped at all, so this
+/// is a genuine not-present fault whose `CAUSED_BY_WRITE` bit is set,
+/// EXACTLY the same real hardware condition Milestone 64's own
+/// MMAP_WRITE_BEFORE_READ_FAULT_PROGRAM exercises -- except this slot is
+/// `writable`, so `try_demand_page_mmap()`'s `is_write && !writable`
+/// refusal never fires: the fault is serviced instead, proving the
+/// genuinely different first-touch-write-succeeds code path. A real read
+/// back (`mov al, [rdx]`) persisted to heap[0] proves the written byte
+/// (0x77) is really there; a SECOND real read at `[rdx+1]` persisted to
+/// heap[1] proves the rest of the page still holds the real snapshotted
+/// file content (only the single touched byte changed, nothing else was
+/// zeroed or corrupted). Finally `munmap()`s the region and persists its
+/// result byte to heap[2].
+///
+/// Layout (verified against the array below by
+/// `self_test_mmap_writable()`):
+///   offset  0..90   the syscall sequence itself (90 bytes)
+///   offset 90..95   "mmapf" (PATH, 5 real bytes, path for syscall 3)
+pub(crate) const MMAP_WRITABLE_WRITE_FIRST_PROGRAM: [u8; 95] = [
+    0xBF, 0x40, 0x00, 0x00, 0x00, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC3, 0x48,
+    0xBF, 0x5A, 0x00, 0x00, 0x50, 0x55, 0x55, 0x00, 0x00, 0xBE, 0x05, 0x00, 0x00, 0x00, 0xB8, 0x03,
+    0x00, 0x00, 0x00, 0xCD, 0x80, 0x48, 0x89, 0xC7, 0xB8, 0x17, 0x00, 0x00, 0x00, 0xCD, 0x80, 0x48,
+    0x89, 0xC2, 0xC6, 0x02, 0x77, 0x8A, 0x02, 0x88, 0x03, 0x8A, 0x42, 0x01, 0x88, 0x43, 0x01, 0xB8,
+    0x16, 0x00, 0x00, 0x00, 0x48, 0x89, 0xD7, 0xCD, 0x80, 0x88, 0x43, 0x02, 0xBF, 0x00, 0x00, 0x00,
+    0x00, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xCD, 0x80, 0xEB, 0xFE,
+    0x6D, 0x6D, 0x61, 0x70, 0x66,
+];
+const MMAP_WRITABLE_WRITE_FIRST_PATH_OFFSET: usize = 90;
+
+/// MILESTONE 65: a TWENTIETH hardcoded, boot-time-created process slot --
+/// runs MMAP_WRITABLE_WRITE_FIRST_PROGRAM. `self_test_mmap_writable()`
+/// `run()`s it directly and inspects its heap afterward, same pattern as
+/// `MMAP_WRITABLE_READ_THEN_WRITE_PROCESS` above.
+static MMAP_WRITABLE_WRITE_FIRST_PROCESS: Mutex<Option<Process>> = Mutex::new(None);
+pub(crate) const MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID: u8 = 24;
 
 /// The kernel's own PML4 physical frame + CR3 flags, saved ONCE at boot
 /// (save_kernel_cr3(), called from kernel_main before any process is
@@ -936,6 +1726,35 @@ pub(crate) static ACTIVE_PROCESS: AtomicU8 = AtomicU8::new(0);
 /// run for this process id" a real, load-bearing check, not a redundant
 /// one.
 pub(crate) static LAST_WRITE_SYSCALL_PID: AtomicU8 = AtomicU8::new(0);
+
+/// POST-MILESTONE-65 FIX: the real root cause of the disclosed
+/// "fresh-second-ATA-drive triple fault" -- found via a real `-d int`
+/// QEMU hardware trace (see this fix pass's own README entry for the
+/// full trace/analysis), not guessed at. `create_process_from_image()`/
+/// `create_process_from_elf()` both used to determine which PML4 to
+/// copy the 511 shared "kernel-space" entries FROM by calling
+/// `Cr3::read()` -- "whatever is CURRENTLY loaded" -- rather than this
+/// function's own canonically-saved `KERNEL_PML4_FRAME`. For every
+/// ORDINARY process-creation call site (every boot-time self-test,
+/// every `runfile`/`runelf` shell command, `fork()`'s own child) this
+/// silently happened to coincide with the real kernel PML4, since
+/// those all run from genuine kernel context (CR3 already restored to
+/// `KERNEL_PML4_FRAME` by the time they're reached). The ONE real
+/// exception: `exec_elf()`/`exec_elf_with_args()` (Milestones 45/58)
+/// call `create_process_from_elf()` from INSIDE the EXEC/EXECARGV
+/// syscall's own dispatch -- i.e. while CR3 is still the DYING
+/// process's OWN private PML4, not the kernel's -- the one call path
+/// in this whole file where `Cr3::read()` and `KERNEL_PML4_FRAME`
+/// genuinely diverge. Returning the real, saved value here instead
+/// closes that gap for both call sites at once, rather than patching
+/// each one separately with its own `Cr3::read()`.
+fn kernel_pml4_for_new_process() -> (PhysFrame<Size4KiB>, Cr3Flags) {
+    let frame_addr = KERNEL_PML4_FRAME.load(Ordering::SeqCst);
+    let frame = PhysFrame::<Size4KiB>::from_start_address(PhysAddr::new(frame_addr))
+        .expect("saved kernel PML4 frame address was not 4KiB-aligned");
+    let flags = Cr3Flags::from_bits_truncate(KERNEL_CR3_FLAGS_BITS.load(Ordering::SeqCst));
+    (frame, flags)
+}
 
 /// MILESTONE 30: called once at boot, before any process's PML4 could
 /// ever be loaded into CR3, so there's always a known-good value to
@@ -978,13 +1797,41 @@ pub(crate) fn read_active_heap_marker() -> u8 {
     unsafe { core::ptr::read(ptr) }
 }
 
+/// MILESTONE 57: a real, pre-existing bug this milestone's own
+/// verification found and fixed -- `read_active_heap_marker()` above
+/// unconditionally dereferences page 0 of the active process's heap,
+/// called from usertest.rs's WRITE-syscall arm purely for a diagnostic
+/// log line, on EVERY write() call, regardless of whether that process
+/// has ever touched its heap at all. Before this milestone, heap page 0
+/// was ALWAYS eagerly mapped at process-creation time, so this never
+/// faulted. As of Milestone 57's demand-paged heap, a process that never
+/// calls `sbrk()` (SIGSEGV_TEST_PROCESS/FAULT_TEST_PROCESS/
+/// WAITSTATUS_TEST_PROCESS/EXEC_TEST_PROCESS/etc. -- most of the
+/// hardcoded test processes in this file) genuinely has NO physical frame
+/// backing page 0, and a first real boot with this milestone's changes
+/// crashed the kernel for real: a page fault with a Ring0 code segment
+/// (this dereference happens from KERNEL context, mid-syscall-dispatch,
+/// not ring 3) at exactly HEAP_START, immediately after
+/// SIGSEGV_TEST_PROCESS's own write() call -- confirmed via a real QEMU
+/// boot log, not by inspection. Callers must check this FIRST and skip
+/// the read entirely if it returns `false`.
+pub(crate) fn heap_page0_mapped(id: u8) -> bool {
+    with_process_mut(id, |p| p.heap_frames[0].is_some()).unwrap_or(false)
+}
+
 /// MILESTONE 33: the `sbrk` syscall's actual kernel-side implementation
 /// -- called from usertest.rs's syscall_dispatch, syscall-2 arm, with the
 /// CURRENTLY-active process's id (from ACTIVE_PROCESS) and the requested
 /// byte count (from the caller's rdi). Bumps that process's OWN
-/// heap_used counter and returns a pointer into ITS OWN pre-mapped
-/// heap region -- `None` if the request would run past the fixed 16 KiB
-/// pre-mapped region or if `id` doesn't name a live process.
+/// heap_used counter and returns a pointer into ITS OWN heap's RESERVED
+/// (as of Milestone 57, not necessarily physically mapped -- see
+/// `try_demand_page_heap()`) virtual region -- `None` if the request
+/// would run past the fixed `HEAP_SIZE` reservation or if `id` doesn't
+/// name a live process. This function itself still never maps or
+/// touches a single physical frame -- purely virtual bookkeeping, same
+/// as before Milestone 57; a real frame only shows up once the returned
+/// pointer is actually dereferenced and a hardware page fault demand-
+/// pages it in.
 ///
 /// MILESTONE 37: now routed through with_process_mut() like every other
 /// per-process syscall, rather than matching only PROCESS_A/PROCESS_B
@@ -1005,6 +1852,410 @@ pub(crate) fn sbrk(id: u8, size: u64) -> Option<u64> {
         proc.heap_used = new_used;
         Some(ptr)
     })?
+}
+
+/// MILESTONE 57: real page-fault-driven demand paging for the per-process
+/// heap. Called from interrupts.rs's page_fault_handler, BEFORE that
+/// handler's own unconditional SIGSEGV-termination path, for exactly one
+/// case: a genuine hardware NOT-PRESENT page fault (never a protection
+/// violation -- checked by the caller, not here -- a heap page this
+/// kernel has already mapped is always PRESENT|WRITABLE|USER_ACCESSIBLE,
+/// so a protection-violation fault there would mean something is
+/// actually wrong, not a legitimate lazy-allocation request) whose
+/// faulting address falls inside `pid`'s own heap virtual range AND
+/// within bytes it has already legitimately committed via `sbrk()`
+/// (`fault_addr < HEAP_START + heap_used`) -- exactly matching real
+/// POSIX brk/demand-paging semantics: you can only fault in a page you
+/// already own via brk, not anywhere in the reserved-but-uncommitted
+/// tail of the address space. Everything else -- an address outside the
+/// heap range entirely, or inside the heap's RESERVED but not-yet-
+/// `sbrk()`'d region -- returns `false` and falls straight through to
+/// the existing, completely unmodified SIGSEGV path. See
+/// `self_test_demand_paging_heap()`'s own negative case, which proves
+/// this boundary is actually enforced, not just documented.
+///
+/// On success: allocates one fresh physical frame, zeroes it (a demand-
+/// paged heap page reads as all-zero on first touch, same as a real
+/// OS's anonymous memory -- and the same zero-fill this process's heap
+/// pages always got when they were eagerly mapped, before this
+/// milestone), maps it into `pid`'s OWN private page tables (reconstructed
+/// from its stored `pml4_frame`, the same raw-pointer-to-`&mut
+/// PageTable` pattern `create_process_from_image()` uses to build a
+/// fresh one), records it in `heap_frames[page_index]`, and returns
+/// `true`. The caller (`page_fault_handler`) then simply returns without
+/// terminating anything -- for a fault-class exception, returning from
+/// the handler naturally retries the SAME faulting instruction, which
+/// now succeeds against the freshly-mapped page. No register state needs
+/// saving/restoring here; the CPU's own interrupt-frame mechanism already
+/// handles the retry.
+pub(crate) fn try_demand_page_heap(pid: u8, fault_addr: u64) -> bool {
+    if pid == 0 || fault_addr < HEAP_START || fault_addr >= HEAP_START + HEAP_SIZE {
+        return false;
+    }
+    let offset = fault_addr - HEAP_START;
+    let page_index = (offset / PAGE_SIZE as u64) as usize;
+
+    let eligible = with_process_mut(pid, |p| {
+        offset < p.heap_used && page_index < p.heap_frames.len() && p.heap_frames[page_index].is_none()
+    });
+    if eligible != Some(true) {
+        return false;
+    }
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let pml4_frame = match with_process_mut(pid, |p| p.pml4_frame) {
+        Some(f) => f,
+        None => return false,
+    };
+
+    let new_frame = match memory::with_frame_allocator(|fa| fa.allocate_frame()) {
+        Some(Some(f)) => f,
+        _ => {
+            let _ = writeln!(
+                serial(),
+                "milestone 57: demand-page FAILED (process {pid}, fault addr {fault_addr:#x}, page {page_index}) -- out of physical frames"
+            );
+            return false;
+        }
+    };
+
+    // Zeroed through the phys-mem-offset direct view, same reasoning as
+    // every other fresh-frame zeroing in this file: this is the new
+    // frame's own physical memory, written directly rather than through
+    // a virtual address that could currently resolve through someone
+    // else's page tables.
+    let frame_virt = phys_mem_offset + new_frame.start_address().as_u64();
+    unsafe { core::ptr::write_bytes::<u8>(frame_virt.as_mut_ptr(), 0, PAGE_SIZE) };
+
+    let pml4_ptr: *mut PageTable = (phys_mem_offset + pml4_frame.start_address().as_u64()).as_mut_ptr();
+    let pml4: &mut PageTable = unsafe { &mut *pml4_ptr };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+    let heap_page = Page::<Size4KiB>::containing_address(VirtAddr::new(HEAP_START + (page_index as u64) * PAGE_SIZE as u64));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+
+    let map_result = memory::with_frame_allocator(|fa| unsafe { mapper.map_to(heap_page, new_frame, flags, fa) });
+    match map_result {
+        Some(Ok(flush)) => flush.flush(),
+        _ => {
+            unsafe { memory::with_frame_allocator(|fa| fa.deallocate_frame(new_frame)) };
+            let _ = writeln!(
+                serial(),
+                "milestone 57: demand-page FAILED (process {pid}, fault addr {fault_addr:#x}, page {page_index}) -- map_to failed"
+            );
+            return false;
+        }
+    }
+
+    with_process_mut(pid, |p| {
+        p.heap_frames[page_index] = Some(new_frame);
+    });
+
+    let _ = writeln!(
+        serial(),
+        "milestone 57: demand-paged heap page {page_index} for process {pid} (fault addr {fault_addr:#x}) -- fresh zeroed physical frame {:#x} mapped, resuming the faulting instruction",
+        new_frame.start_address().as_u64()
+    );
+    true
+}
+
+/// MILESTONE 64: the `mmap` syscall's (21) kernel-side implementation --
+/// maps `fd`'s current, ALREADY-BUFFERED content (see `OpenFile`'s own
+/// doc comment -- open() already read the whole file at open() time, so
+/// no disk access happens here either) read-only into a fresh slot of
+/// `pid`'s own `mmaps` table. Returns the new mapping's virtual address,
+/// or `None` on any of three real, honestly-refused failures: `fd`
+/// doesn't name a currently-open `FdEntry::File` for this process (a
+/// pipe end can't be mmap()'d -- it has no fixed byte content to
+/// snapshot), the file's buffered content exceeds `PAGE_SIZE` (can only
+/// happen if `fs::MAX_FILE_BYTES` and `PAGE_SIZE` ever drift apart --
+/// checked defensively even though today they're provably equal, same
+/// discipline as this module's other pre-flight arithmetic checks), or
+/// `pid`'s own `MAX_MMAPS`-sized table is already full.
+///
+/// Deliberately does NOT map any physical frame or touch the page tables
+/// at all -- exactly like `sbrk()` only ever bumps `heap_used` and lets
+/// `try_demand_page_mmap()` do the real work on first touch, this only
+/// RESERVES the virtual slot and snapshots the content; the first real
+/// hardware page fault against this address is what actually backs it
+/// with a physical frame. See `MmapSlot`'s own doc comment for why a
+/// snapshot, not a live view of the fd, is this slice's one disclosed
+/// simplification.
+pub(crate) fn mmap_file(pid: u8, fd: u64) -> Option<u64> {
+    mmap_file_impl(pid, fd, false)
+}
+
+/// MILESTONE 65: the `mmap_writable` syscall's (23) kernel-side
+/// implementation -- real, private (`MAP_PRIVATE`-equivalent) `PROT_WRITE`
+/// support, the first item of Milestone 64's own disclosed "real future
+/// work" list, re-checked directly against the actual code (not just
+/// Milestone 64's own write-up) before picking it: `MmapSlot` already had
+/// everywhere else needed (a per-process, per-slot snapshot with no
+/// sharing between mappings -- see `mmaps` field's own doc comment
+/// disclosing fork() never copies it, and no two mmap() calls anywhere in
+/// this kernel can ever alias the same physical frame), so a writable
+/// slot is ALREADY structurally private; the only real gap was the
+/// hardcoded refusal in `try_demand_page_mmap()` and the missing
+/// `WRITABLE` page-table bit. Otherwise identical to `mmap_file()` above
+/// -- same fd/size/table-full checks, same snapshot-not-live-view
+/// semantics (a write here NEVER reaches the backing fd's buffer or the
+/// on-disk file -- proven directly by `self_test_mmap_writable()` re-
+/// reading the real on-disk file afterward and finding it unchanged).
+pub(crate) fn mmap_file_writable(pid: u8, fd: u64) -> Option<u64> {
+    mmap_file_impl(pid, fd, true)
+}
+
+/// MILESTONE 64/65: shared real implementation behind `mmap_file()`
+/// (read-only, Milestone 64) and `mmap_file_writable()` (Milestone 65) --
+/// identical fd/size/table-full checks and identical "reserve the virtual
+/// slot, snapshot the content, map nothing yet" behavior either way; only
+/// `writable` (persisted onto the new `MmapSlot`) differs, consumed later
+/// by `try_demand_page_mmap()`.
+fn mmap_file_impl(pid: u8, fd: u64, writable: bool) -> Option<u64> {
+    let content = with_process_mut(pid, |proc| match proc.fds.get(fd as usize)?.as_ref()? {
+        FdEntry::File(f) => Some(f.buffer.clone()),
+        _ => None,
+    })??;
+
+    if content.len() > PAGE_SIZE {
+        let _ = writeln!(
+            serial(),
+            "milestone 64: syscall MMAP{} (process {pid}) -- FAILED, fd {fd}'s buffered content ({} bytes) exceeds PAGE_SIZE ({PAGE_SIZE}) -- fs::MAX_FILE_BYTES should make this unreachable, refusing defensively rather than truncating silently",
+            if writable { "_WRITABLE" } else { "" },
+            content.len()
+        );
+        return None;
+    }
+
+    with_process_mut(pid, |proc| {
+        let slot_index = proc.mmaps.iter().position(|s| s.is_none())?;
+        proc.mmaps[slot_index] = Some(MmapSlot { content, frame: None, writable });
+        let addr = MMAP_START + (slot_index as u64) * PAGE_SIZE as u64;
+        let _ = writeln!(
+            serial(),
+            "milestone {}: syscall MMAP{} (process {pid}) -- fd={fd} slot={slot_index} -- reserved {addr:#x} (not yet backed by any physical frame -- real demand paging on first touch, same mechanism as the per-process heap)",
+            if writable { "65" } else { "64" },
+            if writable { "_WRITABLE" } else { "" }
+        );
+        Some(addr)
+    })?
+}
+
+/// MILESTONE 64: the `munmap` syscall's (22) kernel-side implementation.
+/// `addr` must be EXACTLY a slot's own base address (`MMAP_START +
+/// i*PAGE_SIZE` for some live slot `i`) -- real, disclosed EINVAL
+/// otherwise (this slice never hands out a length/offset a caller could
+/// legitimately round from, so exact-match is the honest, complete
+/// check, not a shortcut). Unmaps the page table entry if one was ever
+/// actually demand-paged in (`frame.is_some()` -- a slot that was
+/// reserved but never touched has nothing mapped to undo), frees the
+/// physical frame back to the global allocator, and clears the slot so a
+/// later `mmap()` call can reuse it. Returns `true` on success, `false`
+/// if `addr` doesn't name any of `pid`'s own live slots.
+pub(crate) fn munmap_region(pid: u8, addr: u64) -> bool {
+    if addr < MMAP_START || addr >= MMAP_START + (MAX_MMAPS as u64) * PAGE_SIZE as u64 {
+        return false;
+    }
+    let offset = addr - MMAP_START;
+    if offset % PAGE_SIZE as u64 != 0 {
+        return false;
+    }
+    let slot_index = (offset / PAGE_SIZE as u64) as usize;
+
+    let (had_slot, frame) = with_process_mut(pid, |proc| match proc.mmaps.get(slot_index) {
+        Some(Some(slot)) => (true, slot.frame),
+        _ => (false, None),
+    })
+    .unwrap_or((false, None));
+    if !had_slot {
+        return false;
+    }
+
+    if let Some(frame) = frame {
+        let phys_mem_offset = memory::phys_mem_offset();
+        if let Some(pml4_frame) = with_process_mut(pid, |p| p.pml4_frame) {
+            let pml4_ptr: *mut PageTable = (phys_mem_offset + pml4_frame.start_address().as_u64()).as_mut_ptr();
+            let pml4: &mut PageTable = unsafe { &mut *pml4_ptr };
+            let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+            if let Ok((_, flush)) = mapper.unmap(page) {
+                flush.flush();
+            }
+        }
+        unsafe { memory::with_frame_allocator(|fa| fa.deallocate_frame(frame)) };
+    }
+
+    with_process_mut(pid, |proc| {
+        proc.mmaps[slot_index] = None;
+    });
+
+    let _ = writeln!(
+        serial(),
+        "milestone 64: syscall MUNMAP (process {pid}) -- slot={slot_index} addr={addr:#x} -- unmapped (physical frame {}), slot freed for reuse",
+        if frame.is_some() { "released" } else { "was never actually backed -- nothing to release" }
+    );
+    true
+}
+
+/// MILESTONE 64: the mmap twin of `try_demand_page_heap()` above --
+/// called from `page_fault_handler()` for exactly one additional
+/// eligible case: a genuine NOT-PRESENT fault (never a protection
+/// violation -- see this function's own `is_write` handling below for
+/// why that split matters here specifically, unlike the heap's case)
+/// whose address falls inside `pid`'s own `[MMAP_START, MMAP_START +
+/// MAX_MMAPS*PAGE_SIZE)` range AND names a slot that is currently `Some`
+/// (a real, live reservation) with `frame == None` (never yet backed).
+///
+/// **The real, hardware-enforced read-only proof, in two parts**: (1) if
+/// the fault that got us here was itself caused by a WRITE
+/// (`is_write == true`, from `error_code.contains(CAUSED_BY_WRITE)`,
+/// checked by the caller before this runs), this function refuses to
+/// populate the page at all and returns `false` -- the caller then falls
+/// through to the SAME unmodified Milestone 41 SIGSEGV termination path
+/// every other illegal access already uses. This is the "first-ever
+/// touch is itself a write" case: no page table entry has been created
+/// yet, so the CPU reports a not-present fault regardless of whether the
+/// attempted access was a read or a write -- only `error_code`'s own
+/// `CAUSED_BY_WRITE` bit distinguishes them, and this is exactly where
+/// that distinction earns its keep. (2) A READ fault DOES get populated
+/// (real content, real physical frame, mapped `PRESENT | USER_ACCESSIBLE`
+/// -- deliberately WITHOUT `WRITABLE`), so any LATER write attempt
+/// against the now-present page produces a genuine hardware
+/// PROTECTION_VIOLATION fault instead -- which `page_fault_handler()`'s
+/// own pre-existing `!error_code.contains(PROTECTION_VIOLATION)` guard
+/// already excludes from ever reaching this function at all, falling
+/// straight through to termination completely unmodified. Both paths
+/// converge on the same real, honest outcome (a write to a read-only
+/// mapping always terminates the process), verified by TWO separate
+/// self-test cases below specifically because they exercise these two
+/// genuinely different code paths (not-present-refusal vs.
+///
+/// **MILESTONE 65 update**: both parts above describe a READ-ONLY slot
+/// (`writable == false`, every slot `mmap_file()` ever creates) --
+/// completely unchanged behavior. A WRITABLE slot (`writable == true`,
+/// only ever produced by this milestone's new `mmap_file_writable()`)
+/// takes a genuinely different path at part (1)'s own decision point: a
+/// first-touch WRITE is no longer refused -- it demand-pages exactly like
+/// a first-touch READ would (real file content copied in first, THEN the
+/// page is mapped WITH `WRITABLE`, and the CPU retries the very
+/// instruction that faulted, which now succeeds and overwrites whatever
+/// byte(s) it targets). A first-touch READ on a writable slot also maps
+/// `WRITABLE` immediately (prot is a property of the mapping, decided
+/// once, not of which access happens to arrive first -- see the
+/// `flags` local below), so a LATER write against an already-mapped
+/// writable page is simply an ordinary hardware store with no fault at
+/// all, never reaching this function a second time. See
+/// `self_test_mmap_writable()` for the real proof of both of THESE two
+/// new paths, verified genuinely private (never written back to the
+/// backing fd or the on-disk file).
+/// protection-violation) rather than assuming one implies the other.
+///
+/// On success: allocates one fresh physical frame, copies the slot's
+/// snapshotted `content` into it (zero-padded past `content.len()` --
+/// real, honest "short reads as zero-fill" semantics, same as a real
+/// `mmap()`'s trailing partial page), maps it, records the frame in the
+/// slot, and returns `true` -- the caller (`page_fault_handler`) returns
+/// without terminating anything, the CPU retries the faulting
+/// instruction, which now succeeds against the freshly-mapped page.
+pub(crate) fn try_demand_page_mmap(pid: u8, fault_addr: u64, is_write: bool) -> bool {
+    if pid == 0 || fault_addr < MMAP_START || fault_addr >= MMAP_START + (MAX_MMAPS as u64) * PAGE_SIZE as u64 {
+        return false;
+    }
+    let offset = fault_addr - MMAP_START;
+    let slot_index = (offset / PAGE_SIZE as u64) as usize;
+
+    // MILESTONE 65: fetch `writable` ALONGSIDE `content` -- the refusal
+    // decision right below now depends on it. A slot created through the
+    // original (Milestone 64) `mmap_file()` always has `writable == false`,
+    // so this `is_write && !writable` check is EXACTLY Milestone 64's own
+    // unconditional `if is_write { return false }` for every pre-existing
+    // caller -- zero behavioral change for a read-only slot, verified by
+    // Milestone 64's own CASE 2/CASE 3 self-test cases still passing
+    // unmodified. Only a slot created through this milestone's new
+    // `mmap_file_writable()` (`writable == true`) reaches the new success
+    // path below.
+    let (content, writable) = match with_process_mut(pid, |p| match p.mmaps.get(slot_index) {
+        Some(Some(slot)) if slot.frame.is_none() => Some((slot.content.clone(), slot.writable)),
+        _ => None,
+    }) {
+        Some(Some(c)) => c,
+        _ => return false,
+    };
+    if is_write && !writable {
+        // Real, deliberate refusal -- see this function's own doc comment,
+        // part (1). Falls through to termination in the caller. Unchanged
+        // from Milestone 64 for every read-only slot.
+        return false;
+    }
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let pml4_frame = match with_process_mut(pid, |p| p.pml4_frame) {
+        Some(f) => f,
+        None => return false,
+    };
+
+    let new_frame = match memory::with_frame_allocator(|fa| fa.allocate_frame()) {
+        Some(Some(f)) => f,
+        _ => {
+            let _ = writeln!(
+                serial(),
+                "milestone 64: mmap demand-page FAILED (process {pid}, fault addr {fault_addr:#x}, slot {slot_index}) -- out of physical frames"
+            );
+            return false;
+        }
+    };
+
+    // Real content, zero-padded past content.len() -- same direct
+    // phys-mem-offset write technique try_demand_page_heap() uses to
+    // zero a fresh heap frame, just filled with real file bytes here
+    // instead of zeros for the first content.len() of them.
+    let frame_virt = phys_mem_offset + new_frame.start_address().as_u64();
+    unsafe { core::ptr::write_bytes::<u8>(frame_virt.as_mut_ptr(), 0, PAGE_SIZE) };
+    unsafe { core::ptr::copy_nonoverlapping(content.as_ptr(), frame_virt.as_mut_ptr::<u8>(), content.len()) };
+
+    let pml4_ptr: *mut PageTable = (phys_mem_offset + pml4_frame.start_address().as_u64()).as_mut_ptr();
+    let pml4: &mut PageTable = unsafe { &mut *pml4_ptr };
+    let mut mapper = unsafe { OffsetPageTable::new(pml4, phys_mem_offset) };
+    let mmap_page = Page::<Size4KiB>::containing_address(VirtAddr::new(MMAP_START + (slot_index as u64) * PAGE_SIZE as u64));
+    // MILESTONE 64/65: no PageTableFlags::WRITABLE for a read-only slot --
+    // see this function's own doc comment, part (2): this absence IS the
+    // real read-only enforcement mechanism, not a cosmetic default.
+    // MILESTONE 65: a WRITABLE slot gets the real hardware WRITABLE bit
+    // set HERE, at first-touch mapping time (not later, not conditionally
+    // on which access triggered the fault) -- real POSIX `mmap()` prot
+    // permissions are a property of the MAPPING, decided once at map time,
+    // not of whichever individual access happens to touch the page first.
+    // This is what lets a subsequent plain store instruction succeed with
+    // NO further fault at all once the page is present, exactly like an
+    // already-demand-paged heap page.
+    let flags = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | if writable { PageTableFlags::WRITABLE } else { PageTableFlags::empty() };
+
+    let map_result = memory::with_frame_allocator(|fa| unsafe { mapper.map_to(mmap_page, new_frame, flags, fa) });
+    match map_result {
+        Some(Ok(flush)) => flush.flush(),
+        _ => {
+            unsafe { memory::with_frame_allocator(|fa| fa.deallocate_frame(new_frame)) };
+            let _ = writeln!(
+                serial(),
+                "milestone 64: mmap demand-page FAILED (process {pid}, fault addr {fault_addr:#x}, slot {slot_index}) -- map_to failed"
+            );
+            return false;
+        }
+    }
+
+    with_process_mut(pid, |p| {
+        if let Some(slot) = p.mmaps[slot_index].as_mut() {
+            slot.frame = Some(new_frame);
+        }
+    });
+
+    let _ = writeln!(
+        serial(),
+        "milestone {}: demand-paged mmap slot {slot_index} for process {pid} (fault addr {fault_addr:#x}, is_write={is_write}) -- fresh physical frame {:#x} mapped {} with real file content, resuming the faulting instruction",
+        if writable { "65" } else { "64" },
+        new_frame.start_address().as_u64(),
+        if writable { "READ-WRITE" } else { "READ-ONLY" }
+    );
+    true
 }
 
 /// MILESTONE 35: locates whichever process `id` names and runs `f`
@@ -1058,6 +2309,46 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
             let mut guard = FAULT_TEST_PROCESS.lock();
             Some(f(guard.as_mut()?))
         }
+        DEMAND_PAGE_TEST_PROCESS_ID => {
+            let mut guard = DEMAND_PAGE_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        DEMAND_PAGE_OOB_TEST_PROCESS_ID => {
+            let mut guard = DEMAND_PAGE_OOB_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        ERRNO_TEST_PROCESS_ID => {
+            let mut guard = ERRNO_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        SIGNAL_TEST_PROCESS_ID => {
+            let mut guard = SIGNAL_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        MMAP_READ_TEST_PROCESS_ID => {
+            let mut guard = MMAP_READ_TEST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID => {
+            let mut guard = MMAP_WRITE_BEFORE_READ_FAULT_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID => {
+            let mut guard = MMAP_WRITE_AFTER_READ_FAULT_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID => {
+            let mut guard = MMAP_USE_AFTER_UNMAP_FAULT_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID => {
+            let mut guard = MMAP_WRITABLE_READ_THEN_WRITE_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
+        MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID => {
+            let mut guard = MMAP_WRITABLE_WRITE_FIRST_PROCESS.lock();
+            Some(f(guard.as_mut()?))
+        }
         id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
             let idx = (id - PID_TABLE_BASE) as usize;
             let mut guard = PROCESS_TABLE.lock();
@@ -1065,6 +2356,189 @@ fn with_process_mut<R>(id: u8, f: impl FnOnce(&mut Process) -> R) -> Option<R> {
         }
         _ => None,
     }
+}
+
+/// MILESTONE 59: sets process `id`'s own real, sticky `errno` field --
+/// the ONLY writer of `Process::errno` anywhere in this kernel.
+/// `usertest.rs`'s `syscall_dispatch` calls this on every syscall failure
+/// path that has a real, distinguishable errno.rs constant to report (see
+/// that file's own per-arm comments), immediately before setting the
+/// syscall's own bare return-value sentinel (`u64::MAX`/`0`/`1`) --
+/// exactly like a real libc's `errno` is set alongside (not instead of) a
+/// syscall's own `-1`/`NULL` return. A no-op (silently) if `id` doesn't
+/// name a live process -- the ONE real caller of this with a possibly-
+/// stale `id` is `syscall_dispatch`'s own `active` value, which is only
+/// ever nonzero while a real process.rs-owned process is genuinely
+/// running, so this should never actually miss in practice; still handled
+/// honestly rather than assumed.
+pub(crate) fn set_errno(id: u8, value: u64) {
+    with_process_mut(id, |p| p.errno = value);
+}
+
+/// MILESTONE 59: reads process `id`'s own current `errno` value -- real
+/// POSIX semantics, same as a real libc's `errno`: whatever the LAST
+/// `set_errno()` call for this process wrote, still there even if a later
+/// syscall SUCCEEDED in between (this kernel's own syscalls never clear
+/// errno on success, exactly like a real libc never does either -- only a
+/// later FAILURE overwrites it). `0` if `id` names a live process that has
+/// never failed a syscall with a real errno.rs-covered cause yet (the same
+/// "0 means no error recorded" sentinel `Process::errno`'s own doc comment
+/// documents), OR if `id` doesn't name a live process at all -- the two
+/// are intentionally not distinguished here (a caller with no live process
+/// to query has nothing more meaningful to report than "no error", the
+/// same honest fallback `getpgid()`'s own None case already uses
+/// elsewhere in this file for an unresolvable id). Backs syscall 17
+/// (GETERRNO) in `usertest.rs`.
+pub(crate) fn get_errno(id: u8) -> u64 {
+    with_process_mut(id, |p| p.errno).unwrap_or(0)
+}
+
+/// MILESTONE 60: same real authorization rule `setpgid()` already
+/// established (self, or a live child of the caller) -- reused here
+/// rather than shared as a helper `setpgid()` itself also calls, since
+/// that function's own check is inlined directly into its `authorized`
+/// let-binding, not already factored out; duplicating this small, already-
+/// working shape carries far less regression risk than refactoring a
+/// working, previously-verified function for this milestone's sake.
+fn is_self_or_live_child(caller_id: u8, target_pid: u8) -> bool {
+    if target_pid == caller_id {
+        return true;
+    }
+    if target_pid >= PID_TABLE_BASE && ((target_pid - PID_TABLE_BASE) as usize) < MAX_PROCESSES {
+        let table = PROCESS_TABLE.lock();
+        let idx = (target_pid - PID_TABLE_BASE) as usize;
+        return matches!(table[idx].as_ref(), Some(child) if child.parent_pid == Some(caller_id));
+    }
+    false
+}
+
+/// MILESTONE 60: real signal-handler registration -- backs syscall 18
+/// (SIGACTION). Real POSIX rule actually enforced: `signum ==
+/// signal::SIGKILL` is refused outright (SIGKILL can never be caught or
+/// ignored) -- see `signal::SIGKILL`'s own doc comment. `handler == 0`
+/// is a real, legal request too: it explicitly CLEARS any previously
+/// registered handler back to `SIG_DFL`, the same "0 means no handler"
+/// meaning `Process::signal_handlers`'s own doc comment already gives
+/// that value everywhere else. No authorization check -- a process may
+/// only ever register a handler for ITSELF (`id` here is always
+/// `ACTIVE_PROCESS`, the caller's own pid, from `usertest.rs`'s
+/// dispatch -- there is no "register a handler on someone else's
+/// behalf" call shape in this syscall at all, unlike `raise_signal()`
+/// below).
+pub(crate) fn sigaction(id: u8, signum: u8, handler: u64) -> Result<(), &'static str> {
+    if signum == 0 || signum as usize >= signal::NSIG {
+        return Err("signum out of range");
+    }
+    if signum == signal::SIGKILL {
+        return Err("SIGKILL cannot be caught or ignored");
+    }
+    with_process_mut(id, |p| p.signal_handlers[signum as usize] = handler).ok_or("no such process")
+}
+
+/// MILESTONE 60: real signal raising -- backs syscall 19 (SIGSEND).
+/// `signum == signal::SIGKILL` is deliberately routed to the
+/// PRE-EXISTING Milestone 41 `kill()` path instead of this milestone's
+/// new pending-signal/handler-dispatch mechanism (SIGKILL was already
+/// real; this just gives callers a single syscall that does the real
+/// thing for either case, matching real `kill(2)`'s own unified
+/// interface). Authorization: same real rule `setpgid()` already
+/// established (self, or a live child of the caller) -- self-signaling
+/// (real POSIX `raise()`) always works; signaling an unrelated process
+/// does not, this kernel having no uid/permission model yet (disclosed,
+/// same real scope-cut `setpgid()`'s own doc comment already names).
+///
+/// **Real, honest, disclosed scope cut for THIS milestone specifically**:
+/// unlike a real kernel, this one does NOT implement any default
+/// signal disposition (real POSIX: most signals default-terminate the
+/// target if it has no handler registered; a few default-ignore). A
+/// signal sent to a process with no handler registered for `signum` is
+/// therefore a real, documented no-op here (`Err`, not a silently
+/// pretended delivery) -- building a full default-action table is real,
+/// legitimately separate future work (would need its own per-signal
+/// dispositions, not just this milestone's "catch it for real" slice).
+pub(crate) fn raise_signal(caller_id: u8, target_pid: u8, signum: u8) -> Result<(), &'static str> {
+    if signum == 0 || signum as usize >= signal::NSIG {
+        return Err("signum out of range");
+    }
+    if signum == signal::SIGKILL {
+        return if kill(caller_id, target_pid) {
+            Ok(())
+        } else {
+            Err("SIGKILL delivery failed (see kill()'s own authorization rule -- target must be a live child)")
+        };
+    }
+    if !is_self_or_live_child(caller_id, target_pid) {
+        return Err("not authorized -- target is neither the caller itself nor a live child of it");
+    }
+    let handler_registered = with_process_mut(target_pid, |p| p.signal_handlers[signum as usize] != 0).ok_or("no such process")?;
+    if !handler_registered {
+        return Err("no handler registered for this signal -- no default-disposition table implemented yet, real no-op");
+    }
+    with_process_mut(target_pid, |p| p.pending_signal = Some(signum)).ok_or("no such process")?;
+    Ok(())
+}
+
+/// MILESTONE 60: called from `usertest.rs`'s `syscall_dispatch`, once,
+/// immediately before EVERY syscall's return-to-userspace (skipped only
+/// when `active == 0`, the legacy bare `usertest` excursion with no
+/// `Process` struct to hold signal state in the first place -- and
+/// naturally never reached at all for syscall 1/exit, which diverges
+/// straight into `resume_kernel()` and never returns to that check
+/// point). This is the real, honest "kernel/user boundary" this
+/// synchronous, one-ring-3-excursion-at-a-time kernel actually has --
+/// there is no preemptive mid-instruction redelivery here (a timer
+/// interrupt during ring-3 execution returns to the SAME interrupted
+/// point via the CPU's own ordinary `iretq`, not through this dispatch
+/// path at all), so checking here, on every real transition back into
+/// ring 3, is the correct and complete delivery point for this design,
+/// not a partial stand-in for one.
+///
+/// Returns `Some((signum, handler_addr))` -- and, as a side effect,
+/// CONSUMES (clears) `pending_signal` -- exactly when `id` has a real
+/// pending signal AND is not already executing inside a still-unresumed
+/// handler (see `Process::in_signal_handler`'s own doc comment for why
+/// ALL further delivery is blocked, not just the same signal number,
+/// while one is in flight). `None` otherwise, including the defensive
+/// (should-be-unreachable, `raise_signal()` already checks this before
+/// ever setting `pending_signal`) case where the registered handler was
+/// somehow cleared back to `SIG_DFL` in between raise and delivery.
+pub(crate) fn take_deliverable_signal(id: u8) -> Option<(u8, u64)> {
+    with_process_mut(id, |p| {
+        if p.in_signal_handler.is_some() {
+            return None;
+        }
+        let signum = p.pending_signal.take()?;
+        let handler = p.signal_handlers[signum as usize];
+        if handler == 0 {
+            return None;
+        }
+        Some((signum, handler))
+    })
+    .flatten()
+}
+
+/// MILESTONE 60: stashes the real, hardware-interrupted context
+/// `usertest.rs` is ABOUT to overwrite (`rip`/`rdi`/`rsp`, to redirect
+/// into the handler `take_deliverable_signal()` just named) -- see
+/// `SavedSignalContext`'s own doc comment for exactly what this is and
+/// its own disclosed kernel-side-stash scope cut. The ONLY writer of
+/// `Process::in_signal_handler`'s `Some` state.
+pub(crate) fn stash_signal_context(id: u8, ctx: SavedSignalContext) {
+    with_process_mut(id, |p| p.in_signal_handler = Some(ctx));
+}
+
+/// MILESTONE 60: real `sigreturn` -- backs syscall 20 (SIGRETURN).
+/// `.take()`s (clears) `Process::in_signal_handler`, handing the saved
+/// context back to `usertest.rs` so it can restore every field of the
+/// live `SyscallRegs` verbatim, resuming the interrupted execution
+/// exactly where the signal preempted it. `None` if `id` is not
+/// currently inside a handler this kernel itself dispatched -- a stray
+/// `SIGRETURN` call with nothing to unwind (real POSIX: undefined
+/// behavior; this kernel just refuses it honestly -- see this syscall's
+/// own dispatch arm in `usertest.rs` for what happens to the caller in
+/// that case) rather than restoring garbage.
+pub(crate) fn take_saved_signal_context(id: u8) -> Option<SavedSignalContext> {
+    with_process_mut(id, |p| p.in_signal_handler.take()).flatten()
 }
 
 /// MILESTONE 54: walks and frees the PRIVATE P3/P2/P1 page-table frames
@@ -1198,11 +2672,22 @@ fn reclaim_process_frames(p: Process) {
             fa.deallocate_frame(p.stack_frame);
         }
         n += 3;
-        for frame in p.heap_frames.iter().copied() {
+        // MILESTONE 57: heap_frames is now sparse (`Option` per slot,
+        // `None` for a never-demand-paged page) -- only free the ones
+        // that actually got a real physical frame mapped in.
+        for frame in p.heap_frames.iter().flatten().copied() {
             unsafe { fa.deallocate_frame(frame) };
             n += 1;
         }
-        for frame in p.extra_frames.iter().copied() {
+        for (_vaddr, frame) in p.extra_frames.iter().copied() {
+            unsafe { fa.deallocate_frame(frame) };
+            n += 1;
+        }
+        // MILESTONE 64: mmap frames are sparse exactly like heap_frames
+        // (`Option` per slot, `None` for a reserved-but-never-demand-
+        // paged mmap region) -- same "only free the ones that actually
+        // got a real physical frame mapped in" reasoning.
+        for frame in p.mmaps.iter().flatten().filter_map(|slot| slot.frame) {
             unsafe { fa.deallocate_frame(frame) };
             n += 1;
         }
@@ -1246,6 +2731,37 @@ fn replace_process(id: u8, new_proc: Process) -> bool {
         SIGKILL_TEST_PROCESS_ID => SIGKILL_TEST_PROCESS.lock().replace(new_proc),
         WAITSTATUS_TEST_PROCESS_ID => WAITSTATUS_TEST_PROCESS.lock().replace(new_proc),
         EXEC_TEST_PROCESS_ID => EXEC_TEST_PROCESS.lock().replace(new_proc),
+        // Note: FAULT_TEST_PROCESS_ID (10) was already, pre-existingly,
+        // never listed here either (only ever used as a fork() source,
+        // never exec()'d directly) -- left as-is, not this milestone's
+        // gap to fix. DEMAND_PAGE_TEST_PROCESS_ID/DEMAND_PAGE_OOB_TEST_
+        // PROCESS_ID are added for the same reason every OTHER
+        // hardcoded-process id is: consistency with with_process_mut()'s
+        // own dispatch, even though neither is ever exec()'d by this
+        // milestone's own self-test.
+        DEMAND_PAGE_TEST_PROCESS_ID => DEMAND_PAGE_TEST_PROCESS.lock().replace(new_proc),
+        DEMAND_PAGE_OOB_TEST_PROCESS_ID => DEMAND_PAGE_OOB_TEST_PROCESS.lock().replace(new_proc),
+        // MILESTONE 59: ERRNO_TEST_PROCESS_ID added for the same
+        // consistency-with-with_process_mut() reason as the two entries
+        // just above, even though it's never exec()'d by this
+        // milestone's own self-test either.
+        ERRNO_TEST_PROCESS_ID => ERRNO_TEST_PROCESS.lock().replace(new_proc),
+        // MILESTONE 60: same consistency-with-with_process_mut() reason
+        // as ERRNO_TEST_PROCESS_ID just above.
+        SIGNAL_TEST_PROCESS_ID => SIGNAL_TEST_PROCESS.lock().replace(new_proc),
+        // MILESTONE 64: same consistency-with-with_process_mut() reason as
+        // every entry just above -- none of the four mmap test processes
+        // is ever exec()'d by this milestone's own self-test either.
+        MMAP_READ_TEST_PROCESS_ID => MMAP_READ_TEST_PROCESS.lock().replace(new_proc),
+        MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID => MMAP_WRITE_BEFORE_READ_FAULT_PROCESS.lock().replace(new_proc),
+        MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID => MMAP_WRITE_AFTER_READ_FAULT_PROCESS.lock().replace(new_proc),
+        MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID => MMAP_USE_AFTER_UNMAP_FAULT_PROCESS.lock().replace(new_proc),
+        // MILESTONE 65: same consistency-with-with_process_mut() reason as
+        // every MMAP_* entry just above -- neither of these two new
+        // writable-mmap test processes is ever exec()'d by this
+        // milestone's own self-test either.
+        MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID => MMAP_WRITABLE_READ_THEN_WRITE_PROCESS.lock().replace(new_proc),
+        MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID => MMAP_WRITABLE_WRITE_FIRST_PROCESS.lock().replace(new_proc),
         id if id >= PID_TABLE_BASE && ((id - PID_TABLE_BASE) as usize) < MAX_PROCESSES => {
             let idx = (id - PID_TABLE_BASE) as usize;
             PROCESS_TABLE.lock()[idx].replace(new_proc)
@@ -1552,7 +3068,12 @@ fn create_process_from_image(
     let new_pml4: &mut PageTable = unsafe { &mut *new_pml4_ptr };
     new_pml4.zero();
 
-    let (kernel_pml4_frame, _) = Cr3::read();
+    // POST-MILESTONE-65 FIX: was `Cr3::read()` (whatever is CURRENTLY
+    // loaded) -- now the canonically-saved kernel PML4, always correct
+    // regardless of which process's own PML4 happens to be loaded at
+    // this specific call site. See kernel_pml4_for_new_process()'s own
+    // doc comment for the real bug this closes.
+    let (kernel_pml4_frame, _) = kernel_pml4_for_new_process();
     let kernel_pml4_ptr: *const PageTable = (phys_mem_offset + kernel_pml4_frame.start_address().as_u64()).as_ptr();
     let kernel_pml4: &PageTable = unsafe { &*kernel_pml4_ptr };
 
@@ -1599,37 +3120,25 @@ fn create_process_from_image(
         stack_frame.start_address().as_u64()
     );
 
-    // MILESTONE 33: pre-map this process's own private heap pages, same
-    // flags and same private-P3/P2/P1-chain mechanism as code/stack above
-    // -- HEAP_START shares USER_CODE_ADDR/USER_STACK_ADDR's p4_index
-    // (170), so this extends the SAME private chain create_process()
-    // already started building for this process, rather than needing any
-    // new PML4-level privacy reasoning.
-    let mut heap_frames = Vec::with_capacity(HEAP_PAGE_COUNT as usize);
-    for i in 0..HEAP_PAGE_COUNT {
-        let heap_frame = frame_allocator.allocate_frame().ok_or("out of physical frames (heap)")?;
-        let heap_page = Page::<Size4KiB>::containing_address(VirtAddr::new(HEAP_START + i * PAGE_SIZE as u64));
-        unsafe {
-            process_mapper
-                .map_to(heap_page, heap_frame, flags, frame_allocator)
-                .map_err(|_| "map_to failed (heap page)")?
-                .flush();
-        }
-        // Zeroed through the phys-mem-offset direct view, same reasoning
-        // as the code page's zeroing below -- this process's own frame,
-        // written directly rather than through a VA that could currently
-        // resolve through someone else's page tables.
-        let heap_frame_virt = phys_mem_offset + heap_frame.start_address().as_u64();
-        unsafe { core::ptr::write_bytes::<u8>(heap_frame_virt.as_mut_ptr(), 0, PAGE_SIZE) };
-        heap_frames.push(heap_frame);
-    }
+    // MILESTONE 57: the heap's virtual range (HEAP_START..HEAP_START+
+    // HEAP_SIZE, same private-P3/P2/P1-chain territory as code/stack
+    // above -- HEAP_START shares USER_CODE_ADDR/USER_STACK_ADDR's
+    // p4_index (170)) is RESERVED here but genuinely NOT mapped: zero
+    // physical frames, zero map_to() calls, zero page-table frames
+    // allocated for it at process-creation time. Every one of this
+    // process's 64 heap-page slots starts `None` -- a real hardware page
+    // fault is what maps a page in, lazily, the first time it's actually
+    // touched (see `try_demand_page_heap()`, called from
+    // interrupts.rs's page_fault_handler). Before this milestone, this
+    // exact spot eagerly allocated+mapped+zeroed every heap page up
+    // front, unconditionally, whether `sbrk()` was ever called or not.
+    let heap_frames: Vec<Option<PhysFrame<Size4KiB>>> = vec![None; HEAP_PAGE_COUNT as usize];
     let _ = writeln!(
         serial(),
-        "milestone 33: process {label} -- private heap mapped: {} pages at {:#x}..{:#x}, backed by physical frames {:?}",
+        "milestone 57: process {label} -- private heap RESERVED (not mapped): {} pages at {:#x}..{:#x}, 0 physical frames committed until a real page fault demand-pages one",
         HEAP_PAGE_COUNT,
         HEAP_START,
-        HEAP_START + HEAP_SIZE - 1,
-        heap_frames.iter().map(|f| f.start_address().as_u64()).collect::<Vec<_>>()
+        HEAP_START + HEAP_SIZE - 1
     );
 
     // Written through the phys-mem-offset DIRECT view of this process's
@@ -1688,6 +3197,31 @@ fn create_process_from_image(
         // kernel has ever run starts at the same fixed address -- see
         // this field's own doc comment on the struct definition.
         entry: usertest::USER_CODE_ADDR,
+        // MILESTONE 59: every fresh process (including a freshly forked
+        // child -- fork_build_child() goes through this same
+        // constructor, see its own doc comment) starts with a clean
+        // slate, same real convention as a genuine new process image
+        // never having called anything that could have set errno yet.
+        errno: 0,
+        // MILESTONE 60: every fresh process (including a freshly forked
+        // child) starts with NO handlers registered (all SIG_DFL/0), no
+        // signal pending, and not inside any handler -- real, honest
+        // "clean slate" convention, same as errno just above. Disclosed
+        // real gap, not silently done or silently skipped: a genuine
+        // fork()'d child does NOT inherit its parent's registered
+        // handlers here (real POSIX fork() DOES inherit signal
+        // disposition) -- fork_build_child() goes through this exact
+        // constructor and never copies `signal_handlers` across from the
+        // parent afterward, unlike its own explicit heap/pgid copying.
+        // Real future work, not pretended complete.
+        signal_handlers: [0; signal::NSIG],
+        pending_signal: None,
+        in_signal_handler: None,
+        // MILESTONE 64: every fresh process (including a freshly forked
+        // child -- see `mmaps`' own doc comment for the disclosed
+        // fork()-inheritance gap) starts with an empty mmap table, same
+        // real "clean slate" convention as errno/signal_handlers above.
+        mmaps: [None, None, None, None],
     })
 }
 
@@ -1941,6 +3475,230 @@ pub fn init_fault_test_process(
     Ok(())
 }
 
+/// MILESTONE 57: creates DEMAND_PAGE_TEST_PROCESS -- see that static's
+/// own doc comment. Mirrors init_fault_test_process()'s exact pattern,
+/// except this one IS `run()` directly (a top-level excursion, not a
+/// fork() source) -- self_test_demand_paging_heap() below runs it for
+/// real and then inspects its heap_frames afterward.
+pub fn init_demand_page_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 57: creating DEMAND_PAGE_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "demand-page-test", &DEMAND_PAGE_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 57: DEMAND_PAGE_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = DEMAND_PAGE_TEST_PROCESS_ID;
+    *DEMAND_PAGE_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 57: creates DEMAND_PAGE_OOB_TEST_PROCESS -- see that
+/// static's own doc comment. Also `run()` directly, same as
+/// DEMAND_PAGE_TEST_PROCESS above; this one is EXPECTED to fault and be
+/// terminated by the unchanged Milestone 41 SIGSEGV path.
+pub fn init_demand_page_oob_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 57: creating DEMAND_PAGE_OOB_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "demand-page-oob-test", &DEMAND_PAGE_OOB_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 57: DEMAND_PAGE_OOB_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = DEMAND_PAGE_OOB_TEST_PROCESS_ID;
+    *DEMAND_PAGE_OOB_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 59: creates ERRNO_TEST_PROCESS -- see ERRNO_TEST_PROGRAM's
+/// own doc comment. Mirrors init_demand_page_test_process()'s exact
+/// pattern (a top-level excursion `run()`s directly, not a fork()
+/// source) -- self_test_errno() below runs it for real and then checks
+/// the process's own final `errno` field afterward.
+pub fn init_errno_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 59: creating ERRNO_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "errno-test", &ERRNO_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 59: ERRNO_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = ERRNO_TEST_PROCESS_ID;
+    *ERRNO_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 60: creates SIGNAL_TEST_PROCESS -- see SIGNAL_TEST_PROGRAM's
+/// own doc comment. Mirrors init_errno_test_process()'s exact pattern (a
+/// top-level excursion `run()`s directly, not a fork() source) --
+/// self_test_signal_delivery() below runs it for real and then checks its own
+/// heap markers afterward.
+pub fn init_signal_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 60: creating SIGNAL_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "signal-test", &SIGNAL_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 60: SIGNAL_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = SIGNAL_TEST_PROCESS_ID;
+    *SIGNAL_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 64: creates MMAP_READ_TEST_PROCESS -- see
+/// MMAP_READ_TEST_PROGRAM's own doc comment. Mirrors
+/// init_demand_page_test_process()'s exact pattern (a top-level excursion
+/// `run()`s directly, not a fork() source) -- self_test_mmap() below runs
+/// it for real and then checks its own heap markers afterward.
+pub fn init_mmap_read_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 64: creating MMAP_READ_TEST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "mmap-read-test", &MMAP_READ_TEST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: MMAP_READ_TEST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = MMAP_READ_TEST_PROCESS_ID;
+    *MMAP_READ_TEST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 64: creates MMAP_WRITE_BEFORE_READ_FAULT_PROCESS -- see
+/// MMAP_WRITE_BEFORE_READ_FAULT_PROGRAM's own doc comment. Same pattern
+/// as init_mmap_read_test_process() above; this one is EXPECTED to fault
+/// and be terminated by the unchanged Milestone 41 SIGSEGV path.
+pub fn init_mmap_write_before_read_fault_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 64: creating MMAP_WRITE_BEFORE_READ_FAULT_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "mmap-write-before-read-fault-test", &MMAP_WRITE_BEFORE_READ_FAULT_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: MMAP_WRITE_BEFORE_READ_FAULT_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID;
+    *MMAP_WRITE_BEFORE_READ_FAULT_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 64: creates MMAP_WRITE_AFTER_READ_FAULT_PROCESS -- see
+/// MMAP_WRITE_AFTER_READ_FAULT_PROGRAM's own doc comment. Same pattern as
+/// init_mmap_read_test_process() above; this one is EXPECTED to fault and
+/// be terminated by the unchanged Milestone 41 SIGSEGV path, AFTER its
+/// first heap marker is genuinely set.
+pub fn init_mmap_write_after_read_fault_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 64: creating MMAP_WRITE_AFTER_READ_FAULT_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "mmap-write-after-read-fault-test", &MMAP_WRITE_AFTER_READ_FAULT_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: MMAP_WRITE_AFTER_READ_FAULT_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID;
+    *MMAP_WRITE_AFTER_READ_FAULT_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 64: creates MMAP_USE_AFTER_UNMAP_FAULT_PROCESS -- see
+/// MMAP_USE_AFTER_UNMAP_FAULT_PROGRAM's own doc comment. Same pattern as
+/// init_mmap_read_test_process() above; this one is EXPECTED to fault and
+/// be terminated by the unchanged Milestone 41 SIGSEGV path, AFTER its
+/// first two heap markers are genuinely set.
+pub fn init_mmap_use_after_unmap_fault_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 64: creating MMAP_USE_AFTER_UNMAP_FAULT_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "mmap-use-after-unmap-fault-test", &MMAP_USE_AFTER_UNMAP_FAULT_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: MMAP_USE_AFTER_UNMAP_FAULT_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID;
+    *MMAP_USE_AFTER_UNMAP_FAULT_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 65: creates MMAP_WRITABLE_READ_THEN_WRITE_PROCESS -- see
+/// MMAP_WRITABLE_READ_THEN_WRITE_PROGRAM's own doc comment. Same pattern
+/// as init_mmap_read_test_process() above.
+pub fn init_mmap_writable_read_then_write_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 65: creating MMAP_WRITABLE_READ_THEN_WRITE_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "mmap-writable-read-then-write-test", &MMAP_WRITABLE_READ_THEN_WRITE_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 65: MMAP_WRITABLE_READ_THEN_WRITE_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID;
+    *MMAP_WRITABLE_READ_THEN_WRITE_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
+/// MILESTONE 65: creates MMAP_WRITABLE_WRITE_FIRST_PROCESS -- see
+/// MMAP_WRITABLE_WRITE_FIRST_PROGRAM's own doc comment. Same pattern as
+/// init_mmap_read_test_process() above.
+pub fn init_mmap_writable_write_first_test_process(
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    phys_mem_offset: VirtAddr,
+) -> Result<(), &'static str> {
+    let _ = writeln!(serial(), "milestone 65: creating MMAP_WRITABLE_WRITE_FIRST_PROCESS's private address space...");
+    let mut p = create_process_from_image(frame_allocator, phys_mem_offset, "mmap-writable-write-first-test", &MMAP_WRITABLE_WRITE_FIRST_PROGRAM)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 65: MMAP_WRITABLE_WRITE_FIRST_PROCESS created -- pml4={:#x} code={:#x} stack={:#x}",
+        p.pml4_frame.start_address().as_u64(),
+        p.code_frame.start_address().as_u64(),
+        p.stack_frame.start_address().as_u64()
+    );
+    p.pgid = MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID;
+    *MMAP_WRITABLE_WRITE_FIRST_PROCESS.lock() = Some(p);
+    Ok(())
+}
+
 /// MILESTONE 30: the `runproc N` shell command's entry point. Switches
 /// CR3 to process N's own PML4, enters ring 3 at the SAME virtual
 /// address usertest.rs always uses, lets the syscalls run (write reads
@@ -1962,9 +3720,19 @@ pub fn run(id: u8) -> Result<(), &'static str> {
         WAITSTATUS_TEST_PROCESS_ID => &WAITSTATUS_TEST_PROCESS,
         EXEC_TEST_PROCESS_ID => &EXEC_TEST_PROCESS,
         FAULT_TEST_PROCESS_ID => &FAULT_TEST_PROCESS,
+        DEMAND_PAGE_TEST_PROCESS_ID => &DEMAND_PAGE_TEST_PROCESS,
+        DEMAND_PAGE_OOB_TEST_PROCESS_ID => &DEMAND_PAGE_OOB_TEST_PROCESS,
+        ERRNO_TEST_PROCESS_ID => &ERRNO_TEST_PROCESS,
+        SIGNAL_TEST_PROCESS_ID => &SIGNAL_TEST_PROCESS,
+        MMAP_READ_TEST_PROCESS_ID => &MMAP_READ_TEST_PROCESS,
+        MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID => &MMAP_WRITE_BEFORE_READ_FAULT_PROCESS,
+        MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID => &MMAP_WRITE_AFTER_READ_FAULT_PROCESS,
+        MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID => &MMAP_USE_AFTER_UNMAP_FAULT_PROCESS,
+        MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID => &MMAP_WRITABLE_READ_THEN_WRITE_PROCESS,
+        MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID => &MMAP_WRITABLE_WRITE_FIRST_PROCESS,
         _ => {
             return Err(
-                "no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), 7 (SIGKILL_TEST_PROCESS_ID), 8 (WAITSTATUS_TEST_PROCESS_ID), 9 (EXEC_TEST_PROCESS_ID), or 10 (FAULT_TEST_PROCESS_ID)",
+                "no such process -- use 1, 2, 4 (FDTEST_PROCESS_ID), 5 (FORK_TEST_PROCESS_ID), 6 (SIGSEGV_TEST_PROCESS_ID), 7 (SIGKILL_TEST_PROCESS_ID), 8 (WAITSTATUS_TEST_PROCESS_ID), 9 (EXEC_TEST_PROCESS_ID), 10 (FAULT_TEST_PROCESS_ID), 11 (DEMAND_PAGE_TEST_PROCESS_ID), 12 (DEMAND_PAGE_OOB_TEST_PROCESS_ID), 17 (ERRNO_TEST_PROCESS_ID), 18 (SIGNAL_TEST_PROCESS_ID), 19 (MMAP_READ_TEST_PROCESS_ID), 20 (MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID), 21 (MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID), or 22 (MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID)",
             );
         }
     };
@@ -2132,7 +3900,46 @@ pub fn run_loaded_process() -> Result<(), &'static str> {
 /// completely legal ELF, e.g. for .bss), so file size alone doesn't
 /// bound how many PHYSICAL FRAMES a malicious/malformed ELF could try
 /// to claim.
-const MAX_PAGES_PER_ELF_SEGMENT: u64 = 4;
+/// MILESTONE 70 UPDATE: raised 4 -> 64 (16 KiB -> 256 KiB per segment).
+/// Real trigger: Tier 3's own toolchain binary, the embedded `cc.elf`
+/// (loaded straight out of the kernel image via `include_bytes!` in
+/// loader.rs -- NOT subject to fs.rs's separate, unrelated, still-
+/// unraised `MAX_FILE_BYTES` 4096-byte on-disk-file cap, which only
+/// bounds files cc.elf itself later WRITES to disk, e.g. its own
+/// compiled output) grew from Milestone 69's 17952 bytes to Milestone
+/// 70's 24112 bytes adding real comparison-operator and if/else
+/// codegen, needing 6 pages in its one PT_LOAD segment -- already past
+/// the old 4-page cap, confirmed the hard way via a real fresh-QEMU-
+/// boot failure: `milestone 67: self-test FAILED -- run_loaded_elf_
+/// process(cc.elf) returned Err: elf: a PT_LOAD segment needs more
+/// pages than this loader's fixed per-segment cap` (see
+/// `m70_fresh_boot.log` in the repo root).
+///
+/// Same class of situation as Milestone 57's `HEAP_PAGE_COUNT`
+/// increase (4 -> 64 pages): a real, legitimately growing component
+/// outgrew an initially-conservative limit, not a bug to route around.
+/// The cap's own job (per its ORIGINAL doc comment above -- still true)
+/// is defending against a MALICIOUS/malformed ELF's `p_memsz` claiming
+/// far more physical frames than its file size would suggest; it was
+/// never meant to track this one specific, honest, ever-growing
+/// toolchain binary at its exact current size, which is why it keeps
+/// needing to move as Tier 3 continues (subset-C grammar growth already
+/// planned next, then a real assembler, then a real linker, per the
+/// Tier 3 roadmap and Milestone 69's own "still genuinely open" list).
+///
+/// 64 pages (256 KiB) is chosen, not an unbounded/very large number,
+/// for a real reason: this is still meant as a genuine "reject up
+/// front" safety cap, not a formality -- QEMU's default boot (no `-m`
+/// flag anywhere in `src/main.rs`/`launch_qemu.ps1`) gives this kernel
+/// 128 MiB (32768 4 KiB pages) of physical memory total, so even a
+/// single process claiming the full 64-page cap would use under 0.2%
+/// of it; 64 pages is roughly 10x cc.elf's real current need (6 pages),
+/// real headroom for several more milestones of grammar/codegen growth
+/// without being "whatever the file happens to ask for". If a future
+/// Tier 3 milestone (the assembler/linker work named above) genuinely
+/// outgrows this again, the fix is the same as this one: bump it again,
+/// with the same real-growth justification, not delete the cap.
+const MAX_PAGES_PER_ELF_SEGMENT: u64 = 64;
 /// Real, disclosed bound on PT_LOAD segment count this loader will
 /// actually map -- elf::parse() already enforces its own
 /// elf::MAX_LOAD_SEGMENTS cap on how many it will even PARSE; this is
@@ -2141,12 +3948,19 @@ const MAX_PAGES_PER_ELF_SEGMENT: u64 = 4;
 /// layers' caps are independently visible in a diff instead of one
 /// hidden re-export away).
 const MAX_ELF_LOAD_SEGMENTS: usize = elf::MAX_LOAD_SEGMENTS;
-/// Total physical pages this loader will map across EVERY PT_LOAD
-/// segment combined, for one ELF-loaded process -- 16 pages (64 KiB) is
-/// comfortably more than this milestone's own 2-segment/2-page test
-/// ELF needs, while still being a real, fixed, disclosed ceiling rather
-/// than "however much the file happens to ask for".
-const MAX_TOTAL_ELF_PAGES: u64 = 16;
+/// MILESTONE 70 UPDATE: raised 16 -> 128 (64 KiB -> 512 KiB total).
+/// Kept at 2x the new `MAX_PAGES_PER_ELF_SEGMENT` (same 2x ratio the
+/// ORIGINAL 16-vs-4 pair already used) rather than raised independently
+/// -- cc.elf itself is still ONE PT_LOAD segment (see
+/// `tools/cc_src/linker.ld`'s own single `seg1` PHDR), so this total
+/// only actually matters today for a future multi-segment ELF (e.g. a
+/// real linker emitting separate .text/.rodata/.data segments, named as
+/// still-not-built in Milestone 69's own "still genuinely open" list);
+/// 128 pages (512 KiB) is still under 0.4% of this kernel's real 128
+/// MiB default QEMU memory, same "comfortably generous, still a real
+/// disclosed ceiling" reasoning as the per-segment cap just above, not
+/// re-derived from a different principle.
+const MAX_TOTAL_ELF_PAGES: u64 = 128;
 
 /// MILESTONE 36: the real page-table-building mechanism for a genuine
 /// ELF64 executable -- maps ONE PHYSICAL PAGE PER PT_LOAD-SEGMENT-PAGE
@@ -2281,7 +4095,15 @@ fn create_process_from_elf(
     let new_pml4: &mut PageTable = unsafe { &mut *new_pml4_ptr };
     new_pml4.zero();
 
-    let (kernel_pml4_frame, _) = Cr3::read();
+    // POST-MILESTONE-65 FIX: same real fix as create_process_from_image()
+    // above -- was `Cr3::read()`, now the canonically-saved kernel PML4.
+    // THIS call site is the one that actually matters: exec_elf()/
+    // exec_elf_with_args() call this function from INSIDE the EXEC/
+    // EXECARGV syscall's own dispatch, while CR3 is still the DYING
+    // process's own private PML4 -- see kernel_pml4_for_new_process()'s
+    // own doc comment for the full, real, `-d int`-trace-confirmed
+    // story.
+    let (kernel_pml4_frame, _) = kernel_pml4_for_new_process();
     let kernel_pml4_ptr: *const PageTable = (phys_mem_offset + kernel_pml4_frame.start_address().as_u64()).as_ptr();
     let kernel_pml4: &PageTable = unsafe { &*kernel_pml4_ptr };
 
@@ -2372,7 +4194,13 @@ fn create_process_from_elf(
             if page_va == entry_page {
                 code_frame = Some(frame);
             } else {
-                extra_frames.push(frame);
+                // MILESTONE 69: now also carries page_va -- see
+                // extra_frames' own doc comment on Process for why
+                // fork() genuinely needs it (real address, not
+                // recomputed/assumed) to remap this exact page at the
+                // exact SAME virtual address in a forked child's own
+                // private PML4.
+                extra_frames.push((VirtAddr::new(page_va), frame));
             }
         }
     }
@@ -2401,28 +4229,15 @@ fn create_process_from_elf(
         stack_frame.start_address().as_u64()
     );
 
-    // Same private heap pre-mapping as create_process_from_image() --
-    // every process gets one uniformly, ELF-loaded or not (see that
-    // function's own comment; sbrk() itself still only recognizes
+    // MILESTONE 57: same reserved-but-not-mapped heap as
+    // create_process_from_image() -- see that function's own comment for
+    // the full reasoning; sbrk() itself still only recognizes
     // PROCESS_A/PROCESS_B ids, an existing, already-disclosed
-    // Milestone 34 limitation this milestone doesn't change).
-    let mut heap_frames = Vec::with_capacity(HEAP_PAGE_COUNT as usize);
-    for i in 0..HEAP_PAGE_COUNT {
-        let heap_frame = frame_allocator.allocate_frame().ok_or("out of physical frames (heap)")?;
-        let heap_page = Page::<Size4KiB>::containing_address(VirtAddr::new(HEAP_START + i * PAGE_SIZE as u64));
-        unsafe {
-            process_mapper
-                .map_to(heap_page, heap_frame, flags, frame_allocator)
-                .map_err(|_| "map_to failed (heap page)")?
-                .flush();
-        }
-        let heap_frame_virt = phys_mem_offset + heap_frame.start_address().as_u64();
-        unsafe { core::ptr::write_bytes::<u8>(heap_frame_virt.as_mut_ptr(), 0, PAGE_SIZE) };
-        heap_frames.push(heap_frame);
-    }
+    // Milestone 34 limitation this milestone doesn't change.
+    let heap_frames: Vec<Option<PhysFrame<Size4KiB>>> = vec![None; HEAP_PAGE_COUNT as usize];
     let _ = writeln!(
         serial(),
-        "milestone 36: process {label} -- private heap mapped: {} pages at {:#x}..{:#x}",
+        "milestone 57: process {label} -- private heap RESERVED (not mapped): {} pages at {:#x}..{:#x}, 0 physical frames committed until a real page fault demand-pages one",
         HEAP_PAGE_COUNT,
         HEAP_START,
         HEAP_START + HEAP_SIZE - 1
@@ -2455,22 +4270,63 @@ fn create_process_from_elf(
         // MILESTONE 44: the real, parsed e_entry -- no longer forced to
         // equal USER_CODE_ADDR. See Process::entry's own doc comment.
         entry,
+        // MILESTONE 59: same real convention as create_process_from_image's
+        // identical field -- a freshly loaded ELF process has never called
+        // anything that could have set errno yet.
+        errno: 0,
+        // MILESTONE 60: same real "clean slate" convention as
+        // create_process_from_image's identical fields -- see that
+        // constructor's own doc comment (including the disclosed
+        // fork()-inheritance gap, which doesn't apply here anyway since
+        // an ELF-loaded process is never itself a forked child).
+        signal_handlers: [0; signal::NSIG],
+        pending_signal: None,
+        in_signal_handler: None,
+        // MILESTONE 64: same real "clean slate" convention as
+        // create_process_from_image's identical field.
+        mmaps: [None, None, None, None],
     })
 }
 
-/// MILESTONE 36: the `runelf PATH` shell command's entry point (called
-/// from loader.rs's run_elf(), which does the real fs::read_file() +
-/// elf::parse() first and hands this function the already-parsed
-/// elf::ElfImage). Builds a fresh process from a genuine multi-segment
-/// ELF64 executable's PT_LOAD segments and runs it once immediately --
-/// otherwise identical to load_and_run_image()'s own CR3-switch /
-/// enter_ring3_now() / (exit syscall restores CR3) sequence. Reuses the
-/// SAME LOADED_PROCESS slot and LOADED_PROCESS_ID as the flat-binary
-/// `runfile` path above -- both are real, single-slot "one loaded
+/// MILESTONE 36: builds a fresh process from a genuine multi-segment
+/// ELF64 executable's PT_LOAD segments -- the "needs frame_allocator"
+/// half of what used to be one combined `load_and_run_elf()` function.
+/// Reuses the SAME LOADED_PROCESS slot and LOADED_PROCESS_ID as the
+/// flat-binary `runfile` path -- both are real, single-slot "one loaded
 /// process at a time" designs, and since `runfile`/`runelf` are never
 /// both mid-flight at once (the shell runs one command to completion
 /// before reading the next), sharing the slot is safe, not a race.
-pub fn load_and_run_elf(
+///
+/// MILESTONE 57: split out of the original combined `load_and_run_elf()`
+/// for the EXACT SAME real reason Milestone 35 already split
+/// `load_and_run_image()` into `create_loaded_process()`/
+/// `run_loaded_process()` (see `run_file()`'s own doc comment in
+/// loader.rs) -- except this time the bug is freshly real rather than
+/// merely wasteful. Before this milestone, running the WHOLE ring-3
+/// excursion from inside `memory::with_frame_allocator()`'s closure was
+/// harmless (the excursion itself never touched `frame_allocator`). As
+/// of Milestone 57's demand-paged heap, it is NOT harmless: a heap page
+/// fault occurring DURING that excursion needs `try_demand_page_heap()`
+/// to call `memory::with_frame_allocator()` itself to get a fresh frame
+/// -- and `spin::Mutex` is not reentrant, so a heap fault occurring while
+/// still inside the OUTER `with_frame_allocator()` call (exactly what
+/// `run_elf()`/`self_test_altentry_elf()`/`self_test_malloc()` all did,
+/// unchanged since Milestone 36) spins forever trying to re-acquire a
+/// lock this same execution context already holds. **Found via a real,
+/// reproducible QEMU crash, not by inspection**: `self_test_malloc()`'s
+/// real malloctest.elf is the first ELF-loaded program in this project's
+/// history to actually touch its heap (a real `sys_sbrk()` call followed
+/// by a real write to the returned pointer) -- every boot up to and
+/// including this milestone's first attempt reproducibly hung/crashed
+/// (QEMU exit code 2, no further kernel output, confirmed via a real
+/// `-d int` trace showing the CPU correctly took the #PF vector and then
+/// nothing further was ever logged) at exactly that first heap touch,
+/// while `self_test_altentry_elf()` (which never touches its heap) and
+/// every hardcoded-process `runproc N` path (which never calls
+/// `load_and_run_elf()` / never holds this lock at all) kept working
+/// fine in the SAME boot -- real evidence isolating the bug to this one
+/// specific lock-scoping gap, not demand paging itself being broken.
+pub fn create_loaded_elf_process(
     frame_allocator: &mut impl FrameAllocator<Size4KiB>,
     phys_mem_offset: VirtAddr,
     image: &[u8],
@@ -2486,8 +4342,27 @@ pub fn load_and_run_elf(
     )?;
     // MILESTONE 42: founder of its own group, same reasoning as A/B.
     proc.pgid = LOADED_PROCESS_ID;
-    let pml4_frame = proc.pml4_frame;
     *LOADED_PROCESS.lock() = Some(proc);
+    Ok(())
+}
+
+/// MILESTONE 36/57: the ring-3-excursion half of what used to be one
+/// combined `load_and_run_elf()` -- called AFTER
+/// `create_loaded_elf_process()`'s own `memory::with_frame_allocator()`
+/// call has already returned (lock dropped), mirroring
+/// `run_loaded_process()`'s exact precedent so a real page fault DURING
+/// this excursion (Milestone 57's demand-paged heap) can safely call
+/// `memory::with_frame_allocator()` itself without deadlocking. `entry`
+/// is passed explicitly (Milestone 44's real, non-`USER_CODE_ADDR`-
+/// forced entry point) rather than re-read out of LOADED_PROCESS, same
+/// reasoning `run_loaded_process()` already documents for its own
+/// USER_CODE_ADDR case.
+pub fn run_loaded_elf_process(entry: u64) -> Result<(), &'static str> {
+    let pml4_frame = {
+        let guard = LOADED_PROCESS.lock();
+        let proc = guard.as_ref().ok_or("no loaded ELF process -- create_loaded_elf_process must succeed first")?;
+        proc.pml4_frame
+    };
 
     let _ = writeln!(
         serial(),
@@ -2501,14 +4376,14 @@ pub fn load_and_run_elf(
     let _ = writeln!(
         serial(),
         "milestone 36: CR3 switched -- entering ring 3 for the ELF-loaded process at {:#x} (real e_entry)",
-        elf_image.entry
+        entry
     );
 
     // MILESTONE 44: the real point of this milestone -- entry no longer
     // has to be USER_CODE_ADDR, and this is a genuinely different value
     // for a real test ELF built with a different linker script entry
     // point.
-    usertest::enter_ring3_now(elf_image.entry);
+    usertest::enter_ring3_now(entry);
 
     let _ = writeln!(
         serial(),
@@ -2744,13 +4619,14 @@ fn fork_build_child(
     phys_mem_offset: VirtAddr,
     parent_code_frame: PhysFrame<Size4KiB>,
     parent_stack_frame: PhysFrame<Size4KiB>,
-    parent_heap_frames: &[PhysFrame<Size4KiB>],
+    parent_heap_frames: &[Option<PhysFrame<Size4KiB>>],
+    parent_extra_frames: &[(VirtAddr, PhysFrame<Size4KiB>)],
 ) -> Result<Process, &'static str> {
     let code_virt = phys_mem_offset + parent_code_frame.start_address().as_u64();
     let mut code_bytes = vec![0u8; PAGE_SIZE];
     unsafe { core::ptr::copy_nonoverlapping(code_virt.as_ptr::<u8>(), code_bytes.as_mut_ptr(), PAGE_SIZE) };
 
-    let child = create_process_from_image(frame_allocator, phys_mem_offset, "forked-child", &code_bytes)?;
+    let mut child = create_process_from_image(frame_allocator, phys_mem_offset, "forked-child", &code_bytes)?;
 
     let child_stack_virt = phys_mem_offset + child.stack_frame.start_address().as_u64();
     let parent_stack_virt = phys_mem_offset + parent_stack_frame.start_address().as_u64();
@@ -2758,11 +4634,75 @@ fn fork_build_child(
         core::ptr::copy_nonoverlapping(parent_stack_virt.as_ptr::<u8>(), child_stack_virt.as_mut_ptr::<u8>(), PAGE_SIZE)
     };
 
-    for (child_frame, parent_frame) in child.heap_frames.iter().zip(parent_heap_frames.iter()) {
+    // MILESTONE 57: `child.heap_frames` came back from
+    // create_process_from_image() as 64 `None`s (nothing mapped yet --
+    // see that function's own comment). Only actually map+copy a heap
+    // page for the child where the PARENT has one -- i.e. only pages the
+    // parent's own `sbrk()`-driven usage has genuinely demand-paged in.
+    // A heap page neither process has ever touched stays `None` on both
+    // sides: unmapped-but-zero is exactly what an untouched heap page
+    // conceptually IS, on either side of a fork(), so there's nothing to
+    // copy and nothing lost by leaving it lazy. This is strictly cheaper
+    // than the pre-Milestone-57 behavior (which unconditionally mapped
+    // and copied all `HEAP_PAGE_COUNT` pages on every fork, regardless of
+    // how much of the heap was actually in use).
+    let heap_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let pml4_ptr: *mut PageTable = (phys_mem_offset + child.pml4_frame.start_address().as_u64()).as_mut_ptr();
+    let child_pml4: &mut PageTable = unsafe { &mut *pml4_ptr };
+    let mut child_mapper = unsafe { OffsetPageTable::new(child_pml4, phys_mem_offset) };
+    for (i, parent_slot) in parent_heap_frames.iter().enumerate() {
+        let Some(parent_frame) = parent_slot else {
+            continue;
+        };
+        let child_frame = frame_allocator.allocate_frame().ok_or("out of physical frames (heap, fork)")?;
+        let heap_page = Page::<Size4KiB>::containing_address(VirtAddr::new(HEAP_START + (i as u64) * PAGE_SIZE as u64));
+        unsafe {
+            child_mapper
+                .map_to(heap_page, child_frame, heap_flags, frame_allocator)
+                .map_err(|_| "map_to failed (heap page, fork)")?
+                .flush();
+        }
         let cv = phys_mem_offset + child_frame.start_address().as_u64();
         let pv = phys_mem_offset + parent_frame.start_address().as_u64();
         unsafe { core::ptr::copy_nonoverlapping(pv.as_ptr::<u8>(), cv.as_mut_ptr::<u8>(), PAGE_SIZE) };
+        child.heap_frames[i] = Some(child_frame);
     }
+
+    // MILESTONE 69: real fix for the real bug extra_frames' own doc
+    // comment on Process describes -- a multi-page ELF-loaded process
+    // (cc.elf, now 3 real code pages) has REAL pages beyond `code_frame`
+    // (page 0), and before this milestone fork() never even looked at
+    // them, so a forked child got NO mapping at all for page 1/2 -- a
+    // real, hardware-recorded `INSTRUCTION_FETCH` page fault the instant
+    // the child's own resume `rip` (captured at the parent's real fork()
+    // call site) happened to land past page 0. Fixed the same way the
+    // heap-frame loop just above already handles "map a fresh child
+    // frame at a known real vaddr, then copy the parent's bytes into it"
+    // -- reusing the SAME real vaddr `extra_frames` now carries (see that
+    // field's own doc comment for why it had to start carrying it),
+    // exactly the same fixed PRESENT|WRITABLE|USER_ACCESSIBLE flags
+    // every OTHER page in this process (code/stack/heap) already maps
+    // with (this kernel enforces no per-segment R/W/X distinction
+    // anywhere yet -- a real, disclosed, PRE-EXISTING limitation, not
+    // something this fix changes).
+    let code_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+    let mut child_extra_frames: Vec<(VirtAddr, PhysFrame<Size4KiB>)> = Vec::with_capacity(parent_extra_frames.len());
+    for (page_va, parent_frame) in parent_extra_frames.iter().copied() {
+        let child_frame = frame_allocator.allocate_frame().ok_or("out of physical frames (extra code page, fork)")?;
+        let page = Page::<Size4KiB>::containing_address(page_va);
+        unsafe {
+            child_mapper
+                .map_to(page, child_frame, code_flags, frame_allocator)
+                .map_err(|_| "map_to failed (extra code page, fork)")?
+                .flush();
+        }
+        let cv = phys_mem_offset + child_frame.start_address().as_u64();
+        let pv = phys_mem_offset + parent_frame.start_address().as_u64();
+        unsafe { core::ptr::copy_nonoverlapping(pv.as_ptr::<u8>(), cv.as_mut_ptr::<u8>(), PAGE_SIZE) };
+        child_extra_frames.push((page_va, child_frame));
+    }
+    let extra_count = child_extra_frames.len();
+    child.extra_frames = child_extra_frames;
 
     let _ = writeln!(
         serial(),
@@ -2770,6 +4710,12 @@ fn fork_build_child(
         child.code_frame.start_address().as_u64(),
         parent_code_frame.start_address().as_u64()
     );
+    if extra_count > 0 {
+        let _ = writeln!(
+            serial(),
+            "milestone 69: fork() -- child also got {extra_count} extra code page(s) REALLY remapped+copied (real fix -- see extra_frames' own doc comment on Process for the bug this closes; a multi-page ELF-loaded parent's pages beyond page 0 used to be silently dropped by fork())"
+        );
+    }
 
     Ok(child)
 }
@@ -2821,13 +4767,19 @@ pub(crate) fn fork(parent_id: u8, resume_rip: u64, resume_rsp: u64) -> Option<u8
         let fd3 = p.fds[3].clone();
         let label = p.label;
         let pgid = p.pgid;
-        (code_frame, stack_frame, heap_frames, heap_used, [fd0, fd1, fd2, fd3], label, pgid)
+        // MILESTONE 69: real fork() fix -- see extra_frames' own doc
+        // comment on Process for the real bug this closes (a multi-page
+        // ELF-loaded process's pages beyond page 0 were silently never
+        // copied into a forked child at all).
+        let extra_frames = p.extra_frames.clone();
+        (code_frame, stack_frame, heap_frames, heap_used, [fd0, fd1, fd2, fd3], label, pgid, extra_frames)
     })?;
-    let (parent_code, parent_stack, parent_heap_frames, parent_heap_used, parent_fds, parent_label, parent_pgid) = snapshot;
+    let (parent_code, parent_stack, parent_heap_frames, parent_heap_used, parent_fds, parent_label, parent_pgid, parent_extra_frames) =
+        snapshot;
 
     let phys_mem_offset = memory::phys_mem_offset();
     let build_result = memory::with_frame_allocator(|frame_allocator| {
-        fork_build_child(frame_allocator, phys_mem_offset, parent_code, parent_stack, &parent_heap_frames)
+        fork_build_child(frame_allocator, phys_mem_offset, parent_code, parent_stack, &parent_heap_frames, &parent_extra_frames)
     });
     let mut child = match build_result {
         Some(Ok(c)) => c,
@@ -3586,6 +5538,230 @@ pub(crate) fn exec_elf(id: u8, image: &[u8], elf_image: &elf::ElfImage) -> Resul
     Ok(new_entry)
 }
 
+/// MILESTONE 58: real, disclosed, checked-before-any-write caps on
+/// argv/envp support -- the single 4KiB user stack page every process
+/// gets (`usertest::USER_STACK_SIZE`, unchanged since Milestone 30) has
+/// to hold this milestone's header+string region AND whatever real
+/// stack space the newly exec()'d program needs at runtime, so this
+/// deliberately stays small rather than claiming the whole page.
+/// `build_argv_envp_stack()` below rejects (with a clear `Err`, never a
+/// silent truncation or an out-of-bounds write) anything that doesn't
+/// fit inside these caps, or that doesn't fit in the page at all even
+/// within them.
+pub(crate) const EXEC_ARGV_MAX_COUNT: usize = 8;
+pub(crate) const EXEC_ARG_MAX_LEN: usize = 128;
+
+/// MILESTONE 58: lays out a real argv/envp block on a NEWLY built
+/// process's own private stack page, following the actual x86_64 SysV
+/// process-entry stack contract a real kernel's `execve()` uses (this
+/// is what a real ELF binary's `_start` expects to find at the initial
+/// RSP it's handed, NOT a `call`-return-address convention): from the
+/// returned RSP upward, `argc` (8 bytes), then `argc` real pointers
+/// into this same page (one per argv string), a NULL (0) terminator,
+/// then `envp.len()` real pointers (one per envp string), a second
+/// NULL terminator -- with the actual NUL-terminated string bytes
+/// themselves packed at the TOP of the page, argv's strings first then
+/// envp's. Returns the new value the new process's ring-3 entry should
+/// use as its initial RSP: `usertest::USER_STACK_ADDR + header_start`,
+/// 16-byte aligned (the real alignment a process's initial stack
+/// pointer must have per the ABI -- checked and enforced here, not
+/// assumed).
+///
+/// Writes through the direct `phys_mem_offset` view of the NEW
+/// process's own already-allocated `stack_frame` -- the exact same
+/// technique `fork_build_child()` already uses to copy a parent's real
+/// stack bytes into a child's own frame (see that function's own doc
+/// comment) -- valid regardless of which CR3 happens to be loaded right
+/// now, so this can run (and does, from `exec_elf_with_args()` below)
+/// BEFORE the CR3 switch into the new address space.
+fn build_argv_envp_stack(
+    phys_mem_offset: VirtAddr,
+    stack_frame: PhysFrame<Size4KiB>,
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+) -> Result<u64, &'static str> {
+    if argv.len() > EXEC_ARGV_MAX_COUNT {
+        return Err("exec: argv entry count exceeds this loader's fixed cap");
+    }
+    if envp.len() > EXEC_ARGV_MAX_COUNT {
+        return Err("exec: envp entry count exceeds this loader's fixed cap");
+    }
+    for s in argv.iter().chain(envp.iter()) {
+        if s.len() > EXEC_ARG_MAX_LEN {
+            return Err("exec: an argv/envp string exceeds this loader's fixed per-string cap");
+        }
+    }
+
+    let page_size: u64 = PAGE_SIZE as u64;
+    let stack_base_virt = phys_mem_offset + stack_frame.start_address().as_u64();
+
+    // Real layout, fully computed BEFORE any write happens -- pack
+    // every string (argv's, in order, then envp's, in order), each
+    // NUL-terminated, recording each one's own BYTE OFFSET within this
+    // packed region so the pointer table below can compute its real
+    // final virtual address.
+    let mut string_bytes: Vec<u8> = Vec::new();
+    let mut argv_offsets: Vec<u64> = Vec::with_capacity(argv.len());
+    let mut envp_offsets: Vec<u64> = Vec::with_capacity(envp.len());
+    for s in argv {
+        argv_offsets.push(string_bytes.len() as u64);
+        string_bytes.extend_from_slice(s);
+        string_bytes.push(0);
+    }
+    for s in envp {
+        envp_offsets.push(string_bytes.len() as u64);
+        string_bytes.extend_from_slice(s);
+        string_bytes.push(0);
+    }
+
+    let header_len: u64 = 8 // argc
+        + (argv.len() as u64 + 1) * 8 // argv pointers + NULL terminator
+        + (envp.len() as u64 + 1) * 8; // envp pointers + NULL terminator
+    let strings_len = string_bytes.len() as u64;
+
+    let strings_start = page_size
+        .checked_sub(strings_len)
+        .ok_or("exec: argv/envp string bytes too large for the single-page stack")?;
+    let header_start_unaligned = strings_start
+        .checked_sub(header_len)
+        .ok_or("exec: argv/envp header too large for the single-page stack")?;
+    // Real SysV process-entry alignment requirement: align DOWN to 16,
+    // never up (up could overlap into the string region computed
+    // above) -- the small gap this can open between the header's real
+    // end and strings_start is real, harmless padding, never read by
+    // anything (the new program only ever dereferences the exact
+    // pointers this function itself hands it).
+    let header_start = header_start_unaligned & !0xFu64;
+    if header_start < 8 {
+        return Err("exec: argv/envp layout does not fit on the single-page stack even after alignment");
+    }
+
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            string_bytes.as_ptr(),
+            (stack_base_virt + strings_start).as_mut_ptr::<u8>(),
+            string_bytes.len(),
+        );
+    }
+
+    let string_user_addr = |off: u64| usertest::USER_STACK_ADDR + strings_start + off;
+
+    let mut cursor = header_start;
+    unsafe { core::ptr::write((stack_base_virt + cursor).as_mut_ptr::<u64>(), argv.len() as u64) };
+    cursor += 8;
+    for &off in &argv_offsets {
+        unsafe { core::ptr::write((stack_base_virt + cursor).as_mut_ptr::<u64>(), string_user_addr(off)) };
+        cursor += 8;
+    }
+    unsafe { core::ptr::write((stack_base_virt + cursor).as_mut_ptr::<u64>(), 0u64) }; // argv NULL terminator
+    cursor += 8;
+    for &off in &envp_offsets {
+        unsafe { core::ptr::write((stack_base_virt + cursor).as_mut_ptr::<u64>(), string_user_addr(off)) };
+        cursor += 8;
+    }
+    unsafe { core::ptr::write((stack_base_virt + cursor).as_mut_ptr::<u64>(), 0u64) }; // envp NULL terminator
+
+    Ok(usertest::USER_STACK_ADDR + header_start)
+}
+
+/// MILESTONE 58: real argv/envp threading through `exec()` -- the
+/// "real exec with argv/envp" item the README's own Tier 1 roadmap
+/// names, closed as its own additive entry point rather than a
+/// modification of Milestone 45's `exec_elf()` above (kept completely
+/// untouched, still exercised by the existing EXEC_TEST_PROCESS self
+/// -test exactly as before -- zero regression risk to that already-
+/// verified path). Does everything `exec_elf()` does (real teardown-
+/// and-rebuild address space, fd table/parent_pid/pgid preserved
+/// across the call, CR3 switched at the end) PLUS the one real thing
+/// `exec_elf()` never had: a caller-supplied argv/envp array laid out
+/// on the NEW program's own initial stack via `build_argv_envp_stack()`
+/// above, per the real x86_64 SysV process-entry contract -- not
+/// registers, not a kernel-private side channel a real `execve()`
+/// wouldn't have. Returns `(new_entry, new_user_rsp)` since the caller
+/// (usertest.rs's new EXECARGV syscall arm) needs BOTH to enter the new
+/// program correctly (`exec_elf()`'s callers all reuse the fixed
+/// `USER_STACK_ADDR + USER_STACK_SIZE` top-of-stack instead, since they
+/// never populate anything below it).
+pub(crate) fn exec_elf_with_args(
+    id: u8,
+    image: &[u8],
+    elf_image: &elf::ElfImage,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Result<(u64, u64), &'static str> {
+    let old_fds = with_process_mut(id, |p| p.fds.clone()).ok_or("exec: no such process")?;
+    let old_parent_pid = with_process_mut(id, |p| p.parent_pid).ok_or("exec: no such process")?;
+    let old_pgid = with_process_mut(id, |p| p.pgid).ok_or("exec: no such process")?;
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let build_result = memory::with_frame_allocator(|frame_allocator| {
+        create_process_from_elf(frame_allocator, phys_mem_offset, "exec'd-argv", elf_image.entry, &elf_image.segments, image)
+    });
+    let mut new_proc = match build_result {
+        Some(Ok(p)) => p,
+        Some(Err(e)) => {
+            let _ = writeln!(serial(), "milestone 58: syscall EXECARGV (process {id}) -- FAILED building the new address space: {e}");
+            return Err(e);
+        }
+        None => {
+            let _ = writeln!(
+                serial(),
+                "milestone 58: syscall EXECARGV (process {id}) -- FAILED, global frame allocator not installed (should never happen post-boot)"
+            );
+            return Err("exec: global frame allocator not installed yet");
+        }
+    };
+
+    new_proc.fds = old_fds;
+    new_proc.parent_pid = old_parent_pid;
+    new_proc.pgid = old_pgid;
+
+    let new_pml4 = new_proc.pml4_frame;
+    let new_entry = new_proc.entry;
+    let new_stack_frame = new_proc.stack_frame;
+    let argv_count = argv.len();
+    let envp_count = envp.len();
+
+    // Real argv/envp stack construction happens BEFORE replace_process()
+    // moves new_proc away and BEFORE the CR3 switch below -- see
+    // build_argv_envp_stack()'s own doc comment for why that ordering
+    // is safe (it writes through phys_mem_offset directly, independent
+    // of the currently-loaded CR3).
+    let new_rsp = match build_argv_envp_stack(phys_mem_offset, new_stack_frame, &argv, &envp) {
+        Ok(rsp) => rsp,
+        Err(e) => {
+            // MILESTONE 58: new_proc's pml4/code/stack/heap frames were
+            // already really allocated by create_process_from_elf()
+            // above -- reclaim them for real (Milestone 54's own
+            // mechanism) rather than letting this Err path silently
+            // leak them, the exact bug class M54 itself closed for
+            // every OTHER process-replacement path in this file.
+            reclaim_process_frames(new_proc);
+            let _ = writeln!(
+                serial(),
+                "milestone 58: syscall EXECARGV (process {id}) -- FAILED laying out argv/envp on the new stack: {e} -- new address space's frames reclaimed, OLD program continues running"
+            );
+            return Err(e);
+        }
+    };
+
+    if !replace_process(id, new_proc) {
+        return Err("exec: no such process (slot vanished during rebuild)");
+    }
+
+    let flags = Cr3Flags::from_bits_truncate(KERNEL_CR3_FLAGS_BITS.load(Ordering::SeqCst));
+    unsafe { Cr3::write(new_pml4, flags) };
+
+    let _ = writeln!(
+        serial(),
+        "milestone 58: syscall EXECARGV (process {id}) -- REAL teardown-and-rebuild complete WITH argv/envp: new pml4={:#x}, new entry={:#x} (real parsed e_entry), new rsp={:#x} ({argv_count} argv string(s), {envp_count} envp string(s), real SysV process-entry stack layout), fd table/parent_pid/pgid preserved, CR3 switched",
+        new_pml4.start_address().as_u64(),
+        new_entry,
+        new_rsp
+    );
+    Ok((new_entry, new_rsp))
+}
+
 /// MILESTONE 53: real, boot-time, non-interactive proof of the new
 /// `WaitOutcome::Signaled` variant -- same "sendkey is unreliable, run
 /// unattended instead" reasoning as every other self_test_* in this
@@ -3715,6 +5891,402 @@ pub fn self_test_fault_status() {
     );
 }
 
+/// MILESTONE 57: real, boot-time, non-interactive proof that per-process
+/// heap pages are genuinely demand-paged -- not eagerly mapped at
+/// process-creation time, and mapped ONLY when a real hardware page
+/// fault legitimately earns it. Two real, independent halves, proving
+/// both directions (same "prove both directions" discipline as
+/// Milestone 39's gate/evidence self-test):
+///
+///   1. POSITIVE case (DEMAND_PAGE_TEST_PROCESS): before it ever runs,
+///      EVERY one of its `HEAP_PAGE_COUNT` heap_frames slots is confirmed
+///      `None` -- real, direct proof this process was created with ZERO
+///      heap frames mapped (the actual point of this milestone). It then
+///      genuinely runs in ring 3, `sbrk()`s past the OLD 16 KiB cap, and
+///      touches the LAST page of its new 64-page reservation -- a real
+///      hardware #PF this milestone's page_fault_handler change must
+///      resolve transparently, mid-instruction, with no crash. Checked
+///      afterward: `heap_frames[63]` is now `Some`, and the actual
+///      physical byte it points at (read directly through
+///      phys_mem_offset, not trusted from the process's own say-so) is
+///      exactly the marker byte the program wrote AFTER the fault
+///      resolved -- real, end-to-end proof the retried instruction
+///      genuinely completed. `heap_frames[0]`, never touched by this
+///      program, is confirmed to STILL be `None` afterward -- proof
+///      demand paging is genuinely per-page, not "the whole reservation
+///      gets mapped on the first fault".
+///   2. NEGATIVE case (DEMAND_PAGE_OOB_TEST_PROCESS): targets the SAME
+///      page index (63) the positive case just proved demand-pages
+///      correctly -- except this process's own `heap_used` never grew
+///      anywhere near it (a small, ordinary 64-byte `sbrk()`), so the
+///      identical virtual address is a genuinely illegal access here:
+///      still inside the heap's reserved range, but nowhere near what
+///      THIS process actually committed. `run()` itself cannot
+///      distinguish "ran to completion" from "faulted and was gracefully
+///      terminated" (both converge on `Ok(())` -- see Milestone 44's own
+///      doc comment on exactly this), so the real check is
+///      `heap_frames[63]` staying `None` afterward (demand paging
+///      correctly refused it) AND an entirely unrelated top-level
+///      process (PROCESS_A) running normally right afterward -- real
+///      proof Milestone 41's UNMODIFIED SIGSEGV path is what actually
+///      caught it, not a silent hang or a corrupted kernel.
+pub fn self_test_demand_paging_heap() {
+    let phys_mem_offset = memory::phys_mem_offset();
+    let far_page: usize = (DEMAND_PAGE_TEST_HEAP_OFFSET / PAGE_SIZE as u64) as usize;
+
+    // Sanity-check this test's own arithmetic before trusting it, same
+    // discipline as SIGSEGV_MSG_OFFSET's own pre-flight check elsewhere
+    // in this file.
+    let offset_ok = far_page == 63 && DEMAND_PAGE_TEST_HEAP_OFFSET == 63 * PAGE_SIZE as u64;
+    let _ = writeln!(
+        serial(),
+        "milestone 57: self-test -- layout check: far heap page index={far_page} (expect 63), offset={:#x} -- {}",
+        DEMAND_PAGE_TEST_HEAP_OFFSET,
+        if offset_ok { "confirmed" } else { "MISMATCH" }
+    );
+
+    // -- POSITIVE CASE --------------------------------------------------
+    let pre_run_all_none = with_process_mut(DEMAND_PAGE_TEST_PROCESS_ID, |p| p.heap_frames.iter().all(|f| f.is_none()));
+    let _ = writeln!(
+        serial(),
+        "milestone 57: self-test -- BEFORE running DEMAND_PAGE_TEST_PROCESS: all {} heap slots unmapped -- {:?} (expect Some(true), real proof create_process_from_image() no longer eagerly maps any heap page)",
+        HEAP_PAGE_COUNT,
+        pre_run_all_none
+    );
+
+    let ran_ok = match run(DEMAND_PAGE_TEST_PROCESS_ID) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 57: self-test -- DEMAND_PAGE_TEST_PROCESS ran and returned to the kernel (run() returned Ok)");
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 57: self-test -- FAILED, DEMAND_PAGE_TEST_PROCESS could not even run: {e}");
+            false
+        }
+    };
+
+    let (page_now_mapped, marker_correct) = with_process_mut(DEMAND_PAGE_TEST_PROCESS_ID, |p| match p.heap_frames[far_page] {
+        Some(frame) => {
+            let byte = unsafe { core::ptr::read((phys_mem_offset + frame.start_address().as_u64()).as_ptr::<u8>()) };
+            (true, byte == DEMAND_PAGE_TEST_MARKER)
+        }
+        None => (false, false),
+    })
+    .unwrap_or((false, false));
+
+    let _ = writeln!(
+        serial(),
+        "milestone 57: self-test -- AFTER running: heap_frames[{far_page}] mapped={page_now_mapped}, marker byte correct={marker_correct} (expect true, true -- a real physical frame was demand-paged for the FAR page specifically, and real content survived the fault+retry)"
+    );
+
+    let page0_still_none = with_process_mut(DEMAND_PAGE_TEST_PROCESS_ID, |p| p.heap_frames[0].is_none()).unwrap_or(false);
+    let _ = writeln!(
+        serial(),
+        "milestone 57: self-test -- heap_frames[0] still unmapped={page0_still_none} (expect true -- proves demand paging is genuinely per-page, not per-reservation)"
+    );
+
+    let positive_ok = pre_run_all_none == Some(true) && ran_ok && page_now_mapped && marker_correct && page0_still_none;
+
+    // -- NEGATIVE CASE ----------------------------------------------------
+    let _ = writeln!(
+        serial(),
+        "milestone 57: self-test -- running DEMAND_PAGE_OOB_TEST_PROCESS: same target page ({far_page}) as the positive case, but this process never sbrk()'d anywhere near it -- expecting a real SIGSEGV, not a silent demand-page"
+    );
+    let oob_run_result = run(DEMAND_PAGE_OOB_TEST_PROCESS_ID);
+    let oob_page_stayed_unmapped = with_process_mut(DEMAND_PAGE_OOB_TEST_PROCESS_ID, |p| p.heap_frames[far_page].is_none()).unwrap_or(false);
+    let _ = writeln!(
+        serial(),
+        "milestone 57: self-test -- DEMAND_PAGE_OOB_TEST_PROCESS: run() returned {:?}, heap_frames[{far_page}] still unmapped={oob_page_stayed_unmapped} (expect true -- the committed-vs-reserved boundary was actually enforced, not silently allowed through)",
+        oob_run_result
+    );
+
+    // Real proof of genuine recovery, not just "hasn't crashed yet" --
+    // same discipline as Milestones 41/53's own self-tests.
+    let recovery_ok = match run(1) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 57: self-test -- PROCESS_A ran normally right after the OOB fault -- kernel genuinely recovered");
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 57: self-test -- FAILED, PROCESS_A could not run after the OOB fault: {e}");
+            false
+        }
+    };
+
+    let negative_ok = oob_run_result.is_ok() && oob_page_stayed_unmapped && recovery_ok;
+
+    let _ = writeln!(
+        serial(),
+        "milestone 57: self-test -- OVERALL: {}",
+        if offset_ok && positive_ok && negative_ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// MILESTONE 64: real, boot-time, non-interactive proof of the whole
+/// read-only file-backed `mmap()` slice -- four real ring-3 excursions,
+/// each proving a genuinely different piece:
+///
+///   1. MMAP_READ_TEST_PROCESS (positive): a real not-present fault on
+///      first touch is transparently resolved with REAL file content
+///      (checked byte-for-byte against MMAP_TEST_FILE_CONTENT, read
+///      directly through the process's own heap physical frame, never
+///      trusted from the process's own say-so -- same discipline
+///      self_test_demand_paging_heap() already established), three more
+///      reads against the SAME already-mapped page succeed without
+///      re-faulting, and a real munmap() both succeeds (result byte 0)
+///      AND clears the process's own mmap slot back to `None`.
+///   2. MMAP_WRITE_BEFORE_READ_FAULT_PROCESS (negative #1): a write to a
+///      NEVER-touched mapping is refused at the not-present+write
+///      decision point (`try_demand_page_mmap()`'s own `is_write` check)
+///      -- checked directly: the slot's `frame` stays `None`.
+///   3. MMAP_WRITE_AFTER_READ_FAULT_PROCESS (negative #2): a write to an
+///      ALREADY-mapped (via a prior real read) page is refused by a
+///      structurally different path -- a genuine hardware
+///      PROTECTION_VIOLATION, excluded from ever reaching
+///      `try_demand_page_mmap()` at all by `page_fault_handler()`'s own
+///      pre-existing guard. Checked directly: the FIRST heap marker (the
+///      real read) is present, the SECOND (a marker only reachable by
+///      surviving the write) is absent.
+///   4. MMAP_USE_AFTER_UNMAP_FAULT_PROCESS (negative #3): a second READ
+///      at an address already `munmap()`'d is refused -- proving
+///      `munmap()` genuinely cleared the slot (not just freed the frame),
+///      so a stale address can't be silently re-granted. Checked
+///      directly: the first two heap markers (read, then munmap result)
+///      are present, the third (only reachable by surviving the second
+///      read) is absent.
+///
+/// Every case ends with PROCESS_A run directly afterward -- same real
+/// "the kernel genuinely recovered, not just didn't crash yet" proof
+/// self_test_demand_paging_heap()'s own negative case already
+/// established.
+pub fn self_test_mmap() {
+    let phys_mem_offset = memory::phys_mem_offset();
+
+    // -- Layout sanity check (same discipline as FDTEST_PROGRAM's own
+    // path1_ok/path2_ok checks and DEMAND_PAGE_TEST_HEAP_OFFSET's own
+    // pre-flight check) -- confirms each program's embedded path bytes
+    // really do live at the offset this file's own constants claim,
+    // before trusting anything downstream.
+    let path_bytes = MMAP_TEST_FILE_PATH.as_bytes();
+    let layout_ok = &MMAP_READ_TEST_PROGRAM[MMAP_READ_TEST_PATH_OFFSET..MMAP_READ_TEST_PATH_OFFSET + path_bytes.len()] == path_bytes
+        && &MMAP_WRITE_BEFORE_READ_FAULT_PROGRAM[MMAP_WRITE_BEFORE_READ_FAULT_PATH_OFFSET..MMAP_WRITE_BEFORE_READ_FAULT_PATH_OFFSET + path_bytes.len()] == path_bytes
+        && &MMAP_WRITE_AFTER_READ_FAULT_PROGRAM[MMAP_WRITE_AFTER_READ_FAULT_PATH_OFFSET..MMAP_WRITE_AFTER_READ_FAULT_PATH_OFFSET + path_bytes.len()] == path_bytes
+        && &MMAP_USE_AFTER_UNMAP_FAULT_PROGRAM[MMAP_USE_AFTER_UNMAP_FAULT_PATH_OFFSET..MMAP_USE_AFTER_UNMAP_FAULT_PATH_OFFSET + path_bytes.len()] == path_bytes
+        && fs::MAX_FILE_BYTES == PAGE_SIZE;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: self-test -- layout check: all four programs' embedded '{MMAP_TEST_FILE_PATH}' path bytes match their own declared offsets, and fs::MAX_FILE_BYTES == PAGE_SIZE -- {}",
+        if layout_ok { "confirmed" } else { "MISMATCH" }
+    );
+
+    // Real fixture -- this self-test's own real file, written for real to
+    // the real on-disk filesystem (same self-contained-fixture pattern
+    // fs::self_test_disk_write() already established).
+    let write_ok = fs::write_file(MMAP_TEST_FILE_PATH, MMAP_TEST_FILE_CONTENT.as_bytes()).is_ok();
+    let _ = writeln!(
+        serial(),
+        "milestone 64: self-test -- wrote real fixture file '{MMAP_TEST_FILE_PATH}' ({} bytes) to the real on-disk filesystem -- {}",
+        MMAP_TEST_FILE_CONTENT.len(),
+        if write_ok { "confirmed" } else { "FAILED" }
+    );
+
+    let expected = MMAP_TEST_FILE_CONTENT.as_bytes();
+
+    // Reads a byte out of process `pid`'s own heap page 0 physical frame,
+    // directly through phys_mem_offset -- never trusted from the
+    // process's own say-so, same discipline as
+    // self_test_demand_paging_heap()'s own marker check.
+    let read_heap_byte = |pid: u8, offset: u64| -> Option<u8> {
+        with_process_mut(pid, |p| p.heap_frames[0]).flatten().map(|frame| unsafe {
+            core::ptr::read((phys_mem_offset + frame.start_address().as_u64() + offset).as_ptr::<u8>())
+        })
+    };
+
+    // -- CASE 1: positive read + munmap -----------------------------------
+    let ran1_ok = run(MMAP_READ_TEST_PROCESS_ID).is_ok();
+    let bytes_match = (0..4u64).all(|i| read_heap_byte(MMAP_READ_TEST_PROCESS_ID, i) == expected.get(i as usize).copied());
+    let munmap_result_byte = read_heap_byte(MMAP_READ_TEST_PROCESS_ID, 4);
+    let slot_cleared_after_munmap = with_process_mut(MMAP_READ_TEST_PROCESS_ID, |p| p.mmaps[0].is_none()).unwrap_or(false);
+    let case1_ok = ran1_ok && bytes_match && munmap_result_byte == Some(0) && slot_cleared_after_munmap;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: self-test -- CASE 1 (positive read+munmap): ran={ran1_ok} first-4-bytes-match-real-file-content={bytes_match} munmap-result-byte={:?} (expect Some(0)) slot-cleared-after-munmap={slot_cleared_after_munmap} -- {}",
+        munmap_result_byte,
+        if case1_ok { "PASS" } else { "FAIL" }
+    );
+
+    // -- CASE 2: write before any read (not-present+write refusal) --------
+    let ran2_ok = run(MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID).is_ok();
+    let case2_frame_stayed_none = with_process_mut(MMAP_WRITE_BEFORE_READ_FAULT_PROCESS_ID, |p| p.mmaps[0].as_ref().map(|s| s.frame.is_none()))
+        .flatten()
+        .unwrap_or(false);
+    let case2_ok = ran2_ok && case2_frame_stayed_none;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: self-test -- CASE 2 (write before read, expect not-present+write refusal): run()_ok={ran2_ok} mmap-slot-frame-stayed-none={case2_frame_stayed_none} -- {}",
+        if case2_ok { "PASS" } else { "FAIL" }
+    );
+
+    // -- CASE 3: read then write (protection-violation refusal) -----------
+    let ran3_ok = run(MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID).is_ok();
+    let case3_read_succeeded = read_heap_byte(MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID, 0) == expected.first().copied();
+    let case3_never_reached_marker = read_heap_byte(MMAP_WRITE_AFTER_READ_FAULT_PROCESS_ID, 1) == Some(0);
+    let case3_ok = ran3_ok && case3_read_succeeded && case3_never_reached_marker;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: self-test -- CASE 3 (read then write, expect protection-violation refusal): run()_ok={ran3_ok} first-read-succeeded={case3_read_succeeded} unreachable-0xEE-marker-absent={case3_never_reached_marker} -- {}",
+        if case3_ok { "PASS" } else { "FAIL" }
+    );
+
+    // -- CASE 4: use after unmap (cleared-slot refusal) --------------------
+    let ran4_ok = run(MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID).is_ok();
+    let case4_read_succeeded = read_heap_byte(MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID, 0) == expected.first().copied();
+    let case4_munmap_succeeded = read_heap_byte(MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID, 1) == Some(0);
+    let case4_never_reached_marker = read_heap_byte(MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID, 2) == Some(0);
+    let case4_slot_stayed_cleared = with_process_mut(MMAP_USE_AFTER_UNMAP_FAULT_PROCESS_ID, |p| p.mmaps[0].is_none()).unwrap_or(false);
+    let case4_ok = ran4_ok && case4_read_succeeded && case4_munmap_succeeded && case4_never_reached_marker && case4_slot_stayed_cleared;
+    let _ = writeln!(
+        serial(),
+        "milestone 64: self-test -- CASE 4 (use after unmap, expect cleared-slot refusal): run()_ok={ran4_ok} first-read-succeeded={case4_read_succeeded} munmap-succeeded={case4_munmap_succeeded} unreachable-0xEE-marker-absent={case4_never_reached_marker} slot-stayed-cleared={case4_slot_stayed_cleared} -- {}",
+        if case4_ok { "PASS" } else { "FAIL" }
+    );
+
+    // Real proof of genuine recovery after every negative case's real
+    // hardware fault, same discipline as
+    // self_test_demand_paging_heap()'s own negative-case recovery check.
+    let recovery_ok = match run(1) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 64: self-test -- PROCESS_A ran normally right after all four mmap test processes -- kernel genuinely recovered");
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 64: self-test -- FAILED, PROCESS_A could not run after the mmap tests: {e}");
+            false
+        }
+    };
+
+    let _ = writeln!(
+        serial(),
+        "milestone 64: self-test -- OVERALL: {}",
+        if layout_ok && write_ok && case1_ok && case2_ok && case3_ok && case4_ok && recovery_ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// MILESTONE 65: real, boot-time, non-interactive proof of real
+/// `PROT_WRITE` support on top of Milestone 64's own read-only `mmap()`
+/// -- two real ring-3 excursions, each proving a genuinely different real
+/// success path (mirroring Milestone 64's own discipline of proving two
+/// structurally different REFUSAL paths with two separate cases):
+///
+///   5. MMAP_WRITABLE_READ_THEN_WRITE_PROCESS: a real not-present READ
+///      fault is resolved WITH the hardware `WRITABLE` bit set (checked
+///      indirectly: the immediately following real WRITE succeeds with
+///      NO second fault at all), and the written byte is read back and
+///      found to genuinely match what was written -- proving the byte is
+///      really sitting in mapped, writable physical memory, not just
+///      "the write instruction didn't crash".
+///   6. MMAP_WRITABLE_WRITE_FIRST_PROCESS: a real not-present fault whose
+///      OWN triggering access is itself a WRITE (`is_write == true`) is
+///      genuinely SERVICED rather than refused -- the exact opposite
+///      outcome from Milestone 64's own MMAP_WRITE_BEFORE_READ_FAULT_
+///      PROGRAM case, which is the SAME real hardware condition
+///      (not-present + `CAUSED_BY_WRITE`) hitting a read-only slot
+///      instead. The written byte is read back and found correct, AND a
+///      second, untouched byte elsewhere on the same page is read back
+///      and found to still hold the real snapshotted file content --
+///      proving the frame was genuinely populated with real content
+///      first, not left zeroed except for the touched byte.
+///
+/// Both cases finish with a real, direct re-read of the ACTUAL on-disk
+/// file (`fs::read_file()`, bypassing both test processes entirely) to
+/// prove the disclosed "private, never written back" semantics ARE real:
+/// despite two separate processes each genuinely overwriting a byte of
+/// their own mapped copy, the file on disk is confirmed byte-for-byte
+/// unchanged from what `self_test_mmap()` originally wrote.
+///
+/// Reuses the SAME on-disk fixture file (`MMAP_TEST_FILE_PATH`/
+/// `MMAP_TEST_FILE_CONTENT`) `self_test_mmap()` already wrote -- this
+/// function is called from main.rs immediately after `self_test_mmap()`,
+/// so the fixture is guaranteed to already exist; same "don't duplicate
+/// a fixture an earlier self-test already established" discipline
+/// `self_test_mmap()` itself used when it reused `MAX_FILE_BYTES`.
+pub fn self_test_mmap_writable() {
+    let path_bytes = MMAP_TEST_FILE_PATH.as_bytes();
+    let layout_ok = &MMAP_WRITABLE_READ_THEN_WRITE_PROGRAM
+        [MMAP_WRITABLE_READ_THEN_WRITE_PATH_OFFSET..MMAP_WRITABLE_READ_THEN_WRITE_PATH_OFFSET + path_bytes.len()]
+        == path_bytes
+        && &MMAP_WRITABLE_WRITE_FIRST_PROGRAM[MMAP_WRITABLE_WRITE_FIRST_PATH_OFFSET..MMAP_WRITABLE_WRITE_FIRST_PATH_OFFSET + path_bytes.len()] == path_bytes;
+    let _ = writeln!(
+        serial(),
+        "milestone 65: self-test -- layout check: both writable-mmap programs' embedded '{MMAP_TEST_FILE_PATH}' path bytes match their own declared offsets -- {}",
+        if layout_ok { "confirmed" } else { "MISMATCH" }
+    );
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let expected = MMAP_TEST_FILE_CONTENT.as_bytes();
+    let read_heap_byte = |pid: u8, offset: u64| -> Option<u8> {
+        with_process_mut(pid, |p| p.heap_frames[0]).flatten().map(|frame| unsafe {
+            core::ptr::read((phys_mem_offset + frame.start_address().as_u64() + offset).as_ptr::<u8>())
+        })
+    };
+
+    // -- CASE 5: read (demand-paged WRITABLE) then write, no second fault --
+    let ran5_ok = run(MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID).is_ok();
+    let case5_original_byte_ok = read_heap_byte(MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID, 0) == expected.first().copied();
+    let case5_write_stuck = read_heap_byte(MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID, 1) == Some(0x99);
+    let case5_munmap_ok = read_heap_byte(MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID, 2) == Some(0);
+    let case5_ok = ran5_ok && case5_original_byte_ok && case5_write_stuck && case5_munmap_ok;
+    let _ = writeln!(
+        serial(),
+        "milestone 65: self-test -- CASE 5 (writable: read then write, expect write to succeed with no second fault): run()_ok={ran5_ok} original-first-byte-matched-real-file={case5_original_byte_ok} write-of-0x99-stuck={case5_write_stuck} munmap-result-byte={:?} (expect Some(0)) -- {}",
+        read_heap_byte(MMAP_WRITABLE_READ_THEN_WRITE_PROCESS_ID, 2),
+        if case5_ok { "PASS" } else { "FAIL" }
+    );
+
+    // -- CASE 6: write as the FIRST-EVER touch, genuinely serviced ---------
+    let ran6_ok = run(MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID).is_ok();
+    let case6_write_stuck = read_heap_byte(MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID, 0) == Some(0x77);
+    let case6_rest_of_page_intact = read_heap_byte(MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID, 1) == expected.get(1).copied();
+    let case6_munmap_ok = read_heap_byte(MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID, 2) == Some(0);
+    let case6_ok = ran6_ok && case6_write_stuck && case6_rest_of_page_intact && case6_munmap_ok;
+    let _ = writeln!(
+        serial(),
+        "milestone 65: self-test -- CASE 6 (writable: write as first-ever touch, expect real demand-page-and-service instead of refusal): run()_ok={ran6_ok} write-of-0x77-stuck={case6_write_stuck} untouched-byte-still-real-file-content={case6_rest_of_page_intact} munmap-result-byte={:?} (expect Some(0)) -- {}",
+        read_heap_byte(MMAP_WRITABLE_WRITE_FIRST_PROCESS_ID, 2),
+        if case6_ok { "PASS" } else { "FAIL" }
+    );
+
+    // -- Real proof of "private, never written back" -----------------------
+    // Bypasses BOTH test processes entirely and re-reads the actual
+    // on-disk file directly, the same way fs::self_test_disk_write() or
+    // any other fs.rs self-test would -- if either writable mapping's
+    // write had leaked back to the fd's buffer or the disk, this would
+    // catch it directly, not just trust the disclosed scope-cut's wording.
+    let on_disk_after = fs::read_file(MMAP_TEST_FILE_PATH).ok();
+    let file_unchanged = on_disk_after.as_deref() == Some(expected);
+    let _ = writeln!(
+        serial(),
+        "milestone 65: self-test -- real on-disk file '{MMAP_TEST_FILE_PATH}' re-read directly after both writable mappings wrote into their own private copies -- unchanged-from-original={file_unchanged}"
+    );
+
+    let recovery_ok = match run(1) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 65: self-test -- PROCESS_A ran normally right after both writable-mmap test processes -- kernel genuinely recovered");
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 65: self-test -- FAILED, PROCESS_A could not run after the writable-mmap tests: {e}");
+            false
+        }
+    };
+
+    let _ = writeln!(
+        serial(),
+        "milestone 65: self-test -- OVERALL: {}",
+        if layout_ok && case5_ok && case6_ok && file_unchanged && recovery_ok { "PASS" } else { "FAIL" }
+    );
+}
+
 /// MILESTONE 54: real, boot-time, non-interactive proof that
 /// `reclaim_process_frames()` returns a dead process's physical frames
 /// to the allocator's free list AND that a later allocation genuinely
@@ -3779,11 +6351,44 @@ pub fn self_test_frame_reclaim() {
     // until `kill()`/`wait_for_child()` actually reclaims them.
     fn real_frame_cost(pid: u8, phys_mem_offset: VirtAddr) -> Option<usize> {
         with_process_mut(pid, |p| {
-            let leaf = 3 + p.heap_frames.len() + p.extra_frames.len();
+            // MILESTONE 57: heap_frames is now always HEAP_PAGE_COUNT
+            // entries long (sparse `Option`s), so `.len()` alone no
+            // longer means "how many heap frames this process actually
+            // has mapped" -- count the `Some` entries instead. For a
+            // process that's never called sbrk() and touched the result
+            // (true of every process this self-test forks), that count
+            // is genuinely 0 now, not HEAP_PAGE_COUNT -- a real,
+            // disclosed reduction in this test's own expected numbers
+            // versus Milestone 54's original eager-heap-mapping design,
+            // computed live rather than hardcoded either way.
+            let mapped_heap = p.heap_frames.iter().filter(|f| f.is_some()).count();
+            let leaf = 3 + mapped_heap + p.extra_frames.len();
             count_private_page_tables(p.pml4_frame, phys_mem_offset) + leaf
         })
     }
 
+    // MILESTONE 69: `first_cost` now carries `(cost, before)`, not just
+    // `cost` -- `before` (the free list's real size measured right before
+    // THIS self-test's own first fork(), whatever else already ran
+    // earlier in THIS boot left sitting there) is what the second check
+    // below now compares against, replacing a hardcoded `expected 0`. See
+    // that check's own comment for the real, disclosed reason: a genuine
+    // regression THIS milestone's own testing found, not a hypothetical
+    // one -- Milestone 69's cc.elf self-test (which `self_test_cc()` runs
+    // BEFORE this one, per main.rs's own existing, UNCHANGED call order)
+    // is the first self-test in this whole codebase to fork()+exec()+
+    // wait() a MULTI-PAGE process (three full cycles, CASE 8/9/10),
+    // genuinely reclaiming more real physical frames back onto the SAME
+    // global free list than any earlier milestone's self-test ever did in
+    // this exact boot sequence -- a real, correct consequence of real,
+    // correct reclaim work, not a leak. This self-test's OWN original
+    // `expected 0` literal only ever held because nothing between boot
+    // and this exact call site had freed anything yet; it was never
+    // actually testing "the free list is empty" so much as "the free list
+    // is back to whatever it was when this function started" -- this fix
+    // makes it test that ACTUAL, real intent explicitly, so it stays
+    // correct regardless of what any OTHER earlier self-test (this one or
+    // a future one) has already reclaimed by the time it runs.
     let first_cost = fork(FAULT_TEST_PROCESS_ID, 0, 0).and_then(|pid| {
         let cost = real_frame_cost(pid, phys_mem_offset);
         let before = memory::with_frame_allocator(|fa| fa.free_list_len()).unwrap_or(0);
@@ -3797,7 +6402,7 @@ pub fn self_test_frame_reclaim() {
                     "milestone 54: self-test -- forked+killed pid {pid} (independently counted real frame cost, leaf+page-tables: {cost}), free list grew {before} -> {after} -- {}",
                     if count_ok { "confirmed" } else { "MISMATCH" }
                 );
-                count_ok.then_some(cost)
+                count_ok.then_some((cost, before))
             }
             None => {
                 let _ = writeln!(serial(), "milestone 54: self-test -- FAILED, could not read back the forked child's own frame cost before killing it");
@@ -3829,16 +6434,27 @@ pub fn self_test_frame_reclaim() {
     // strictly stronger than trying to pin down which specific frame
     // landed where.
     let reuse_ok = match first_cost {
-        Some(cost) => match fork(FAULT_TEST_PROCESS_ID, 0, 0) {
+        Some((cost, before)) => match fork(FAULT_TEST_PROCESS_ID, 0, 0) {
             Some(pid2) => {
                 let second_cost = real_frame_cost(pid2, phys_mem_offset);
                 let remaining = memory::with_frame_allocator(|fa| fa.free_list_len()).unwrap_or(usize::MAX);
                 let _ = kill(FAULT_TEST_PROCESS_ID, pid2);
                 let symmetric = second_cost == Some(cost);
-                let fully_drained = remaining == 0;
+                // MILESTONE 69: compares against `before` (this SAME
+                // self-test's own real free-list size measured right
+                // before its first fork(), NOT a hardcoded 0) -- see
+                // `first_cost`'s own doc comment above for the real,
+                // disclosed reason this changed: proving "the second
+                // fork() drew every frame the first fork()'s own kill
+                // just freed, fully reused rather than falling through to
+                // fresh bump allocation" only ever needed the free list
+                // to return to WHATEVER it was at this function's own
+                // entry, never actually needed it to be the literal
+                // absolute value 0.
+                let fully_drained = remaining == before;
                 let _ = writeln!(
                     serial(),
-                    "milestone 54: self-test -- second fork()'s own real frame cost: {:?} (expected {cost}, symmetric={symmetric}); free list after its construction: {remaining} (expected 0, fully drained={fully_drained})",
+                    "milestone 54: self-test -- second fork()'s own real frame cost: {:?} (expected {cost}, symmetric={symmetric}); free list after its construction: {remaining} (expected {before}, fully drained={fully_drained})",
                     second_cost
                 );
                 symmetric && fully_drained
@@ -3859,6 +6475,151 @@ pub fn self_test_frame_reclaim() {
         "milestone 54: self-test -- OVERALL: {}",
         if first_cost.is_some() && reuse_ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// MILESTONE 59: real, boot-time, non-interactive proof that distinct
+/// syscall failures set distinct, correct errno values, and that a
+/// userspace program can genuinely read them back -- runs
+/// ERRNO_TEST_PROCESS (see ERRNO_TEST_PROGRAM's own doc comment for its
+/// exact syscall-by-syscall sequence) through ONE real ring-3 excursion
+/// that deliberately fails four DIFFERENT syscalls for four DIFFERENT
+/// real reasons (EBADF, ECHILD, ENOMEM, ESRCH), reading errno back via
+/// the new GETERRNO syscall after each one. Every individual read is
+/// only really checkable by a human/log reader in real time (syscall 17's
+/// own dispatch arm in usertest.rs logs the value AND its errno.rs name
+/// to serial as it happens -- see that arm's own comment) -- what THIS
+/// function can automatically assert, the same "check a specific
+/// kernel-side field after a real ring-3 excursion completes" discipline
+/// self_test_demand_paging_heap()/self_test_fault_status() already
+/// established, is the LAST word this process's own sticky `errno` field
+/// holds once the whole excursion (and its final exit()) has finished:
+/// ESRCH, from the getpgid(250) call immediately before exit() in
+/// ERRNO_TEST_PROGRAM's own fixed sequence -- real, direct proof the
+/// field really did end up holding the LAST real failure's code, exactly
+/// the "sticky, not reset by unrelated later syscalls" semantics
+/// `Process::errno`'s own doc comment promises (exit() itself never
+/// touches errno, so this is a genuine end-to-end check, not a tautology).
+pub fn self_test_errno() {
+    let _ = writeln!(
+        serial(),
+        "milestone 59: self-test -- running ERRNO_TEST_PROCESS (read/wait/sbrk/getpgid, each deliberately failing for a different real reason, GETERRNO read back after each -- watch the syscall log lines just below for the four distinct errno values)..."
+    );
+    let ran_ok = match run(ERRNO_TEST_PROCESS_ID) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 59: self-test -- ERRNO_TEST_PROCESS ran to completion (its own exit() syscall returned normally)");
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 59: self-test -- FAILED, ERRNO_TEST_PROCESS could not run: {e}");
+            false
+        }
+    };
+
+    let final_errno = get_errno(ERRNO_TEST_PROCESS_ID);
+    let final_ok = final_errno == errno::ESRCH;
+    let _ = writeln!(
+        serial(),
+        "milestone 59: self-test -- ERRNO_TEST_PROCESS's own final errno field: {final_errno} ({}) -- expected {} (ESRCH, the getpgid(250) call's real failure, the LAST syscall before exit()) -- {}",
+        errno::name(final_errno),
+        errno::ESRCH,
+        if final_ok { "confirmed" } else { "MISMATCH" }
+    );
+
+    let _ = writeln!(
+        serial(),
+        "milestone 59: self-test -- OVERALL: {}",
+        if ran_ok && final_ok { "PASS" } else { "FAIL" }
+    );
+}
+
+/// MILESTONE 60: real, boot-time, non-interactive, end-to-end proof of
+/// real signal delivery -- runs SIGNAL_TEST_PROCESS (see
+/// SIGNAL_TEST_PROGRAM's own doc comment for its exact instruction-by-
+/// instruction sequence) through ONE real ring-3 excursion that
+/// registers a handler, self-signals, gets genuinely redirected into
+/// that handler mid-execution (proven by a marker byte only the handler
+/// writes), and unwinds back out via a real SIGRETURN to exactly the
+/// interrupted point (proven by a SECOND marker byte only the resumed
+/// original code writes, AFTER the handler already ran) -- with the full
+/// register file proven intact across the whole round trip via a canary
+/// register the handler deliberately clobbers.
+///
+/// Same "kernel-side automated check of a specific physical byte/field
+/// after a real ring-3 excursion completes" discipline
+/// self_test_demand_paging_heap()/self_test_errno() already established:
+/// every check below reads the process's own HEAP_START page DIRECTLY
+/// through phys_mem_offset (not trusted from the process's own say-so),
+/// the same real technique self_test_demand_paging_heap() already uses.
+pub fn self_test_signal_delivery() {
+    // Real, checked-not-assumed layout cross-check: SIGNAL_TEST_PROGRAM's
+    // own assembler-produced bytes must agree with the offset/pid
+    // constants this self-test (and the program's own doc comment) rely
+    // on, same discipline as SIGSEGV_MSG_OFFSET's own pre-flight check
+    // elsewhere in this file.
+    let resume_opcode_ok = SIGNAL_TEST_PROGRAM[SIGNAL_TEST_RESUME_OFFSET as usize] == 0x48
+        && SIGNAL_TEST_PROGRAM[SIGNAL_TEST_RESUME_OFFSET as usize + 1] == 0xB8;
+    let handler_opcode_ok = SIGNAL_TEST_PROGRAM[SIGNAL_TEST_HANDLER_OFFSET as usize] == 0x48
+        && SIGNAL_TEST_PROGRAM[SIGNAL_TEST_HANDLER_OFFSET as usize + 1] == 0xB8;
+    // The `mov edi, SIGNAL_TEST_PROCESS_ID` (self pid) operand byte, at a
+    // fixed offset within the program's own sigsend() call -- see
+    // SIGNAL_TEST_PROGRAM's own byte listing (offset 0x35's `0xBF, 0x12,
+    // ...`).
+    let self_pid_ok = SIGNAL_TEST_PROGRAM[0x36] == SIGNAL_TEST_PROCESS_ID;
+    let layout_ok = resume_opcode_ok && handler_opcode_ok && self_pid_ok;
+    let _ = writeln!(
+        serial(),
+        "milestone 60: self-test -- layout check: resume opcode ok={resume_opcode_ok}, handler opcode ok={handler_opcode_ok}, embedded self-pid ok={self_pid_ok} -- {}",
+        if layout_ok { "confirmed" } else { "MISMATCH" }
+    );
+
+    let _ = writeln!(
+        serial(),
+        "milestone 60: self-test -- running SIGNAL_TEST_PROCESS (register a real SIGUSR1 handler, self-signal, expect genuine mid-execution redirection into it and a real SIGRETURN back out)..."
+    );
+    let ran_ok = match run(SIGNAL_TEST_PROCESS_ID) {
+        Ok(()) => {
+            let _ = writeln!(serial(), "milestone 60: self-test -- SIGNAL_TEST_PROCESS ran to completion (its own exit() syscall returned normally)");
+            true
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 60: self-test -- FAILED, SIGNAL_TEST_PROCESS could not run: {e}");
+            false
+        }
+    };
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let heap_bytes = with_process_mut(SIGNAL_TEST_PROCESS_ID, |p| {
+        p.heap_frames[0].map(|frame| {
+            let base = phys_mem_offset + frame.start_address().as_u64();
+            let mut buf = [0u8; 40];
+            unsafe { core::ptr::copy_nonoverlapping(base.as_ptr::<u8>(), buf.as_mut_ptr(), buf.len()) };
+            buf
+        })
+    })
+    .flatten();
+
+    let (before_ok, handler_ran_ok, canary_restored_ok, resume_ran_ok, signum_ok) = match heap_bytes {
+        Some(buf) => {
+            let canary = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+            let signum_seen = u64::from_le_bytes(buf[32..40].try_into().unwrap());
+            (
+                buf[0] == 0xAA,
+                buf[8] == 0xBB,
+                canary == SIGNAL_TEST_CANARY,
+                buf[24] == 0xCC,
+                signum_seen == SIGNAL_TEST_SIGNUM as u64,
+            )
+        }
+        None => (false, false, false, false, false),
+    };
+
+    let _ = writeln!(
+        serial(),
+        "milestone 60: self-test -- HEAP_START markers: main-before-signal ran={before_ok} (expect true), handler genuinely ran={handler_ran_ok} (expect true), canary register (0x{SIGNAL_TEST_CANARY:X}, clobbered by the handler to 0x{SIGNAL_TEST_CANARY_CLOBBER:X} in between) survived SIGRETURN intact={canary_restored_ok} (expect true), resumed-after-handler code ran={resume_ran_ok} (expect true), handler received the real signum ({SIGNAL_TEST_SIGNUM}, SIGUSR1) as its SysV first argument={signum_ok} (expect true)"
+    );
+
+    let overall = layout_ok && ran_ok && before_ok && handler_ran_ok && canary_restored_ok && resume_ran_ok && signum_ok;
+    let _ = writeln!(serial(), "milestone 60: self-test -- OVERALL: {}", if overall { "PASS" } else { "FAIL" });
 }
 
 /// MILESTONE 45: a direct, filesystem-independent proof that

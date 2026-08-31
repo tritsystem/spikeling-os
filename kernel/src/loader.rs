@@ -412,6 +412,47 @@ static ALTENTRY_TEST_ELF_BYTES: &[u8] = include_bytes!("../assets/testelf_altent
 /// real behavior against.
 static MALLOCTEST_ELF_BYTES: &[u8] = include_bytes!("../assets/malloctest.elf");
 
+/// MILESTONE 58: the "receiver" half of the real argv/envp exec() test
+/// -- real, externally-built ELF64 payload (same toolchain as every
+/// other *_ELF_BYTES above, not hand-assembled) that reads argc/argv/
+/// envp straight off its own real initial stack, per the actual x86_64
+/// SysV process-entry contract, and checks it against the exact values
+/// ARGVLAUNCHER_ELF_BYTES below is known to send. Source in
+/// tools/argvtarget_src/, see that directory's own README.md for the
+/// exact build recipe (and a real link failure hit and fixed while
+/// building it).
+static ARGVTARGET_ELF_BYTES: &[u8] = include_bytes!("../assets/argvtarget.elf");
+
+/// MILESTONE 58: the "caller" half of the real argv/envp exec() test --
+/// calls the kernel's new EXECARGV syscall (16) with a real 3-entry
+/// argv array and a real 1-entry envp array, exec()ing into
+/// ARGVTARGET_ELF_BYTES (seeded to disk at `process::EXECARGV_TARGET_
+/// PATH` by seed_argvtarget_elf() below). Source in
+/// tools/argvlauncher_src/.
+static ARGVLAUNCHER_ELF_BYTES: &[u8] = include_bytes!("../assets/argvlauncher.elf");
+
+/// MILESTONE 61: real, externally-built ELF64 test payload exercising
+/// the new `string.h` (memcpy/memmove/memset/memcmp/strlen/strcmp/
+/// strncmp/strcpy/strncpy/strcat/strchr) and buffered stdio (fopen/
+/// fclose/fread/fwrite/fflush/fputc/fgetc/fputs/feof/fprintf-equivalent)
+/// added to libc.rs this milestone -- built the same way every other
+/// *_ELF_BYTES above is (this project's own pinned Rust toolchain +
+/// rust-lld, not hand-assembled), source in tools/stdiotest_src/. See
+/// tools/stdiotest_src/README.md for the exact build recipe and
+/// tools/stdiotest_src/main.rs for the hand-computed predictions this
+/// program checks its own string.h/stdio implementation against.
+static STDIOTEST_ELF_BYTES: &[u8] = include_bytes!("../assets/stdiotest.elf");
+
+/// MILESTONE 67: real, externally-built ELF64 test payload -- Tier 3's
+/// first slice, a subset-C lexer + minimal recursive-descent parser (NO
+/// codegen yet). Built the same way every other *_ELF_BYTES above is
+/// (this project's own pinned Rust toolchain + rust-lld, not hand-
+/// assembled), source in tools/cc_src/. See tools/cc_src/README.md for
+/// the exact build recipe and tools/cc_src/main.rs for the hand-
+/// computed token-stream/AST predictions (plus two deliberate error
+/// cases) this program checks its own lex()/parse_function() against.
+static CC_ELF_BYTES: &[u8] = include_bytes!("../assets/cc.elf");
+
 /// MILESTONE 40: the `seedpipetest` shell command's entry point --
 /// same reasoning as seed_test_elf() above, writes the real ELF bytes
 /// to disk so `runelf pipetest` (reusing run_elf() below unchanged,
@@ -496,13 +537,22 @@ pub fn run_elf(path: &str) -> Result<(), String> {
         );
     }
 
+    // MILESTONE 57: split into create_loaded_elf_process() (needs
+    // frame_allocator, runs INSIDE with_frame_allocator's closure -- and
+    // only for exactly this call) then run_loaded_elf_process() (the
+    // ring-3 excursion itself, called AFTER that closure -- and
+    // therefore the global FRAME_ALLOCATOR lock -- has already returned.
+    // Same real fix, same reasoning, as run_file()'s own Milestone 35
+    // split just above -- see create_loaded_elf_process()'s own doc
+    // comment in process.rs for the freshly real (not just wasteful)
+    // deadlock this closes.
     let phys_mem_offset = memory::phys_mem_offset();
-    let result = memory::with_frame_allocator(|frame_allocator| {
-        process::load_and_run_elf(frame_allocator, phys_mem_offset, &bytes, &elf_image)
+    let create_result = memory::with_frame_allocator(|frame_allocator| {
+        process::create_loaded_elf_process(frame_allocator, phys_mem_offset, &bytes, &elf_image)
     });
 
-    match result {
-        Some(Ok(())) => Ok(()),
+    match create_result {
+        Some(Ok(())) => process::run_loaded_elf_process(elf_image.entry).map_err(|e| format!("runelf: {e}")),
         Some(Err(e)) => Err(format!("runelf: {e}")),
         None => Err("runelf: global frame allocator not installed yet (should never happen post-boot)".into()),
     }
@@ -618,21 +668,34 @@ pub fn self_test_altentry_elf() {
 
     let _ = writeln!(
         serial(),
-        "milestone 44: self-test -- running the alt-entry ELF via process::load_and_run_elf() (the SAME function `runelf` itself calls)..."
+        "milestone 44: self-test -- running the alt-entry ELF via process::create_loaded_elf_process()/run_loaded_elf_process() (the SAME functions `runelf` itself calls)..."
     );
+    // MILESTONE 57: split the same way run_elf()/self_test_malloc() are
+    // split -- the ring-3 excursion (run_loaded_elf_process) must NOT
+    // run from inside with_frame_allocator()'s closure. This particular
+    // self-test never touches its heap, so the deadlock this closes was
+    // never actually reachable through THIS specific call before -- but
+    // it's the same shared load_and_run_elf() function self_test_malloc()
+    // below DID reproducibly deadlock through, so it's fixed here too for
+    // real consistency, not left as a live footgun for the next self-test
+    // that happens to touch its heap.
     let phys_mem_offset = memory::phys_mem_offset();
-    let run_result = memory::with_frame_allocator(|frame_allocator| {
-        process::load_and_run_elf(frame_allocator, phys_mem_offset, ALTENTRY_TEST_ELF_BYTES, &elf_image)
+    let create_result = memory::with_frame_allocator(|frame_allocator| {
+        process::create_loaded_elf_process(frame_allocator, phys_mem_offset, ALTENTRY_TEST_ELF_BYTES, &elf_image)
     });
+    let run_result = match create_result {
+        Some(Ok(())) => process::run_loaded_elf_process(elf_image.entry),
+        Some(Err(e)) => Err(e),
+        None => Err("frame allocator not installed"),
+    };
 
-    let returned_ok = matches!(run_result, Some(Ok(())));
+    let returned_ok = run_result.is_ok();
     let _ = writeln!(
         serial(),
-        "milestone 44: self-test -- load_and_run_elf() returned {} (no panic either way -- see this function's own doc comment for why that alone isn't the real proof)",
+        "milestone 44: self-test -- run_loaded_elf_process() returned {} (no panic either way -- see this function's own doc comment for why that alone isn't the real proof)",
         match &run_result {
-            Some(Ok(())) => String::from("Ok(())"),
-            Some(Err(e)) => format!("Err({e})"),
-            None => String::from("None (frame allocator not installed)"),
+            Ok(()) => String::from("Ok(())"),
+            Err(e) => format!("Err({e})"),
         }
     );
 
@@ -720,10 +783,33 @@ pub fn self_test_malloc() {
         }
     };
 
+    // MILESTONE 57: a REAL, reproducible deadlock was found and fixed
+    // right here during this milestone's own verification -- the
+    // original single `load_and_run_elf()` call ran malloctest.elf's
+    // ENTIRE ring-3 excursion from inside this `with_frame_allocator()`
+    // closure, and malloctest.elf is the first ELF-loaded program in
+    // this project's history to actually touch its heap (a real
+    // `sys_sbrk()` call followed by a real write to the returned
+    // pointer). That first heap write's page fault called
+    // `process::try_demand_page_heap()`, which itself needs
+    // `memory::with_frame_allocator()` to get a fresh frame -- but
+    // `spin::Mutex` is not reentrant, so it spun forever trying to
+    // re-acquire the SAME lock this call site already held, confirmed
+    // via a real, reproducible QEMU crash (exit code 2, no further
+    // kernel output) across multiple fresh boots before being
+    // root-caused and fixed by splitting create/run exactly like
+    // run_file()'s own Milestone 35 precedent -- see
+    // process::create_loaded_elf_process()'s own doc comment for the
+    // full story.
     let phys_mem_offset = memory::phys_mem_offset();
-    let result = memory::with_frame_allocator(|frame_allocator| {
-        process::load_and_run_elf(frame_allocator, phys_mem_offset, MALLOCTEST_ELF_BYTES, &elf_image)
+    let create_result = memory::with_frame_allocator(|frame_allocator| {
+        process::create_loaded_elf_process(frame_allocator, phys_mem_offset, MALLOCTEST_ELF_BYTES, &elf_image)
     });
+    let result = match create_result {
+        Some(Ok(())) => Some(process::run_loaded_elf_process(elf_image.entry)),
+        Some(Err(e)) => Some(Err(e)),
+        None => None,
+    };
 
     match result {
         Some(Ok(())) => {
@@ -733,10 +819,268 @@ pub fn self_test_malloc() {
             );
         }
         Some(Err(e)) => {
-            let _ = writeln!(serial(), "milestone 51: self-test FAILED -- load_and_run_elf(malloctest.elf) returned Err: {e}");
+            let _ = writeln!(serial(), "milestone 51: self-test FAILED -- run_loaded_elf_process(malloctest.elf) returned Err: {e}");
         }
         None => {
             let _ = writeln!(serial(), "milestone 51: self-test FAILED -- global frame allocator not installed yet (should never happen post-boot)");
+        }
+    }
+}
+
+/// MILESTONE 58: the `seedargvtarget` shell command's entry point --
+/// same reasoning as seed_malloctest_elf() above, writes
+/// ARGVTARGET_ELF_BYTES to the real on-disk filesystem at
+/// `process::EXECARGV_TARGET_PATH` ("argvtarget"), the exact path
+/// ARGVLAUNCHER_ELF_BYTES's own real EXECARGV syscall call targets.
+/// Also called directly, non-interactively, from self_test_execargv()
+/// below so this milestone's own self-test needs no shell/keyboard
+/// interaction to have real content on disk to exec() into.
+pub fn seed_argvlauncher_elf() -> Result<usize, String> {
+    let len = ARGVLAUNCHER_ELF_BYTES.len();
+    fs::write_file("argvlauncher", ARGVLAUNCHER_ELF_BYTES).map_err(|e| format!("seedargvlauncher: {e}"))?;
+    let _ = writeln!(
+        serial(),
+        "milestone 58: seedargvlauncher -- wrote {len} real bytes (a genuine externally-built ELF64 executable calling the real EXECARGV syscall) to 'argvlauncher' on the real on-disk filesystem"
+    );
+    Ok(len)
+}
+
+pub fn seed_argvtarget_elf() -> Result<usize, String> {
+    let len = ARGVTARGET_ELF_BYTES.len();
+    fs::write_file(crate::process::EXECARGV_TARGET_PATH, ARGVTARGET_ELF_BYTES).map_err(|e| format!("seedargvtarget: {e}"))?;
+    let _ = writeln!(
+        serial(),
+        "milestone 58: seedargvtarget -- wrote {len} real bytes (a genuine externally-built ELF64 executable that reads real argv/envp off its own initial stack) to '{}' on the real on-disk filesystem",
+        crate::process::EXECARGV_TARGET_PATH
+    );
+    Ok(len)
+}
+
+/// MILESTONE 58: a real, boot-time, non-interactive proof that argv/envp
+/// genuinely thread through exec() -- same "sendkey is unreliable, run
+/// unattended instead" reasoning as every other self_test_* in this
+/// project. First seeds ARGVTARGET_ELF_BYTES to disk (same "self-
+/// contained, no shell interaction needed" reasoning as
+/// process::self_test_real_exec()'s own seed_test_elf_altentry() call),
+/// THEN loads and runs ARGVLAUNCHER_ELF_BYTES via the same real
+/// create_loaded_elf_process()/run_loaded_elf_process() split
+/// self_test_malloc() above uses. The launcher itself calls the new
+/// EXECARGV syscall, which tears down and rebuilds the SAME process
+/// slot (LOADED_PROCESS_ID) mid-flight via
+/// process::exec_elf_with_args() -- exactly like
+/// process::self_test_real_exec()'s own EXEC_TEST_PROCESS does for the
+/// plain syscall 9 path -- so run_loaded_elf_process() only returns
+/// once the NEWLY exec()'d argvtarget.elf itself calls exit(), not when
+/// the launcher's own code would have (a real EXECARGV success never
+/// reaches the launcher's own exit() call at all).
+///
+/// The real pass/fail evidence is written directly to serial BY THE
+/// RING-3 PROGRAMS THEMSELVES (argvlauncher.elf's own startup/fallback
+/// messages, argvtarget.elf's own hand-computed argv/envp checks and
+/// final "OVERALL=PASS/FAIL" line) -- this kernel-side wrapper's own
+/// job is narrower and honest about it: confirm the target seeds to
+/// disk, confirm the ELF loads and parses, confirm run_loaded_elf_
+/// process() returns Ok (no kernel panic, no double fault, no hang)
+/// rather than an Err or a crash. Grep the serial log around this point
+/// for the programs' own "milestone 58:" lines for the actual
+/// argv/envp-correctness evidence.
+pub fn self_test_execargv() {
+    if let Err(e) = seed_argvtarget_elf() {
+        let _ = writeln!(serial(), "milestone 58: self-test FAILED -- could not seed argvtarget.elf to disk: {e}");
+        return;
+    }
+
+    let elf_image = match elf::parse(ARGVLAUNCHER_ELF_BYTES) {
+        Ok(image) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 58: self-test -- parsed the embedded argvlauncher.elf: e_entry={:#x} (expected {:#x}), {} PT_LOAD segment(s)",
+                image.entry,
+                usertest::USER_CODE_ADDR,
+                image.segments.len()
+            );
+            image
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 58: self-test FAILED -- elf::parse(embedded argvlauncher.elf) returned Err: {e}");
+            return;
+        }
+    };
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let create_result = memory::with_frame_allocator(|frame_allocator| {
+        process::create_loaded_elf_process(frame_allocator, phys_mem_offset, ARGVLAUNCHER_ELF_BYTES, &elf_image)
+    });
+    let result = match create_result {
+        Some(Ok(())) => Some(process::run_loaded_elf_process(elf_image.entry)),
+        Some(Err(e)) => Some(Err(e)),
+        None => None,
+    };
+
+    match result {
+        Some(Ok(())) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 58: self-test -- argvlauncher.elf's real EXECARGV replaced it with argvtarget.elf, which ran to completion and returned to the kernel cleanly (no panic, no double fault) -- see the 'milestone 58:' lines above for the real argv/envp-correctness evidence written by the programs themselves"
+            );
+        }
+        Some(Err(e)) => {
+            let _ = writeln!(serial(), "milestone 58: self-test FAILED -- run_loaded_elf_process(argvlauncher.elf) returned Err: {e}");
+        }
+        None => {
+            let _ = writeln!(serial(), "milestone 58: self-test FAILED -- global frame allocator not installed yet (should never happen post-boot)");
+        }
+    }
+}
+
+/// MILESTONE 61: the `seedstdiotest` shell command's entry point -- same
+/// reasoning as seed_malloctest_elf() above, writes the real ELF bytes
+/// to disk so `runelf stdiotest` can also load and run it interactively
+/// (the boot-time self-test below runs the SAME embedded bytes
+/// non-interactively; this is the interactive re-run path). NOTE:
+/// stdiotest.elf's own self-test writes real files of its own
+/// ("stdiotest_a"/"stdiotest_b") to the SAME on-disk filesystem this
+/// seeds into -- running it more than once in the same boot (or after
+/// `seedstdiotest` itself) is safe (fopen("w") on an existing path just
+/// reuses/extends that path's existing on-disk entry, it doesn't fail),
+/// but see libc.rs's own stdio doc comment for the real, disclosed
+/// no-O_TRUNC caveat that applies if a re-run's total written length
+/// ever ends up shorter than a previous run's.
+pub fn seed_stdiotest_elf() -> Result<usize, String> {
+    let len = STDIOTEST_ELF_BYTES.len();
+    fs::write_file("stdiotest", STDIOTEST_ELF_BYTES).map_err(|e| format!("seedstdiotest: {e}"))?;
+    let _ = writeln!(
+        serial(),
+        "milestone 61: seedstdiotest -- wrote {len} real bytes (a genuine externally-built ELF64 executable exercising string.h + buffered stdio) to 'stdiotest' on the real on-disk filesystem"
+    );
+    Ok(len)
+}
+
+/// MILESTONE 61: a real, boot-time, non-interactive proof that the new
+/// string.h + buffered stdio actually work -- same "sendkey is
+/// unreliable, run unattended instead" reasoning, and the same real
+/// create/run split (self_test_malloc()'s own doc comment above tells
+/// the full, already-fixed deadlock story this split closes) as every
+/// other ELF-loading self-test in this file.
+///
+/// The real pass/fail evidence -- including every hand-computed
+/// prediction's own PASS/FAIL (string.h correctness, the exact internal
+/// `wlen`/`rlen`/`rpos` buffering-mechanism values, the append-mode
+/// round trip, the fprintf-equivalent's byte-exact output) -- is written
+/// directly to serial BY THE RING-3 PROGRAM ITSELF, via its own real
+/// write() syscalls (see tools/stdiotest_src/main.rs's own inline
+/// comments for exactly what each check predicts and why). This
+/// kernel-side wrapper's own job stays the same narrow, honest scope
+/// self_test_malloc() above already established: confirm the ELF
+/// parses, confirm run_loaded_elf_process() returns Ok (no panic, no
+/// double fault, no hang), confirm the kernel is still alive
+/// immediately afterward. Grep the serial log around this point for the
+/// program's own "milestone 61: stdiotest" lines for the actual
+/// string.h/stdio-correctness evidence.
+pub fn self_test_stdio() {
+    let elf_image = match elf::parse(STDIOTEST_ELF_BYTES) {
+        Ok(image) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 61: self-test -- parsed the embedded stdiotest.elf: e_entry={:#x} (expected {:#x}), {} PT_LOAD segment(s)",
+                image.entry,
+                usertest::USER_CODE_ADDR,
+                image.segments.len()
+            );
+            image
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 61: self-test FAILED -- elf::parse(embedded stdiotest.elf) returned Err: {e}");
+            return;
+        }
+    };
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let create_result = memory::with_frame_allocator(|frame_allocator| {
+        process::create_loaded_elf_process(frame_allocator, phys_mem_offset, STDIOTEST_ELF_BYTES, &elf_image)
+    });
+    let result = match create_result {
+        Some(Ok(())) => Some(process::run_loaded_elf_process(elf_image.entry)),
+        Some(Err(e)) => Some(Err(e)),
+        None => None,
+    };
+
+    match result {
+        Some(Ok(())) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 61: self-test -- stdiotest.elf ran to completion and returned to the kernel cleanly (no panic, no double fault) -- see the 'milestone 61: stdiotest' lines above for the real string.h/stdio-correctness evidence written by the program itself"
+            );
+        }
+        Some(Err(e)) => {
+            let _ = writeln!(serial(), "milestone 61: self-test FAILED -- run_loaded_elf_process(stdiotest.elf) returned Err: {e}");
+        }
+        None => {
+            let _ = writeln!(serial(), "milestone 61: self-test FAILED -- global frame allocator not installed yet (should never happen post-boot)");
+        }
+    }
+}
+
+/// MILESTONE 67/68: a real, boot-time, non-interactive proof that Tier 3's
+/// first two slices -- the subset-C lexer + minimal recursive-descent
+/// parser (Milestone 67), and real x86_64 machine-code generation from
+/// the resulting AST (Milestone 68) -- both actually work when run as a
+/// real spikeling-os ring-3 process. Same real create/run split, and the
+/// same narrow, honest kernel-side scope, as self_test_stdio() above:
+/// confirm the ELF parses, confirm run_loaded_elf_process() returns Ok
+/// (no panic, no double fault, no hang), confirm the kernel is still
+/// alive immediately afterward. Every actual lex/parse/codegen-
+/// correctness check -- Milestone 67's full 19-token hand-computed
+/// stream, the resulting AST's exact shape, two deliberate lex/parse
+/// error cases, AND Milestone 68's real compile-then-EXECUTE cases
+/// (the generated machine code is actually called through a Rust
+/// function pointer and its real returned integer checked against a
+/// hand-computed expected value) plus one deliberate codegen error case
+/// -- is written directly to serial BY THE RING-3 PROGRAM ITSELF via its
+/// own real write() syscalls (see tools/cc_src/main.rs's own inline
+/// comments for exactly what each check predicts and why). Grep the
+/// serial log around this point for the program's own "milestone 67:
+/// cc" and "milestone 68: cc codegen" lines for the actual evidence.
+pub fn self_test_cc() {
+    let elf_image = match elf::parse(CC_ELF_BYTES) {
+        Ok(image) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 67: self-test -- parsed the embedded cc.elf: e_entry={:#x} (expected {:#x}), {} PT_LOAD segment(s)",
+                image.entry,
+                usertest::USER_CODE_ADDR,
+                image.segments.len()
+            );
+            image
+        }
+        Err(e) => {
+            let _ = writeln!(serial(), "milestone 67: self-test FAILED -- elf::parse(embedded cc.elf) returned Err: {e}");
+            return;
+        }
+    };
+
+    let phys_mem_offset = memory::phys_mem_offset();
+    let create_result = memory::with_frame_allocator(|frame_allocator| {
+        process::create_loaded_elf_process(frame_allocator, phys_mem_offset, CC_ELF_BYTES, &elf_image)
+    });
+    let result = match create_result {
+        Some(Ok(())) => Some(process::run_loaded_elf_process(elf_image.entry)),
+        Some(Err(e)) => Some(Err(e)),
+        None => None,
+    };
+
+    match result {
+        Some(Ok(())) => {
+            let _ = writeln!(
+                serial(),
+                "milestone 67: self-test -- cc.elf ran to completion and returned to the kernel cleanly (no panic, no double fault) -- see the 'milestone 67: cc' lines above for the real lexer/parser-correctness evidence written by the program itself"
+            );
+        }
+        Some(Err(e)) => {
+            let _ = writeln!(serial(), "milestone 67: self-test FAILED -- run_loaded_elf_process(cc.elf) returned Err: {e}");
+        }
+        None => {
+            let _ = writeln!(serial(), "milestone 67: self-test FAILED -- global frame allocator not installed yet (should never happen post-boot)");
         }
     }
 }

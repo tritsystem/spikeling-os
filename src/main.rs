@@ -32,6 +32,23 @@ fn ensure_persist_disk() -> String {
     path.to_string()
 }
 
+// MILESTONE 66: a REAL second block device -- a genuine IDE slave drive
+// on the SAME secondary-bus cable as ensure_persist_disk()'s master
+// (`ata.rs`'s `SECONDARY_SLAVE`, drive-select 0xF0 vs the master's
+// 0xE0, same I/O port base 0x170), backed by its own separate,
+// stable-across-runs image file so `ata::self_test_
+// block_device_abstraction()` always has a real, independent second
+// drive to prove genuine device separation against -- not the same
+// disk read twice under a different name.
+fn ensure_persist_disk2() -> String {
+    let path = "target/persist2.img";
+    if !std::path::Path::new(path).exists() {
+        let blank = vec![0u8; 1024 * 1024];
+        fs::write(path, blank).expect("failed to create target/persist2.img");
+    }
+    path.to_string()
+}
+
 // Runs the built kernel disk image in QEMU -- this is the "run it
 // virtually" piece: iterate against a real emulated x86_64 machine with
 // no risk to physical hardware, same approach every serious hobby-OS
@@ -130,6 +147,17 @@ fn main() {
     cmd.arg("-drive")
         .arg(format!("id=persist,format=raw,file={persist_path},if=none"));
     cmd.arg("-device").arg("ide-hd,drive=persist,bus=ide.1,unit=0");
+
+    // MILESTONE 66: a real second block device -- the SLAVE drive on
+    // the same secondary-bus cable (unit=1, same bus=ide.1 as the
+    // master just above), matching ata.rs's new SECONDARY_SLAVE
+    // (I/O base 0x170, drive-select 0xF0). Real, separate backing file
+    // (target/persist2.img), stable across runs exactly like the
+    // master's persist.img.
+    let persist2_path = ensure_persist_disk2();
+    cmd.arg("-drive")
+        .arg(format!("id=persist2,format=raw,file={persist2_path},if=none"));
+    cmd.arg("-device").arg("ide-hd,drive=persist2,bus=ide.1,unit=1");
 
     let mut child = cmd.spawn().expect(
         "failed to start qemu-system-x86_64 -- install QEMU first (e.g. apt install qemu-system-x86 \

@@ -57,9 +57,30 @@ lazy_static! {
         // executes `int 0x80` -- a dedicated stack, entirely separate
         // from the double-fault IST stack above and from any task's own
         // stack, since a syscall can be taken while literally any task
-        // (or kernel_main itself) is current.
+        // (or kernel_main itself) is current. It is ALSO the one stack
+        // every hardware exception (page fault included -- see
+        // `interrupts.rs`'s IDT setup, which never gives `page_fault` its
+        // own IST index) switches onto on any ring3->ring0 transition,
+        // not just `int 0x80`.
+        //
+        // POST-MILESTONE-65 FIX: was `4096 * 5` (20 KiB) -- real, found
+        // root cause of the disclosed "fresh-second-ATA-drive triple
+        // fault" (see the README's own "Post-Milestone-65 fix pass" entry
+        // for the full `-d int` trace and analysis). The EXEC/EXECARGV
+        // syscall path (`syscall_dispatch` -> `exec_elf_with_args()` ->
+        // `create_process_from_elf()` -> `build_argv_envp_stack()` ->
+        // `exec_into_ring3()`, all still nested on this SAME stack, exec
+        // never unwinding back through a normal syscall return first) is
+        // structurally deeper than any other syscall this kernel has,
+        // and 20 KiB was not enough real room for it in this unoptimized
+        // debug build -- a genuine kernel-stack overflow, not a page-
+        // fault-handling logic bug. `4096 * 40` (160 KiB) was tested
+        // first as a diagnostic and eliminated the crash outright; `4096
+        // * 16` (64 KiB, real margin, not a tight fit) was then
+        // independently re-verified sufficient on its own real, fresh-
+        // disk boot.
         tss.privilege_stack_table[0] = {
-            const STACK_SIZE: usize = 4096 * 5;
+            const STACK_SIZE: usize = 4096 * 16;
             static mut STACK: AlignedStack<STACK_SIZE> = AlignedStack([0; STACK_SIZE]);
 
             let stack_start = VirtAddr::from_ptr(&raw const STACK);
@@ -149,7 +170,30 @@ pub fn user_data_selector() -> SegmentSelector {
 /// comment for the real bug this exists to fix, found and diagnosed via
 /// an ACTUAL page fault (instruction fetch at VirtAddr(0x200)) during
 /// real QEMU testing, not guessed at.
-const CHILD_EXCURSION_STACK_SIZE: usize = 4096 * 5;
+///
+/// MILESTONE 69: bumped from `4096 * 5` (20 KiB) to `4096 * 16` (64 KiB)
+/// -- the EXACT SAME real bug the "POST-MILESTONE-65 FIX" comment on
+/// `privilege_stack_table[0]` just above already found and fixed for the
+/// MAIN syscall stack, never propagated to this SECOND one. Root cause
+/// confirmed the same way, not guessed: a forked child calling `exec()`
+/// (`syscall_dispatch` -> `exec_elf()` -> `create_process_from_elf()`,
+/// the identical structurally-deep call chain that bug already names) had
+/// never actually happened on THIS stack before Milestone 69 -- every
+/// prior fork()-related self-test either had its child exit() without
+/// exec()ing, or exec()'d a target so shallow the overflow's real
+/// threshold was never reached. Confirmed the hard way: a genuinely
+/// corrupted LOCAL VARIABLE (`phys_mem_offset`, read fresh from a global
+/// atomic moments earlier, observed as a bogus `0x100001992b0` instead of
+/// the real, unchanging `0x28000000000` every other call site on this
+/// same boot printed) inside `create_process_from_elf()`, followed by a
+/// real `misaligned pointer dereference` panic building the new process's
+/// PML4 -- exactly the same "stack-frame corruption, not a page-fault-
+/// handling logic bug" signature the Post-Milestone-65 fix's own
+/// `-d int` trace already diagnosed once. Set to the SAME `4096 * 16`
+/// value that fix independently re-verified sufficient (with real
+/// margin, not a tight fit) for the identical call depth, rather than
+/// re-deriving a new number from scratch.
+const CHILD_EXCURSION_STACK_SIZE: usize = 4096 * 16;
 /// MILESTONE 41: same `#[repr(align(16))]` fix as the two TSS stacks
 /// above -- an unaligned stack-switch target is a real, silent bug, not
 /// just a theoretical one; fixing it here too rather than leaving this

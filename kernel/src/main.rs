@@ -17,6 +17,7 @@ mod ata;
 mod fs;
 mod console;
 mod elf;
+mod errno;
 mod gdt;
 mod interrupts;
 mod keyboard;
@@ -31,6 +32,7 @@ mod process;
 mod rtc;
 mod scheduler;
 mod shell;
+mod signal;
 mod speaker;
 mod tasks;
 mod ternary;
@@ -333,6 +335,69 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Ok(()) => writeln!(port, "milestone 53: FAULT_TEST_PROCESS private address space created").unwrap(),
         Err(e) => writeln!(port, "milestone 53: FAILED to create FAULT_TEST_PROCESS -- {e}").unwrap(),
     }
+    // MILESTONE 57: an eleventh and twelfth hardcoded process slot, real
+    // demand-paging self-test targets (positive and negative case) --
+    // same "frame_allocator/phys_mem_offset conveniently still in scope"
+    // reason as the others just above.
+    match process::init_demand_page_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 57: DEMAND_PAGE_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 57: FAILED to create DEMAND_PAGE_TEST_PROCESS -- {e}").unwrap(),
+    }
+    match process::init_demand_page_oob_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 57: DEMAND_PAGE_OOB_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 57: FAILED to create DEMAND_PAGE_OOB_TEST_PROCESS -- {e}").unwrap(),
+    }
+    // MILESTONE 59: a thirteenth hardcoded process slot (pid 17, not
+    // 13-16 -- see PID_TABLE_BASE's own doc comment), real errno self-
+    // test target -- same "frame_allocator/phys_mem_offset conveniently
+    // still in scope" reason as the others just above.
+    match process::init_errno_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 59: ERRNO_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 59: FAILED to create ERRNO_TEST_PROCESS -- {e}").unwrap(),
+    }
+    // MILESTONE 60: a fourteenth hardcoded process slot (pid 18, not
+    // 13-16 -- see PID_TABLE_BASE's own doc comment), real signal-
+    // delivery self-test target -- same "frame_allocator/phys_mem_offset
+    // conveniently still in scope" reason as the others just above.
+    match process::init_signal_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 60: SIGNAL_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 60: FAILED to create SIGNAL_TEST_PROCESS -- {e}").unwrap(),
+    }
+    // MILESTONE 64: a fifteenth through eighteenth hardcoded process slot
+    // (pids 19-22, not 13-16 -- see PID_TABLE_BASE's own doc comment),
+    // real read-only file-backed mmap() self-test targets (one positive,
+    // three negative) -- same "frame_allocator/phys_mem_offset
+    // conveniently still in scope" reason as the others just above.
+    match process::init_mmap_read_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 64: MMAP_READ_TEST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 64: FAILED to create MMAP_READ_TEST_PROCESS -- {e}").unwrap(),
+    }
+    match process::init_mmap_write_before_read_fault_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 64: MMAP_WRITE_BEFORE_READ_FAULT_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 64: FAILED to create MMAP_WRITE_BEFORE_READ_FAULT_PROCESS -- {e}").unwrap(),
+    }
+    match process::init_mmap_write_after_read_fault_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 64: MMAP_WRITE_AFTER_READ_FAULT_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 64: FAILED to create MMAP_WRITE_AFTER_READ_FAULT_PROCESS -- {e}").unwrap(),
+    }
+    match process::init_mmap_use_after_unmap_fault_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 64: MMAP_USE_AFTER_UNMAP_FAULT_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 64: FAILED to create MMAP_USE_AFTER_UNMAP_FAULT_PROCESS -- {e}").unwrap(),
+    }
+    // MILESTONE 65: a nineteenth and twentieth hardcoded process slot
+    // (pids 23-24, not 13-16 -- see PID_TABLE_BASE's own doc comment),
+    // real writable-mmap self-test targets (two positive successes,
+    // mirroring Milestone 64's own two negative-refusal cases) -- same
+    // "frame_allocator/phys_mem_offset conveniently still in scope"
+    // reason as the others just above.
+    match process::init_mmap_writable_read_then_write_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 65: MMAP_WRITABLE_READ_THEN_WRITE_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 65: FAILED to create MMAP_WRITABLE_READ_THEN_WRITE_PROCESS -- {e}").unwrap(),
+    }
+    match process::init_mmap_writable_write_first_test_process(&mut frame_allocator, phys_mem_offset) {
+        Ok(()) => writeln!(port, "milestone 65: MMAP_WRITABLE_WRITE_FIRST_PROCESS private address space created").unwrap(),
+        Err(e) => writeln!(port, "milestone 65: FAILED to create MMAP_WRITABLE_WRITE_FIRST_PROCESS -- {e}").unwrap(),
+    }
 
     // MILESTONE 34: real general program loader. `frame_allocator`'s
     // last boot-time consumer was process::init_test_processes just
@@ -377,6 +442,19 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // log immediately rather than only when someone remembers to test
     // it by hand.
     fs::self_test_disk_write();
+    // MILESTONE 66: real block-device abstraction -- proves the new
+    // `ata::BlockDevice` trait genuinely routes `read_sector()`/
+    // `write_sector()` (still used unmodified by `fs.rs` just above,
+    // and by `ata::save_weights()`/`load_weights()`) to the real
+    // `SECONDARY_MASTER` device, AND proves a real second block device
+    // (`SECONDARY_SLAVE`, a genuine IDE slave drive on the same
+    // secondary-bus cable, `src/main.rs`'s new `bus=ide.1,unit=1`
+    // drive) is genuinely independent hardware, not an alias of the
+    // first. No ring-3 entry, no ordering constraint relative to
+    // interrupts::init_pics()/sti(), same as the disk self-test just
+    // above -- placed directly after it since both exercise real disk
+    // I/O on the same secondary ATA controller.
+    ata::self_test_block_device_abstraction();
     // MILESTONE 46: same non-interactive-proof reasoning as the
     // disk-write self-test just above, run against the NEW second
     // backing store (an in-memory ramfs, reached through the exact same
@@ -384,6 +462,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // proves the new trait/dispatch layer actually routes to a genuinely
     // separate store, not just the disk under a different-looking path.
     fs::self_test_ramfs();
+    // MILESTONE 62: same non-interactive-proof reasoning as the two
+    // fs self-tests just above -- real on-disk permissions/ownership/
+    // timestamps and their enforcement (chmod/chown rules, granular
+    // read-vs-write denial, parent-directory-write-required create/
+    // delete, directory search-bit traversal gating) checked directly
+    // on every boot. No ring-3 entry, no ordering constraint relative
+    // to interrupts::init_pics()/sti(), same as the two self-tests
+    // above.
+    fs::self_test_permissions();
+    // MILESTONE 63: same non-interactive-proof reasoning as the fs
+    // self-tests above -- real symbolic links (creation, raw
+    // stat/readlink, bounded real dereferencing on read_file and on
+    // directory-path traversal, ELOOP/broken-link errors, rm-removes-
+    // the-link-not-the-target, the disclosed write-through refusal, and
+    // -- most importantly -- that a symlink can never bypass a real
+    // permission check on the directory it points into) checked
+    // directly on every boot.
+    fs::self_test_symlinks();
     // MILESTONE 40: same non-interactive-proof reasoning as the
     // disk-write self-test just above -- pipe()/dup/dup2 mechanics
     // checked directly on every boot, no interactive shell command
@@ -862,6 +958,17 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // already-fixed reason (Milestone 25's background scheduler racing
     // an ELF-loaded process's return) this ordering matters.
     loader::self_test_malloc();
+    // MILESTONE 61: real string.h + buffered stdio self-test -- same
+    // ordering requirement as self_test_malloc() just above (this also
+    // loads and runs a real ELF via process::create_loaded_elf_process()/
+    // run_loaded_elf_process(), a genuine ring-3 entry, and its own
+    // stdio layer uses malloc()/free() the same way malloctest.elf does)
+    // -- must run after init_pics()/enable() and before THIS enable()
+    // call, per the "MERGE NOTE" reasoning documented above. Placed
+    // directly after self_test_malloc() since stdiotest.elf's own
+    // fopen() literally malloc()s its FILE structs -- thematically and
+    // mechanically the next real dependency in this boot sequence.
+    loader::self_test_stdio();
     // MILESTONE 53: same ordering requirement as self_test_signals()/
     // self_test_wait_status() just above -- real ring-3 entry via
     // wait_for_child() -> run_forked_child() -> enter_ring3_as_forked_
@@ -871,6 +978,75 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // 44/51): stays downstream of every non-interactive ring-3 self-test
     // and upstream of this same enable() call.
     process::self_test_fault_status();
+    // MILESTONE 57: real page-fault-driven heap demand paging. Same
+    // ordering requirement as every real-ring-3-excursion self-test
+    // above (process::run(DEMAND_PAGE_TEST_PROCESS_ID)/
+    // process::run(DEMAND_PAGE_OOB_TEST_PROCESS_ID) both go through
+    // usertest::enter_ring3_now(), which sets RFLAGS.IF=1 the same way
+    // every other top-level entry does) -- must run after
+    // init_pics()/enable() (line ~750) and before THIS enable() call,
+    // per the "MERGE NOTE" reasoning documented above.
+    process::self_test_demand_paging_heap();
+    // MILESTONE 64: real read-only file-backed mmap() self-test -- same
+    // ordering requirement as every real-ring-3-excursion self-test above
+    // (process::run(MMAP_READ_TEST_PROCESS_ID) and its three negative-case
+    // siblings all go through usertest::enter_ring3_now(), which sets
+    // RFLAGS.IF=1 the same way every other top-level entry does) -- must
+    // run after init_pics()/enable() (line ~750) and before THIS enable()
+    // call, per the "MERGE NOTE" reasoning documented above. Placed
+    // directly after self_test_demand_paging_heap() since this milestone
+    // reuses that same real hardware page-fault mechanism, generalized to
+    // a second eligible fault case -- thematically and mechanically the
+    // next real dependency in this boot sequence.
+    process::self_test_mmap();
+    // MILESTONE 65: real PROT_WRITE mmap self-test -- same ordering
+    // requirement as self_test_mmap() immediately above (both of this
+    // milestone's new test processes go through the identical
+    // usertest::enter_ring3_now() real-ring-3-excursion path). Placed
+    // directly after self_test_mmap() since it reuses that same real
+    // on-disk fixture file AND the same try_demand_page_mmap() hardware
+    // page-fault mechanism, generalized to a second, writable, MmapSlot
+    // case -- thematically and mechanically the next real dependency.
+    process::self_test_mmap_writable();
+    // MILESTONE 58: real argv/envp threading through exec() -- same
+    // ordering requirement as every real-ring-3-excursion self-test
+    // above (loader::self_test_execargv() loads and runs a real ELF via
+    // process::create_loaded_elf_process()/run_loaded_elf_process(),
+    // exactly like loader::self_test_malloc() above, so it needs
+    // RFLAGS.IF already set from init_pics()/enable() at line ~750) --
+    // must run after that and before THIS enable() call, per the
+    // "MERGE NOTE" reasoning documented above.
+    loader::self_test_execargv();
+    // MILESTONE 59: real errno self-test -- same ordering requirement as
+    // every real-ring-3-excursion self-test above
+    // (process::run(ERRNO_TEST_PROCESS_ID) goes through
+    // usertest::enter_ring3_now(), which sets RFLAGS.IF=1 the same way
+    // every other top-level entry does) -- must run after that and
+    // before THIS enable() call, per the "MERGE NOTE" reasoning
+    // documented above.
+    process::self_test_errno();
+    // MILESTONE 60: real signal delivery self-test -- same ordering
+    // requirement as every real-ring-3-excursion self-test above
+    // (process::run(SIGNAL_TEST_PROCESS_ID) goes through
+    // usertest::enter_ring3_now(), which sets RFLAGS.IF=1 the same way
+    // every other top-level entry does) -- must run after that and
+    // before THIS enable() call, per the "MERGE NOTE" reasoning
+    // documented above.
+    process::self_test_signal_delivery();
+    // MILESTONE 67/68: Tier 3's first two real slices, both exercised by
+    // the SAME embedded cc.elf process -- a subset-C lexer + minimal
+    // recursive-descent parser (67), then real x86_64 machine-code
+    // generation from the resulting AST, actually compiled AND executed
+    // in-process (68) -- run as a real ring-3 ELF process. Same ordering
+    // requirement as every real-ring-3-excursion self-test above
+    // (loader::self_test_cc() loads and runs a real ELF via
+    // process::create_loaded_elf_process()/run_loaded_elf_process(),
+    // exactly like loader::self_test_stdio() above) -- must run after
+    // init_pics()/enable() and before THIS enable() call, per the "MERGE
+    // NOTE" reasoning documented above. Placed last in this chain since
+    // it's the newest, independent of every other Tier 1/2 self-test's
+    // own state.
+    loader::self_test_cc();
     x86_64::instructions::interrupts::enable();
 
     // MILESTONE 54: real physical frame reclamation self-test -- no

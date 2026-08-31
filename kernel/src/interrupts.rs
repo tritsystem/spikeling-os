@@ -17,6 +17,62 @@ use x86_64::{PrivilegeLevel, VirtAddr};
 
 pub const SYSCALL_VECTOR: u8 = 0x80;
 
+/// MILESTONE 75: real, disclosed heuristic distinguishing a genuine
+/// STACK OVERFLOW from an ordinary wild-pointer SIGSEGV, purely for
+/// diagnostic clarity -- the actual termination path
+/// (`terminate_faulted_process_and_resume_kernel()`, unchanged) is
+/// byte-for-byte identical either way; this constant only changes
+/// which log line `page_fault_handler` prints, never what gets caught
+/// or how.
+///
+/// This is the kernel-side half of the one significant OPEN SAFETY
+/// ITEM flagged since Milestone 73 and re-flagged, untouched, by
+/// Milestone 74's own closing disclosure: this kernel gives every
+/// process exactly ONE 4 KiB stack page
+/// (`usertest::USER_STACK_ADDR`/`USER_STACK_SIZE`), growing DOWN from
+/// `USER_STACK_ADDR + USER_STACK_SIZE`, with no stack-depth guard on
+/// self-recursive, forward, or mutually-recursive call chains.
+///
+/// Checked directly against `process.rs` before writing this comment,
+/// not assumed: `create_process_from_image()`/`create_process_from_elf()`
+/// map exactly one code page and exactly one stack page per process;
+/// `try_demand_page_heap()` only ever maps pages in
+/// `[HEAP_START, HEAP_START + HEAP_SIZE)`, ABOVE the stack, never
+/// below it; `try_demand_page_mmap()` similarly never lands below the
+/// stack. So the entire real, ~256 MiB range between
+/// `USER_CODE_ADDR`'s own single page and `USER_STACK_ADDR`
+/// (`USER_STACK_ADDR - USER_CODE_ADDR - PAGE_SIZE`, computed directly
+/// from those two constants, not a round or invented number) is
+/// deliberately never mapped by ANY code path in this kernel -- it
+/// already acts as a real (if enormous, and previously UN-exercised)
+/// guard region: a stack push/access that runs off the bottom of the
+/// single mapped page produces an ordinary NOT-PRESENT `#PF`, which
+/// falls through both the heap and mmap demand-paging attempts below
+/// (neither's own address range comes anywhere close) straight to the
+/// SAME unconditional SIGSEGV-and-terminate path every other invalid
+/// ring-3 access has used since Milestone 41 -- this was already true
+/// before this milestone, just never verified end-to-end against a
+/// program that actually recurses far enough to hit it (see
+/// `tools/cc_src/main.rs`'s new CASE 34 for that real, on-disk-ELF +
+/// kernel `exec()` + `wait()` verification).
+///
+/// `STACK_GUARD_REGION_SIZE` (1 MiB) is a deliberately conservative
+/// SUBSET of that real ~256 MiB gap, used only to decide whether the
+/// fault log line below says "STACK OVERFLOW" instead of the generic
+/// SIGSEGV wording. A wild pointer that happens to land in this same
+/// 1 MiB band immediately below the stack would be mislabeled by the
+/// log line -- a real, disclosed, purely COSMETIC limitation (the
+/// termination path is identical either way) -- not a new safety gap.
+/// This constant does NOT raise the single-page stack to more than one
+/// page, does NOT add a software recursion-depth counter (this kernel
+/// has no visibility into arbitrary ring-3 `call`/`ret` depth without
+/// per-call instrumentation this codegen doesn't emit), and does NOT
+/// change which faults get caught -- it only makes an already-real,
+/// already-caught failure mode diagnosable at a glance in the serial
+/// log, and gives it a real, direct, end-to-end verification for the
+/// first time.
+const STACK_GUARD_REGION_SIZE: u64 = 0x10_0000; // 1 MiB
+
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
@@ -163,12 +219,80 @@ extern "x86-interrupt" fn page_fault_handler(
     // `active` variable already uses.
     let active = crate::process::ACTIVE_PROCESS.load(Ordering::Relaxed);
     if stack_frame.code_segment.rpl() == PrivilegeLevel::Ring3 && active != 0 {
-        let _ = writeln!(
-            serial(),
-            "milestone 41: SIGSEGV -- process {active} page-faulted at {:?} (real hardware CPL=3, error code {:?}) -- terminating this process, kernel continues",
-            Cr2::read(),
-            error_code
-        );
+        // MILESTONE 57: real demand paging for the per-process heap --
+        // tried BEFORE the unconditional SIGSEGV termination below, for
+        // exactly one case: a genuine NOT-PRESENT fault (never a
+        // protection violation -- a heap page this kernel has mapped is
+        // always PRESENT|WRITABLE, so a protection-violation fault there
+        // would mean something is actually wrong, not a legitimate lazy
+        // allocation) whose address is inside the active process's own
+        // heap AND within bytes it has already committed via sbrk(). See
+        // process::try_demand_page_heap()'s own doc comment for the full
+        // eligibility check. Every other fault -- an address outside the
+        // heap entirely, or inside the heap's reserved-but-uncommitted
+        // tail -- returns false here and falls straight through to the
+        // SAME termination path every prior milestone already used,
+        // completely unmodified.
+        let fault_addr = Cr2::read().map(|a| a.as_u64()).unwrap_or(0);
+        if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION) && crate::process::try_demand_page_heap(active, fault_addr) {
+            // A demand-paged fault-class exception resumes by simply
+            // returning: the CPU retries the exact faulting instruction,
+            // which now succeeds against the freshly-mapped page. No
+            // termination, no resume_kernel() unwind -- ring 3 execution
+            // continues exactly where it was.
+            return;
+        }
+        // MILESTONE 64: the mmap twin of the heap demand-paging attempt
+        // just above -- tried SECOND (a fault this process's own mmap
+        // table doesn't recognize at all just falls through, same as a
+        // heap fault outside the heap range falls through the check
+        // above), same `!PROTECTION_VIOLATION` guard (a mmap page this
+        // kernel has mapped is always PRESENT, never WRITABLE by design
+        // -- see process::try_demand_page_mmap()'s own doc comment for
+        // why a protection violation there is the SECOND of its two
+        // real, deliberate write-refusal paths, not a bug). Passes
+        // `error_code`'s own CAUSED_BY_WRITE bit through explicitly --
+        // the ONE piece of information try_demand_page_heap() never
+        // needed (every heap page is always writable once mapped, so a
+        // write-vs-read distinction on a not-present heap fault is
+        // meaningless there) but this function's own FIRST refusal path
+        // depends on entirely.
+        if !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+            && crate::process::try_demand_page_mmap(active, fault_addr, error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE))
+        {
+            return;
+        }
+        // MILESTONE 75: distinguish a genuine stack overflow from a
+        // generic wild-pointer SIGSEGV in the log only -- see
+        // STACK_GUARD_REGION_SIZE's own doc comment above for the full
+        // reasoning. A NOT-PRESENT fault (never a protection violation
+        // -- there is no mapped-but-wrong-permission page anywhere in
+        // this 1 MiB band, only genuinely unmapped memory) whose CR2
+        // falls strictly below USER_STACK_ADDR and within
+        // STACK_GUARD_REGION_SIZE bytes of it is overwhelmingly likely
+        // the active process running its own stack pointer off the
+        // bottom of its single mapped page.
+        let stack_bottom = usertest::USER_STACK_ADDR;
+        let looks_like_stack_overflow = !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
+            && fault_addr < stack_bottom
+            && fault_addr >= stack_bottom.saturating_sub(STACK_GUARD_REGION_SIZE);
+        if looks_like_stack_overflow {
+            let _ = writeln!(
+                serial(),
+                "milestone 75: STACK OVERFLOW -- process {active} ran off the bottom of its own single {}-byte stack page (fault address {:?}, {} bytes below USER_STACK_ADDR {:#x} -- inside this kernel's real, deliberately-unmapped guard gap below the stack, not a wild-pointer SIGSEGV) -- terminating this process, kernel continues",
+                usertest::USER_STACK_SIZE,
+                Cr2::read(),
+                stack_bottom - fault_addr,
+                stack_bottom
+            );
+        } else {
+            let _ = writeln!(
+                serial(),
+                "milestone 41: SIGSEGV -- process {active} page-faulted at {:?} (real hardware CPL=3, error code {:?}) -- terminating this process, kernel continues",
+                Cr2::read(),
+                error_code
+            );
+        }
         crate::usertest::terminate_faulted_process_and_resume_kernel();
     }
     let mut port = serial();

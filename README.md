@@ -1774,7 +1774,98 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       QEMU boot with the persist disk attached, milestones
       42/43/44/45/47/51/53/54/55/56 all pass, zero panics, boot reaches
       the interactive shell normally.
+- [x] **Milestone 57**: real, hardware-fault-driven demand paging for the
+      per-process heap -- the first piece of the Tier 1 roadmap's "virtual
+      memory/demand paging" item (real virtual memory is a much bigger
+      target -- copy-on-write and `mmap` remain future work; this
+      milestone is specifically the heap's reserve-vs-commit-vs-map
+      split). `HEAP_PAGE_COUNT` grows 4 -> 64 pages (16 KiB -> 256 KiB of
+      *reserved* virtual address space per process) for zero eager
+      physical cost: `create_process_from_image()`/`create_process_from_elf()`
+      no longer map a single heap page up front (`heap_frames` becomes
+      `Vec<Option<PhysFrame<Size4KiB>>>`, all `None` at creation) --
+      `sbrk()` still only bumps a purely virtual `heap_used` counter, and
+      a real physical frame is allocated, zeroed, and mapped into that
+      ONE process's own private page tables only the first time a genuine
+      hardware `#PF` touches a byte it has already legitimately committed
+      via `sbrk()` (`try_demand_page_heap()`, called from
+      `interrupts.rs`'s `page_fault_handler` before the existing
+      Milestone 41 SIGSEGV path, and only for a real NOT-PRESENT fault --
+      never a protection violation). Touching reserved-but-uncommitted
+      heap space (beyond what `sbrk()` actually returned) still falls
+      straight through to the unmodified SIGSEGV termination path -- real
+      POSIX brk semantics, not "the whole reservation is secretly
+      mapped". `fork()`'s `fork_build_child()` now only copies+maps a
+      heap page for the child where the PARENT actually has one mapped
+      (an untouched heap page stays lazy on both sides, strictly cheaper
+      than the old unconditional 4-page copy). `reclaim_process_frames()`
+      and Milestone 54's own frame-accounting self-test both updated to
+      count `Some` entries rather than trusting `heap_frames.len()`
+      (no longer 1:1 with real physical frames held). New boot-time
+      self-test (`self_test_demand_paging_heap()`, two new hardcoded
+      process slots, PIDs 11/12) proves both directions for real: the
+      POSITIVE case confirms all 64 heap slots start unmapped, `sbrk()`s
+      past the OLD 16 KiB cap, touches the LAST page of the new
+      reservation (page 63) via a real hardware fault, and checks the
+      actual physical byte survived the fault+retry while page 0 (never
+      touched) stays unmapped -- proof demand paging is genuinely
+      per-page, not per-reservation; the NEGATIVE case targets the exact
+      same page index from a process whose own `heap_used` never grew
+      near it, and confirms a real SIGSEGV fires (page stays unmapped)
+      and the kernel genuinely recovers afterward (PROCESS_A runs
+      normally right after).
 
+      **A real, pre-existing bug found and fixed during this milestone's
+      own verification**: `usertest.rs`'s WRITE-syscall diagnostic
+      unconditionally dereferenced heap page 0 on every write() call --
+      harmless before this milestone (heap page 0 was always eagerly
+      mapped), but a genuine kernel-context page fault (Ring0 CPL, not a
+      process fault) the first real boot after removing eager heap
+      mapping, since most hardcoded test processes never call `sbrk()`
+      at all. Fixed with a new `heap_page0_mapped()` check-first guard
+      rather than papering over it.
+
+      **A second real, reproducible bug found and fixed during this
+      milestone's own verification -- a genuine reentrant-lock deadlock,
+      not a flake**: the first boots after removing eager heap mapping
+      reproducibly hung/crashed (QEMU exit code 2, no further kernel
+      output -- confirmed via a real `-d int` hardware trace showing the
+      CPU correctly took the `#PF` vector and then nothing further was
+      ever logged) at the FIRST real heap touch inside an ELF-loaded
+      process. Root cause: `run_elf()`/`self_test_altentry_elf()`/
+      `self_test_malloc()` all ran the loaded process's ENTIRE ring-3
+      excursion from inside `memory::with_frame_allocator()`'s closure
+      (harmless before this milestone, since that excursion never itself
+      touched `frame_allocator`) -- but a heap page fault occurring
+      DURING that excursion now needs `try_demand_page_heap()` to call
+      `memory::with_frame_allocator()` itself for a fresh frame, and
+      `spin::Mutex` is not reentrant: the retry spins forever trying to
+      re-acquire a lock the SAME execution context already holds. Real
+      evidence isolating it to this one lock-scoping gap rather than
+      demand paging itself being broken: `self_test_altentry_elf()`
+      (never touches its heap) and every hardcoded-process `runproc N`
+      path (never calls the ELF-loader's combined function, never holds
+      this lock during its own ring-3 excursion) kept working fine in the
+      SAME boot that hung on `self_test_malloc()`'s real malloctest.elf
+      -- the first ELF-loaded program in this project's history to
+      actually touch its heap (`sys_sbrk()` then a real write to the
+      returned pointer). Fixed by splitting `load_and_run_elf()` into
+      `create_loaded_elf_process()` (runs inside
+      `with_frame_allocator()`'s closure) and `run_loaded_elf_process()`
+      (the ring-3 excursion itself, called only AFTER that closure --
+      and therefore the lock -- has already returned), mirroring the
+      `create_loaded_process()`/`run_loaded_process()` split
+      `run_file()` already established for the flat-binary loader path
+      (loader.rs). All three call sites (`run_elf()`,
+      `self_test_altentry_elf()`, `self_test_malloc()`) updated to the
+      new two-call shape.
+
+      Real, fresh build + fresh QEMU boot (persist disk attached):
+      milestones 42/43/44/45/53/54/57 all self-report `OVERALL: PASS`
+      (57's own self-test included), the Milestone 51 malloc test --
+      the exact code path that used to deadlock -- prints its own real
+      `OVERALL=PASS`, zero panics, zero warnings, boot reaches the
+      interactive shell and background task scheduling normally.
 ## Building and running
 
 Requires:

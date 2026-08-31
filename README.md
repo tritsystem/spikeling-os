@@ -3274,6 +3274,139 @@ pass's two named problems. Disclosed honestly rather than silently
 patched: a real, small, additional idempotency gap in this project's
 self-test suite, genuinely open for a future pass.
 
+- [x] **Milestone 66**: a real `BlockDevice` trait abstraction over ATA
+      PIO -- the LAST remaining Tier 2 (filesystem completeness) item,
+      chosen after re-verifying both remaining candidates against the
+      ACTUAL current code, not just prior write-ups: **hard links**
+      still need the inode-indirection layer Milestones 62/63/64/65
+      already identified as missing (`fs.rs`'s `DirEntry` still embeds
+      its own `start_lba`/`sector_count` directly, re-confirmed
+      unchanged in the current source -- genuinely too big a structural
+      lift to scope honestly into one milestone, same judgment call
+      Milestones 62-65 each independently re-reached). A **real
+      block-device abstraction beyond raw ATA**, by contrast, was
+      re-confirmed newly tractable: the Post-Milestone-65 fix pass's
+      real root-cause fix (enlarging `gdt.rs`'s shared ring0
+      `privilege_stack_table[0]` stack) means a second real ATA drive no
+      longer risks the triple fault that blocked this candidate at
+      Milestone 65's own write-up -- independently re-confirmed this
+      milestone's own verification never hit that fault once, across
+      two full boots with a real second drive attached the entire time.
+      `ata.rs` before this milestone had real PIO code but no actual
+      abstraction: `read_sector()`/`write_sector()` were bare free
+      functions hardcoded to ONE device (I/O base 0x170, master
+      drive-select 0xE0), with nothing separating "how to talk ATA PIO"
+      from "which specific drive" -- and only ever one real device
+      existed to prove any such separation against.
+
+      **Real mechanism**: a new `pub trait BlockDevice` (`read_sector`/
+      `write_sector` by LBA) and a new `pub struct AtaDevice { io_base,
+      drive_select_base }` implementing it, generalizing the exact same
+      real PIO sequence (`wait_not_busy`/`wait_drq`/`select_and_setup`/
+      the read and write command paths) that used to be free functions
+      hardcoded to fixed port constants. Two real, `const`-constructed
+      `AtaDevice` statics: `SECONDARY_MASTER` (I/O base 0x170,
+      drive-select 0xE0 -- byte-identical ports and select value to
+      every pre-Milestone-66 hardcoded constant, confirmed by
+      construction, not just claimed) and the new `SECONDARY_SLAVE`
+      (same I/O base 0x170, drive-select 0xF0 -- the real IDE slave on
+      the SAME secondary-bus cable, selected purely via the
+      drive-select byte's DRV bit, not a second controller or IRQ). The
+      old free `read_sector()`/`write_sector()` functions (still used
+      unmodified by `fs.rs`'s 7 call sites and this module's own
+      `save_weights()`/`load_weights()`) are now thin wrappers
+      delegating to `SECONDARY_MASTER` through the trait -- zero
+      behavioral change for any existing caller, directly confirmed (see
+      verification below: every fs/weight-persistence self-test that
+      already existed still passes byte-for-byte). `src/main.rs` (the
+      QEMU host runner) attaches the real new second drive explicitly:
+      a separate, stable-across-runs `target/persist2.img` backing file
+      via `-device ide-hd,drive=persist2,bus=ide.1,unit=1` (same
+      `bus=ide.1` secondary controller as the existing master's
+      `unit=0`, genuinely a second real device on the same cable, not a
+      second bus).
+
+      **Real, disclosed scope cuts**: (1) `fs.rs` itself was
+      deliberately NOT rewired to go through the new trait -- its 7
+      `crate::ata::read_sector`/`write_sector` call sites are unchanged,
+      still targeting the single filesystem/weight-persistence device
+      (now `SECONDARY_MASTER` under the hood) -- genuinely separate,
+      larger future work (multi-device filesystem support) that this
+      milestone's own scope is "prove the abstraction is real against a
+      second real device", not "give the filesystem a second real
+      device to mount". (2) the second device (`SECONDARY_SLAVE`) is
+      exercised ONLY by this milestone's own new self-test, at one
+      scratch LBA (500) -- no filesystem, no weight-persistence format,
+      lives on it. (3) still PIO, not DMA/AHCI -- same real, disclosed
+      limitation every prior ATA milestone has carried; a real
+      block-device abstraction over a DIFFERENT underlying transport
+      (e.g. a future AHCI/SATA driver, Tier 7's own roadmap item) is
+      real future work this trait boundary now makes structurally
+      easier, not something this milestone itself builds.
+
+      Verified with a real, new, non-interactive self-test
+      (`ata::self_test_block_device_abstraction()`, called from
+      `main.rs` immediately after `fs::self_test_disk_write()` -- no
+      ring-3 ordering constraint, same as every other pure-disk-I/O
+      self-test), exercising four genuinely different real checks: (1)
+      a trait write to the master, read back via the OLD free function,
+      proving real delegation rather than a coincidentally-agreeing
+      separate implementation; (2) the reverse direction (free-function
+      write, trait read); (3) a full write+read round trip against the
+      real SECOND device (`SECONDARY_SLAVE`) purely through the trait;
+      (4) re-reading the master AFTER the slave write and confirming it
+      still shows its own last-written content, not the slave's --
+      direct, real proof the two devices are genuinely independent
+      hardware, not the same physical device aliased under two names.
+      Quoted from the actual serial log, IDENTICAL result across TWO
+      separate real boots -- a genuinely fresh disk pair (both
+      `persist.img` and the new `persist2.img` created blank) and a
+      SEPARATE, immediately-following boot against those SAME,
+      now-reused disks:
+      ```
+      milestone 66: self-test -- trait-write/free-read-agree(master)=true free-write/trait-read-agree(master)=true slave-device-roundtrip=true master-unaffected-by-slave-write(no-aliasing)=true
+      milestone 66: self-test -- OVERALL: PASS
+      ```
+      identical in both boots -- direct proof this milestone's own
+      feature has NO reused-disk idempotency gap (its scratch LBA 500
+      is simply overwritten fresh on every boot, unlike the
+      create-exclusive fixture pattern that caused Milestone 62/63's
+      pre-fix-pass bug or the still-open `stdiotest.elf` O_TRUNC gap
+      below). In the SAME two boots, also directly confirmed still
+      passing with zero regressions: `fs self-test: permissions
+      OVERALL=PASS`, `fs self-test: symlinks OVERALL=PASS` (both, in
+      BOTH boots -- the Post-Milestone-65 fix pass's teardown helpers
+      still hold), and milestones 42, 43, 44, 45, 51 (malloctest.elf's
+      own `OVERALL=PASS`), 53, 54, 57, 58 (argvtarget.elf's own real
+      argv/envp roundtrip), 59, 60, 64, and 65 -- all `OVERALL: PASS` in
+      both boots, zero panics, zero unexpected `FAIL`, zero
+      `EXCEPTION: PAGE FAULT`/`DOUBLE FAULT`/`TRIPLE FAULT` anywhere in
+      either log. The only `FAIL` observed in either boot was the
+      SECOND (reused-disk) boot's `stdiotest.elf` (`fread_real_
+      buffering=FAIL eof_semantics=FAIL OVERALL=FAIL`) -- exactly the
+      pre-existing, already-disclosed Milestone 61 O_TRUNC gap (see the
+      Post-Milestone-65 fix pass's own write-up above), independently
+      re-confirmed here and NOT touched by this milestone (this
+      milestone never modifies `loader.rs`, `fs::write_file()`, or
+      `stdiotest.elf`); the FIRST (fresh-disk) boot showed a clean
+      `stdiotest.elf` `OVERALL=PASS`, matching the documented pattern
+      exactly. `tasklist` confirmed zero orphaned
+      `qemu-system-x86_64.exe` processes after both verification boots.
+
+      **Still genuinely open**: hard links (still blocked by the same
+      inode-indirection gap re-confirmed above); `fs.rs` itself does not
+      yet use the `BlockDevice` trait (still calls the free-function
+      wrappers directly, deliberately out of this milestone's own
+      scope); no DMA/AHCI transport, only PIO; the pre-existing,
+      independently-reconfirmed `stdiotest.elf` reused-disk O_TRUNC gap
+      (disclosed by the Post-Milestone-65 fix pass, untouched by this
+      milestone). With Tier 2's remaining well-scoped items now this
+      thin -- hard links is the only one left, and it has been
+      independently re-confirmed still blocked at every milestone from
+      62 through 66 -- Tier 2 (filesystem completeness) is honestly
+      characterized as functionally done for now; the natural next step
+      is Tier 3 (toolchain bootstrapping), scoped to its own first
+      honestly-verifiable slice when a future milestone picks it up.
 ## Building and running
 
 Requires:

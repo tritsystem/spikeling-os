@@ -1979,6 +1979,109 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       scheduling normally afterward. `tasklist` confirmed zero orphaned
       `qemu-system-x86_64.exe` processes after verification.
 
+- [x] **Milestone 59**: real `errno` -- the other Tier 1 gap Milestone 58's
+      own closing doc comment named alongside real signal delivery,
+      chosen over that bigger, riskier lift (a whole new control-transfer
+      mechanism: a real trampoline into a user-registered handler, a
+      `sigreturn`-equivalent, per-process handler-table bookkeeping,
+      layered on a fault/kill path this kernel has never needed to
+      interrupt mid-instruction before) for the same reason Milestone 58
+      picked `exec()`'s argv/envp gap over it too: giving every syscall
+      that already fails today a real, specific reason code alongside its
+      existing bare `u64::MAX`/`0`/`1` sentinel is real, cleanly-scoped
+      work with no new control-flow mechanism required.
+
+      **Honest disclosure**: this milestone was started, then interrupted
+      mid-work by a rate limit, and finished by a follow-up pass. The
+      interrupted session got exactly as far as `kernel/src/errno.rs`
+      itself (a complete, well-documented module of REAL POSIX/Linux
+      x86_64 errno.h values -- `EPERM`, `ENOENT`, `ESRCH`, `EIO`, `E2BIG`,
+      `ENOEXEC`, `EBADF`, `ECHILD`, `EAGAIN`, `ENOMEM`, `EINVAL`,
+      `EMFILE`, checked against the real numbers, not invented) and one
+      new `Process::errno` struct field (with both existing constructors
+      updated to initialize it to `0`) -- but had not yet wired a single
+      one of those constants into any real syscall failure path, and left
+      a real `#[warn(dead_code)]` "field `errno` is never read" warning at
+      the point of interruption. The follow-up pass found this state via
+      `git status`/`git diff`, confirmed the field-and-constructor fix was
+      already correct (mirrored exactly from the sibling constructor, doc
+      comment included), and did the actual wiring described below.
+
+      The real wiring: `process::set_errno()`/`process::get_errno()` (the
+      only reader/writer of `Process::errno` anywhere in this kernel) back
+      a NEW syscall, 17 (GETERRNO, no arguments) -- real POSIX semantics,
+      same as a real libc's `errno`: process-local, and NEVER implicitly
+      cleared by a later SUCCESSFUL syscall, only overwritten by the next
+      FAILURE. Every syscall arm in `usertest.rs`'s `syscall_dispatch`
+      that has a real, distinguishable failure reason now calls
+      `set_errno()` alongside its existing bare return-value sentinel,
+      checked call-by-call against `errno.rs`'s own doc comments: OPEN
+      (EINVAL non-UTF8 path, EMFILE fd-table-full), READ/FDWRITE/CLOSE/
+      DUP/DUP2 (EBADF invalid fd; CLOSE's own persist-failure branch gets
+      the more specific EIO), FORK (EAGAIN, covering all three real
+      causes -- table full, out of frames, nested-excursion refusal),
+      WAIT (EINVAL out-of-range pid, ECHILD not-a-live-child), SBRK
+      (ENOMEM), EXEC/EXECARGV (EINVAL non-UTF8 path, ENOENT missing file,
+      ENOEXEC malformed ELF, E2BIG argv/envp cap exceeded, plus a new
+      `exec_err_errno()` helper mapping `exec_elf()`/
+      `exec_elf_with_args()`'s own `Err` messages to ENOMEM/E2BIG/ENOEXEC/
+      ESRCH by real cause), PIPE (EMFILE), KILL/GETPGID (ESRCH),
+      SETPGID (EPERM, errno.rs's own named example for the field). The
+      legacy `ACTIVE_PROCESS == 0` `usertest` excursion sets no errno
+      anywhere (disclosed, not silently wrong): it has no `Process` struct
+      at all to hold one, so `set_errno(0, ...)` would be a real, silent
+      no-op, not a meaningful report.
+
+      Verified end-to-end with a genuinely new hand-assembled ELF test
+      payload, `process::ERRNO_TEST_PROGRAM` (a 13th hardcoded process
+      slot, pid 17 -- deliberately NOT 13-16, `fork()`'s own live dynamic
+      PID range, see `PID_TABLE_BASE`'s own doc comment) -- one continuous
+      ring-3 excursion that deliberately fails FOUR different syscalls for
+      FOUR different real reasons back to back (`read(fd=99)`,
+      `wait(pid=250)`, `sbrk(0xFFFFFFFF)`, `getpgid(pid=250)`), reading
+      errno back via GETERRNO after each one. Real, fresh build + fresh
+      QEMU boot, quoted from the actual serial log:
+      ```
+      milestone 35: syscall READ (process 17) -- FAILED, fd 99 is not open -- returning u64::MAX
+      milestone 59: syscall GETERRNO (process 17) -- ... -- errno=9 (EBADF)
+      milestone 37: syscall WAIT (process 17) -- FAILED (pid 250 is not a live child of this process...) -- returning u64::MAX
+      milestone 59: syscall GETERRNO (process 17) -- ... -- errno=10 (ECHILD)
+      milestone 33: syscall SBRK (process 17) -- FAILED (requested 4294967295 bytes would exceed this process's fixed per-process heap) -- returning 0
+      milestone 59: syscall GETERRNO (process 17) -- ... -- errno=12 (ENOMEM)
+      milestone 42: syscall GETPGID (process 17) -- FAILED, pid 250 not a live process -- returning u64::MAX
+      milestone 59: syscall GETERRNO (process 17) -- ... -- errno=3 (ESRCH)
+      milestone 59: self-test -- ERRNO_TEST_PROCESS's own final errno field: 3 (ESRCH) -- expected 3 (ESRCH, the getpgid(250) call's real failure, the LAST syscall before exit()) -- confirmed
+      milestone 59: self-test -- OVERALL: PASS
+      ```
+      Four genuinely distinct real errno values, correctly set and read
+      back for four genuinely different failure causes, plus a real
+      sticky-field check (the process's own `errno` still held ESRCH,
+      the LAST real failure, after its own `exit()` -- exit() itself
+      never touches errno). Fixed the pre-existing `dead_code` warning:
+      the field is now genuinely read, confirmed by its absence from a
+      full clean rebuild's warning output. No regressions: milestones
+      42/43/44/45/51/53/54/57/58 all still self-report `PASS`/"ran to
+      completion... no panic, no double fault" in the same boot, zero
+      panics anywhere in the log, boot reaches the interactive shell and
+      background task scheduling normally afterward. `tasklist` confirmed
+      zero orphaned `qemu-system-x86_64.exe` processes after verification.
+
+      **Still genuinely open** (disclosed, not silently dropped): real
+      signal delivery (`sigaction`/handler/`sigreturn`) remains exactly
+      the Tier 1 gap `errno.rs`'s own doc comment named it as when
+      choosing errno over it this milestone -- SIGKILL is still the only
+      signal, still an immediate-terminate special case. A handful of
+      this kernel's `Option`-collapsed failure causes (e.g. `dup`/`dup2`'s
+      "fd not open" vs. their own internal "fd table full", `setpgid`'s
+      "invalid pgid" vs. "not authorized" vs. "target vanished") are
+      reported as a single best-fit errno rather than a fully
+      disambiguated one -- the same honest "one Option collapses several
+      real causes, pick the single best-fit real errno" reasoning
+      `errno.rs`'s own EMFILE doc comment already discloses for open()/
+      pipe(), applied consistently rather than pretending finer
+      granularity exists where the underlying `process.rs` functions
+      don't yet return it.
+
 ## Building and running
 
 Requires:

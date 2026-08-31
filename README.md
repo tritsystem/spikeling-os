@@ -1866,6 +1866,119 @@ the thing the OS *is* -- built up one real, working milestone at a time.
       the exact code path that used to deadlock -- prints its own real
       `OVERALL=PASS`, zero panics, zero warnings, boot reaches the
       interactive shell and background task scheduling normally.
+- [x] **Milestone 58**: real `exec()` with argv/envp -- the Tier 1
+      roadmap item named right alongside "virtual memory/demand paging"
+      (Milestone 57's own slice, still a heap-only first piece; the
+      next real VM increment -- copy-on-write, `mmap` -- stays real,
+      disclosed future work, not silently claimed here). Chosen over
+      every other unclaimed Tier 1 item by real dependency order: this
+      project's process groups/sessions (`pgid`, Milestone 42),
+      `pipe()`/`dup`/`dup2` (Milestones 40/42), `waitpid` exit-status
+      semantics (`WaitOutcome::{Exited,Killed,Signaled}`, Milestones
+      43/53), and the ELF loader's fixed-entry-address restriction
+      (generalized at Milestone 44) were ALL already real and working
+      before this milestone started -- checked directly against the
+      code, not assumed from old doc comments. `errno` and a general
+      real signal-delivery mechanism (SIGKILL is currently the only
+      signal, and it's an immediate-terminate special case, not real
+      `sigaction`/handler delivery) remain genuinely open Tier 1 gaps,
+      but both are bigger, riskier lifts than the one, cleanly-scoped
+      gap `exec()` itself already had: `kernel/src/usertest.rs`'s
+      syscall 9 (Milestone 45's own real teardown-and-rebuild exec())
+      took only a bare path -- `loader.rs`'s own top-of-file doc
+      comment has said "no argv/envp" since Milestone 34 and nothing
+      since ever closed it.
+
+      A genuinely NEW syscall (16, EXECARGV) rather than an in-place
+      change to syscall 9: `process::EXEC_TEST_PROGRAM` (Milestone 45,
+      hand-assembled raw machine code) calls syscall 9 with only
+      rdi/rsi ever set, so extending that ABI in place would have left
+      rdx/r10/r8/r9 as whatever garbage happened to sit in those
+      registers at that hand-assembled call site -- a real regression
+      risk for zero benefit. Syscall 9's own arm, `process::exec_elf()`,
+      and its EXEC_TEST_PROCESS self-test are completely untouched.
+      EXECARGV takes `path_ptr, path_len, argv_ptr, argv_count,
+      envp_ptr, envp_count` (rdi/rsi/rdx/r10/r8/r9, the standard 6-arg
+      syscall convention this kernel's `int 0x80` trampoline already
+      captures in full) -- `argv_ptr`/`envp_ptr` each point to an array
+      of `(str_ptr: u64, str_len: u64)` entries, the SAME ptr+len idiom
+      this kernel already uses for every other string-bearing syscall
+      argument, not NUL-terminated C strings.
+
+      The real, new piece: `process::build_argv_envp_stack()` lays the
+      received argv/envp out on the NEWLY exec()'d process's own private
+      stack page following the ACTUAL x86_64 SysV process-entry
+      contract (what a real kernel's `execve()` establishes, and what a
+      real ELF's `_start`/libc crt0 assumes) -- `argc` (8 bytes), then
+      `argc` real pointers into this same page, a NULL (0) terminator,
+      then `envp.len()` pointers, a second NULL terminator, with the
+      NUL-terminated string bytes themselves packed at the top of the
+      page -- writing through the direct `phys_mem_offset` view of the
+      new process's own already-allocated `stack_frame` (the exact same
+      technique `fork_build_child()` already uses to copy a parent's
+      real stack bytes into a child's), so it can run before the CR3
+      switch into the new address space. Returns a genuinely 16-byte-
+      aligned RSP (real ABI alignment, checked and enforced, not
+      assumed) -- `process::exec_elf_with_args()` hands both the new
+      entry and this new RSP to a new `usertest::exec_replace_and_enter_
+      with_rsp()` (identical to Milestone 37/45's own `exec_replace_and_
+      enter()`, just parameterized on RSP instead of always defaulting
+      to the bare stack top). Real, disclosed, checked-before-any-write
+      caps (`EXEC_ARGV_MAX_COUNT` = 8 entries, `EXEC_ARG_MAX_LEN` = 128
+      bytes each) -- the single 4 KiB stack page every process gets has
+      to hold this layout AND whatever real stack space the newly
+      exec()'d program needs at runtime, so this stays deliberately
+      small and rejects (a clear `Err`, never silent truncation or an
+      out-of-bounds write) anything that doesn't fit. A real, closed
+      leak risk found and fixed during this milestone's own
+      implementation, before it was ever exercised: if
+      `build_argv_envp_stack()` fails AFTER `create_process_from_elf()`
+      already allocated the new process's pml4/code/stack/heap frames,
+      that failure path now calls `reclaim_process_frames()` (Milestone
+      54's own mechanism) on the abandoned `new_proc` instead of letting
+      the early `return Err` silently leak those frames -- the exact bug
+      class Milestone 54 itself closed for every OTHER process-
+      replacement path in this file, now closed here too rather than
+      reintroduced.
+
+      Verified with two REAL, externally-built ELF64 test payloads
+      (`rustc --target x86_64-unknown-none` + `rust-lld`, same toolchain
+      as every other `tools/*_src` payload, not hand-assembled --
+      `tools/argvlauncher_src/` and `tools/argvtarget_src/`, see each
+      one's own `README.md`): the launcher calls EXECARGV with a real
+      3-entry argv (`["argvtarget", "hello", "world"]`) and 1-entry envp
+      (`["GREETING=hi"]`); the target's `_start` is
+      `#[unsafe(naked)]` (same mechanism as `usertest.rs`'s own
+      `syscall_entry()`) so it can read the hardware-set `rsp` before
+      any Rust prologue disturbs it (`mov rdi,[rsp]` / `lea rsi,[rsp+8]`
+      / a `lea`-computed envp pointer), tail-calling into ordinary Rust
+      that reads the real argc/argv/envp back and checks it against
+      hand-computed predictions (same discipline as
+      `tools/malloctest_src/main.rs`'s own checks). A real link failure
+      was hit and fixed while building the target payload (documented
+      in `tools/argvtarget_src/README.md`): an early decimal-printing
+      helper used ordinary array indexing with a runtime-only-bounded
+      index, which kept a real `panic_bounds_check` branch that pulled
+      in `core::fmt::Display for u64` and blew a GOT-relative relocation
+      range against this crate's own `-C code-model=large` -- fixed by
+      switching to raw-pointer writes (no bounds check emitted at all)
+      rather than papering over it.
+
+      Real, fresh build + fresh QEMU boot (persist disk attached),
+      quoted from the actual serial log: the target's own self-check
+      printed `argc=3: PASS argv0=argvtarget: PASS argv1=hello: PASS
+      argv2=world: PASS envc=1: PASS envp0=GREETING=hi: PASS` then
+      `OVERALL=PASS`; the kernel-side wrapper logged "argvlauncher.elf's
+      real EXECARGV replaced it with argvtarget.elf, which ran to
+      completion and returned to the kernel cleanly (no panic, no
+      double fault)". No regressions: milestones 42/43/44/45/53/54/57
+      all still self-report `OVERALL: PASS` in the same boot, the
+      Milestone 51 malloc test still prints its own real `OVERALL=PASS`,
+      the ARP/ICMP/UDP self-tests still PASS, zero panics, zero
+      warnings, boot reaches the interactive shell and background task
+      scheduling normally afterward. `tasklist` confirmed zero orphaned
+      `qemu-system-x86_64.exe` processes after verification.
+
 ## Building and running
 
 Requires:

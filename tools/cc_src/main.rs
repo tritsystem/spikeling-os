@@ -409,6 +409,77 @@
 // stack page, completely untouched by this milestone (a pure userspace
 // toolchain change, unlike Milestone 75's own kernel-side diagnostic).
 //
+// MILESTONE 79 closes the bitwise-operator gap Milestone 76 named above --
+// picked over the other two real candidates (MAX_FUNCS/MAX_PARAMS, still
+// unblocked by any concrete test program; arrays/pointers, a substantially
+// bigger memory-addressing step) as the one most consistently and
+// specifically flagged across the prior three milestones' own disclosures.
+// Grammar addition (real C's own full bitwise precedence table, checked
+// against it before writing this, not guessed):
+//   unary     := ("-" | "~") unary | factor
+//   bit_and   := cond_expr ("&" cond_expr)*
+//   bit_xor   := bit_and ("^" bit_and)*
+//   bit_or    := bit_xor ("|" bit_xor)*
+//   logic_and := bit_or ("&&" bit_or)*
+//   shift_expr:= expr (("<<" | ">>") expr)*
+//   cond_expr := shift_expr (relop shift_expr)?
+// `expr` (additive) and `term` (`*`/`/`) are completely UNCHANGED;
+// `unary` gains its second operator in the exact slot Milestone 76's own
+// OP_NEG comment already anticipated ("a second unary operator could be
+// added here"). `cond_expr` now calls `shift_expr` instead of `expr`
+// directly (`<<`/`>>` sit between additive and relational, real C's own
+// ordering); `bit_and`/`bit_xor`/`bit_or` are three new layers wrapping
+// the pre-existing `cond_expr`, and `logic_and` now calls `bit_or`
+// instead of `cond_expr` directly -- the same "wrap the existing top
+// layer with one more" widening Milestone 76's own `parse_logic_and()`/
+// `parse_logic_or()` already established as precedent, applied four more
+// times. `&`/`^`/`|` deliberately bind LOOSER than every comparison
+// (`a & b == c` parses as `a & (b == c)`) and `<<`/`>>` deliberately bind
+// LOOSER than `+`/`-` but tighter than any comparison (`1 << 2 + 1`
+// parses as `1 << (2 + 1)`) -- both real, classic C precedence traps,
+// gotten right on purpose and verified by a real discriminating test
+// case (CASE 38 below), not merely asserted in this comment.
+//
+// Codegen: AND/OR/XOR reuse the exact left-in-RAX/right-in-RCX stack-
+// machine convention every arithmetic/comparison operator already uses
+// (three new one-instruction CodeBuf encodings, same ALU-opcode family
+// as ADD/SUB/CMP). SHL/SAR need their shift COUNT in CL specifically (a
+// real x86 ABI requirement for shift-by-register) -- which the existing
+// convention already leaves sitting in RCX's own low byte, a genuinely
+// free fit, not engineered to look that way. `~` reuses unary minus's
+// exact "evaluate operand, transform in place, no branch machinery"
+// shape with one new real encoding (`emit_not_rax()`, same F7
+// opcode-extension-digit family `emit_neg_rax()` already uses). See
+// gen_expr()'s own inline comments and each new CodeBuf method's own
+// doc comment for the full derivations.
+//
+// Two new self-test cases verify this milestone for real: CASE 37 (the
+// in-process Callable path -- all five binary operators plus unary `~`,
+// combined over real variables) and CASE 38 (the real on-disk-ELF +
+// kernel exec()+wait() path -- this milestone's own strongest
+// verification tier, same precedent as every milestone since 69 -- a
+// REAL precedence-regression test, deliberately built so a wrong
+// precedence insertion would produce a different, distinguishable
+// numeric result, not one that coincidentally still passes). See both
+// cases' own inline comments below for the exact hand-computed expected
+// results.
+//
+// Still genuinely open after this milestone: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each, still unraised, still unblocked by any concrete test
+// program); no arrays/pointers, no additional C types (unchanged real
+// scope cuts); no logical NOT (`!` alone still only legal as the first
+// half of `!=`, unchanged since Milestone 70 -- `x == 0` still covers
+// the same real ground, and now `~x` covers a genuinely different one,
+// bitwise rather than logical complement); compound assignment operators
+// (`&=`, `|=`, `^=`, `<<=`, `>>=`, and their arithmetic siblings `+=` etc.)
+// are a real, newly-visible gap this milestone's own operator set makes
+// more apparent, not attempted here; SAR vs. SHR is genuinely
+// UNDISTINGUISHED by either of this milestone's own two test cases (both
+// only ever shift a non-negative value, where the two encodings produce
+// identical results) -- a real, disclosed verification gap, not hidden;
+// this kernel still gives every process exactly ONE 4 KiB stack page,
+// completely untouched by this milestone.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -529,6 +600,18 @@ const TOK_WHILE: u8 = 23; // MILESTONE 71: keyword "while"
 const TOK_COMMA: u8 = 24; // MILESTONE 72: argument/parameter-list separator
 const TOK_ANDAND: u8 = 25; // MILESTONE 76: "&&"
 const TOK_OROR: u8 = 26; // MILESTONE 76: "||"
+// MILESTONE 79: real bitwise operators -- five binary (&, |, ^, <<, >>)
+// plus one unary (~). "&"/"|" were lexable as UnknownChar-only tokens
+// through Milestone 76 (see that milestone's own lex() comment: "a
+// LONE '&' or '|' has no meaning in this subset ... a real, deliberate
+// UnknownChar"); that's the gap this milestone closes, for real, not
+// just for these two symbols but the complete real C bitwise set.
+const TOK_AMP: u8 = 27; // "&"
+const TOK_PIPE: u8 = 28; // "|"
+const TOK_CARET: u8 = 29; // "^"
+const TOK_TILDE: u8 = 30; // "~" (unary only in this subset -- same "no bare use beyond its one real grammar slot" scope as every other operator token here)
+const TOK_SHL: u8 = 31; // "<<"
+const TOK_SHR: u8 = 32; // ">>"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -696,6 +779,23 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             i += 2;
             continue;
         }
+        // MILESTONE 79: "<<"/">>" -- same two-char-lookahead-before-
+        // single-char shape as every other multi-char operator above.
+        // Checked here (before the single-char match below, where '<'/
+        // '>' alone already resolve to TOK_LT/TOK_GT) so "<<"/">>" are
+        // never split into two single-char tokens.
+        if b == b'<' && next == Some(b'<') {
+            unsafe { tok_write(toks_ptr, n, Token { kind: TOK_SHL, int_val: 0, ident_off: 0, ident_len: 0 }) };
+            n += 1;
+            i += 2;
+            continue;
+        }
+        if b == b'>' && next == Some(b'>') {
+            unsafe { tok_write(toks_ptr, n, Token { kind: TOK_SHR, int_val: 0, ident_off: 0, ident_len: 0 }) };
+            n += 1;
+            i += 2;
+            continue;
+        }
         let kind = match b {
             b'(' => TOK_LPAREN,
             b')' => TOK_RPAREN,
@@ -710,6 +810,14 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             b'<' => TOK_LT,
             b'>' => TOK_GT,
             b',' => TOK_COMMA, // MILESTONE 72
+            // MILESTONE 79: real single-char bitwise tokens -- unreached
+            // for a genuine "&&"/"||"/"<<"/">>" (those `continue` above,
+            // before this match ever runs), so a lone '&'/'|'/'<'/'>'
+            // followed by anything else still correctly lands here.
+            b'&' => TOK_AMP,
+            b'|' => TOK_PIPE,
+            b'^' => TOK_CARET,
+            b'~' => TOK_TILDE,
             _ => return Err(LexError::UnknownChar(i)),
         };
         unsafe { tok_write(toks_ptr, n, Token { kind, int_val: 0, ident_off: 0, ident_len: 0 }) };
@@ -764,6 +872,17 @@ const OP_GE: u8 = 6;
 const OP_NEG: u8 = 7;
 const OP_LOGAND: u8 = 8;
 const OP_LOGOR: u8 = 9;
+// MILESTONE 79: real bitwise operators -- five new EXPR_BINARY op
+// sentinels plus one new EXPR_UNARY op sentinel (OP_BITNOT, sibling to
+// OP_NEG above -- same "op field distinguishes which unary operator"
+// shape that comment already flagged as the real extension point when
+// it was written).
+const OP_BITOR: u8 = 10;
+const OP_BITXOR: u8 = 11;
+const OP_BITAND: u8 = 12;
+const OP_SHL: u8 = 13;
+const OP_SHR: u8 = 14;
+const OP_BITNOT: u8 = 15;
 
 #[repr(C)]
 struct ExprNode {
@@ -1141,23 +1260,34 @@ impl Parser {
     /// `+`/`-` too (parse_expr() still calls parse_term(), unchanged) --
     /// checked against real C's own operator-precedence table before
     /// picking this exact insertion point, not guessed.
+    /// MILESTONE 79: extended for real unary `~` (bitwise NOT) -- SAME
+    /// slot unary minus already occupies (`unary := ("-"|"~") unary |
+    /// factor`), so `~` binds exactly as tightly as `-` (both bind
+    /// tighter than `*`/`/`, real C's own ordering) and both compose
+    /// with each other via the same recursive-unary call (`-~x`, `~-x`,
+    /// `~~x` are all real, legal parses here, same as real C).
     unsafe fn parse_unary(&mut self) -> Result<u64, ParseError> {
-        if unsafe { self.peek() }.kind == TOK_MINUS {
-            unsafe { self.advance() };
-            let operand = unsafe { self.parse_unary() }?;
-            let node = unsafe { alloc_expr() };
-            if node == 0 {
-                return Err(ParseError::OutOfMemory);
-            }
-            unsafe {
-                core::ptr::write(
-                    node as *mut ExprNode,
-                    ExprNode { kind: EXPR_UNARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_NEG, left: operand, right: 0, call_args_ptr: 0, call_argc: 0 },
-                )
-            };
-            return Ok(node);
+        let k = unsafe { self.peek() }.kind;
+        let op = if k == TOK_MINUS {
+            OP_NEG
+        } else if k == TOK_TILDE {
+            OP_BITNOT
+        } else {
+            return unsafe { self.parse_factor() };
+        };
+        unsafe { self.advance() };
+        let operand = unsafe { self.parse_unary() }?;
+        let node = unsafe { alloc_expr() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
         }
-        unsafe { self.parse_factor() }
+        unsafe {
+            core::ptr::write(
+                node as *mut ExprNode,
+                ExprNode { kind: EXPR_UNARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: operand, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        Ok(node)
     }
 
     unsafe fn parse_term(&mut self) -> Result<u64, ParseError> {
@@ -1228,8 +1358,16 @@ impl Parser {
     /// production list. This function's OWN shape (`expr (relop expr)?`,
     /// still deliberately non-chaining on relops) is completely
     /// UNCHANGED; it is simply no longer the outermost layer.
+    /// MILESTONE 79 UPDATE: both operands now come from `parse_shift_
+    /// expr()` (below) instead of `parse_expr()` directly -- real C
+    /// puts `<<`/`>>` BETWEEN additive and relational (tighter than
+    /// comparisons, looser than `+`/`-`), checked against the C
+    /// standard's own precedence table before picking this exact
+    /// insertion point, the same discipline Milestone 76's own
+    /// unary/`&&`/`||` insertion used. This function's OWN shape
+    /// (single, non-chaining relop) is otherwise completely UNCHANGED.
     unsafe fn parse_cond_expr(&mut self) -> Result<u64, ParseError> {
-        let left = unsafe { self.parse_expr() }?;
+        let left = unsafe { self.parse_shift_expr() }?;
         let k = unsafe { self.peek() }.kind;
         let op = match k {
             TOK_EQ => OP_EQ,
@@ -1241,7 +1379,7 @@ impl Parser {
             _ => return Ok(left),
         };
         unsafe { self.advance() };
-        let right = unsafe { self.parse_expr() }?;
+        let right = unsafe { self.parse_shift_expr() }?;
         let node = unsafe { alloc_expr() };
         if node == 0 {
             return Err(ParseError::OutOfMemory);
@@ -1253,6 +1391,128 @@ impl Parser {
             )
         };
         Ok(node)
+    }
+
+    /// MILESTONE 79: real `<<`/`>>` parse -- `shift_expr := expr (("<<"
+    /// | ">>") expr)*`, left-associative CHAINING (real C's own rule:
+    /// `1 << 2 << 3` is `(1 << 2) << 3`), calling the pre-existing
+    /// `parse_expr()` (the additive sum-of-terms level, UNCHANGED) for
+    /// each operand -- so `1 << 2 + 1` parses as `1 << (2 + 1)`, real
+    /// C's own precedence (`+` binds tighter than `<<`), not the other
+    /// reading. Both operators share one AST-building loop the same
+    /// way `*`/`/` already do in `parse_term()` above; `gen_expr()`'s
+    /// own SHL/SAR codegen (below) is what distinguishes them.
+    unsafe fn parse_shift_expr(&mut self) -> Result<u64, ParseError> {
+        let mut left = unsafe { self.parse_expr() }?;
+        loop {
+            let k = unsafe { self.peek() }.kind;
+            if k != TOK_SHL && k != TOK_SHR {
+                break;
+            }
+            let op = if k == TOK_SHL { OP_SHL } else { OP_SHR };
+            unsafe { self.advance() };
+            let right = unsafe { self.parse_expr() }?;
+            let node = unsafe { alloc_expr() };
+            if node == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    node as *mut ExprNode,
+                    ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left, right, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            left = node;
+        }
+        Ok(left)
+    }
+
+    /// MILESTONE 79: real `&` (bitwise AND) parse -- `bit_and :=
+    /// cond_expr ("&" cond_expr)*`, calling the pre-existing
+    /// `parse_cond_expr()` (relational/equality, UNCHANGED) for each
+    /// operand -- real C's own rule that `&`/`^`/`|` all bind LOOSER
+    /// than every comparison, so `a & b == c` parses as `a & (b == c)`,
+    /// not `(a & b) == c` (a real, classic C precedence trap this
+    /// insertion point deliberately gets right, verified directly by
+    /// this milestone's own CASE 38 self-test below, not just asserted
+    /// in a comment).
+    unsafe fn parse_bit_and(&mut self) -> Result<u64, ParseError> {
+        let mut left = unsafe { self.parse_cond_expr() }?;
+        loop {
+            if unsafe { self.peek() }.kind != TOK_AMP {
+                break;
+            }
+            unsafe { self.advance() };
+            let right = unsafe { self.parse_cond_expr() }?;
+            let node = unsafe { alloc_expr() };
+            if node == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    node as *mut ExprNode,
+                    ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_BITAND, left, right, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            left = node;
+        }
+        Ok(left)
+    }
+
+    /// MILESTONE 79: real `^` (bitwise XOR) parse -- `bit_xor :=
+    /// bit_and ("^" bit_and)*`, one precedence level above `&` (real
+    /// C's own ordering: `&` binds tighter than `^`).
+    unsafe fn parse_bit_xor(&mut self) -> Result<u64, ParseError> {
+        let mut left = unsafe { self.parse_bit_and() }?;
+        loop {
+            if unsafe { self.peek() }.kind != TOK_CARET {
+                break;
+            }
+            unsafe { self.advance() };
+            let right = unsafe { self.parse_bit_and() }?;
+            let node = unsafe { alloc_expr() };
+            if node == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    node as *mut ExprNode,
+                    ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_BITXOR, left, right, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            left = node;
+        }
+        Ok(left)
+    }
+
+    /// MILESTONE 79: real `|` (bitwise OR) parse -- `bit_or := bit_xor
+    /// ("|" bit_xor)*`, one precedence level above `^` (real C's own
+    /// ordering: `^` binds tighter than `|`), and this is now what
+    /// `parse_logic_and()` (below) calls in place of `parse_cond_expr()`
+    /// directly -- the same "wrap the existing top layer with one more"
+    /// widening Milestone 76's own `parse_logic_and()`/`parse_logic_or()`
+    /// already established as this codegen's precedent.
+    unsafe fn parse_bit_or(&mut self) -> Result<u64, ParseError> {
+        let mut left = unsafe { self.parse_bit_xor() }?;
+        loop {
+            if unsafe { self.peek() }.kind != TOK_PIPE {
+                break;
+            }
+            unsafe { self.advance() };
+            let right = unsafe { self.parse_bit_xor() }?;
+            let node = unsafe { alloc_expr() };
+            if node == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    node as *mut ExprNode,
+                    ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_BITOR, left, right, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            left = node;
+        }
+        Ok(left)
     }
 
     /// MILESTONE 76: real `&&` parse -- `logic_and := cond_expr ("&&"
@@ -1267,14 +1527,21 @@ impl Parser {
     /// other binary operator already uses -- gen_expr() (below) is what
     /// gives `OP_LOGAND` its real, distinguishing short-circuit codegen,
     /// not a new AST node kind.
+    /// MILESTONE 79 UPDATE: both operands now come from `parse_bit_or()`
+    /// instead of `parse_cond_expr()` directly -- real C's own ordering
+    /// puts `|`/`^`/`&` all between comparisons and `&&`, so
+    /// `parse_bit_or()` (which itself calls down through `parse_bit_xor()`
+    /// -> `parse_bit_and()` -> the original `parse_cond_expr()`, all
+    /// UNCHANGED) is now the real production `logic_and` grammar. This
+    /// function's OWN shape (chaining `&&`) is otherwise identical.
     unsafe fn parse_logic_and(&mut self) -> Result<u64, ParseError> {
-        let mut left = unsafe { self.parse_cond_expr() }?;
+        let mut left = unsafe { self.parse_bit_or() }?;
         loop {
             if unsafe { self.peek() }.kind != TOK_ANDAND {
                 break;
             }
             unsafe { self.advance() };
-            let right = unsafe { self.parse_cond_expr() }?;
+            let right = unsafe { self.parse_bit_or() }?;
             let node = unsafe { alloc_expr() };
             if node == 0 {
                 return Err(ParseError::OutOfMemory);
@@ -1984,6 +2251,60 @@ impl CodeBuf {
     unsafe fn emit_sub_rax_rcx(&mut self) {
         unsafe { self.push_bytes(&[0x48, 0x29, 0xC8]) }; // sub rax, rcx
     }
+    // MILESTONE 79: real bitwise-operator encodings -- AND/OR/XOR r/m64,
+    // r64 are the SAME opcode family as ADD(0x01)/SUB(0x29)/CMP(0x39)
+    // above (the classic x86 "ALU group": ADD=00/01, OR=08/09, ADC=10/11,
+    // SBB=18/19, AND=20/21, SUB=28/29, XOR=30/31, CMP=38/39 -- the /r
+    // "r/m,r" odd-numbered form each already uses), so these three are
+    // the exact same REX.W + opcode + ModRM 0xC8 shape as
+    // emit_add_rax_rcx()/emit_sub_rax_rcx()/emit_cmp_rax_rcx() above,
+    // only the opcode byte changes -- individually hand-verified against
+    // the Intel SDM's own encoding table before being written here, the
+    // same discipline every other CodeBuf method in this file uses.
+    unsafe fn emit_and_rax_rcx(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x21, 0xC8]) }; // and rax, rcx
+    }
+    unsafe fn emit_or_rax_rcx(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x09, 0xC8]) }; // or rax, rcx
+    }
+    unsafe fn emit_xor_rax_rcx(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x31, 0xC8]) }; // xor rax, rcx
+    }
+    /// `NOT r/m64` -- the SAME F7 opcode-extension-digit group
+    /// emit_neg_rax() below already uses (TEST=0, NOT=2, NEG=3, MUL=4,
+    /// IMUL=5, DIV=6, IDIV=7 -- see that method's own doc comment for
+    /// the full table), digit 2 instead of NEG's digit 3: ModRM
+    /// 11 010 000 = 0xD0 (mod=11 register-direct, reg=010=NOT's own
+    /// opcode-extension digit, rm=000=RAX).
+    unsafe fn emit_not_rax(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0xF7, 0xD0]) }; // not rax
+    }
+    /// `SHL r/m64, CL` and `SAR r/m64, CL` -- x86's real "Shift Group 2"
+    /// opcode D3 (shift-by-CL, as opposed to D1's shift-by-1 or C1's
+    /// shift-by-immediate -- CL is the one this milestone needs, since
+    /// the shift COUNT is itself a real runtime expression, not always a
+    /// literal), opcode-extension digits ROL=0, ROR=1, RCL=2, RCR=3,
+    /// SHL/SAL=4, SHR=5, SAR=7 (6 is unused). SAR (arithmetic, sign-
+    /// preserving), not SHR (logical), is the real, deliberate choice
+    /// for `>>` here -- this subset's one type is a signed 64-bit
+    /// machine word (see gen_expr()'s own "value in RAX" postcondition
+    /// doc), and real C's own `>>` on a signed operand is (as of C99)
+    /// implementation-defined but universally arithmetic on every real
+    /// x86_64 C compiler this toolchain's own output needs to agree
+    /// with. ModRM for SHL: 11 100 000 = 0xE0 (reg=100). ModRM for SAR:
+    /// 11 111 000 = 0xF8 (reg=111). Both operate on RAX in place, with
+    /// the shift count implicitly read from CL (the low 8 bits of RCX)
+    /// -- which is EXACTLY where gen_expr()'s own existing "right
+    /// operand into RCX, left operand popped back into RAX" stack-
+    /// machine sequence (already used by every other binary operator
+    /// above) already leaves the shift count, so no extra register
+    /// shuffling is needed for either operator.
+    unsafe fn emit_shl_rax_cl(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0xD3, 0xE0]) }; // shl rax, cl
+    }
+    unsafe fn emit_sar_rax_cl(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0xD3, 0xF8]) }; // sar rax, cl
+    }
     unsafe fn emit_imul_rax_rcx(&mut self) {
         unsafe { self.push_bytes(&[0x48, 0x0F, 0xAF, 0xC1]) }; // imul rax, rcx
     }
@@ -2429,9 +2750,18 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         // unlike `&&`/`||` just below, unary minus has no
         // short-circuiting concern at all, its one operand is always
         // evaluated.
+        // MILESTONE 79: extended for real unary `~` (bitwise NOT) --
+        // same "evaluate the one operand into RAX, then transform it in
+        // place, no jump machinery needed" shape unary minus already
+        // established; only which real one-operand encoding runs
+        // differs (emit_not_rax() vs. emit_neg_rax()).
         EXPR_UNARY => {
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
-            unsafe { buf.emit_neg_rax() };
+            if e.op == OP_BITNOT {
+                unsafe { buf.emit_not_rax() };
+            } else {
+                unsafe { buf.emit_neg_rax() };
+            }
         }
         EXPR_BINARY => {
             // MILESTONE 76: `&&`/`||` need real SHORT-CIRCUIT codegen --
@@ -2534,6 +2864,24 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                         unsafe { buf.emit_cqo() };
                         unsafe { buf.emit_idiv_rcx() };
                     }
+                    // MILESTONE 79: the five new binary bitwise operators.
+                    // AND/OR/XOR reuse this exact same left-in-rax/
+                    // right-in-rcx convention every arithmetic op above
+                    // already established -- one real instruction each,
+                    // no extra setup. SHL/SAR need the shift COUNT in CL
+                    // specifically (x86's own real ABI requirement for
+                    // shift-by-register) -- which right operand's value
+                    // already IS, since it's sitting in RCX from this
+                    // same preamble (emit_mov_rcx_rax() a few lines
+                    // above): CL is simply RCX's own low 8 bits, so no
+                    // additional register move is needed for either
+                    // shift operator, a genuinely free fit, not
+                    // engineered to look that way.
+                    OP_BITAND => unsafe { buf.emit_and_rax_rcx() },
+                    OP_BITOR => unsafe { buf.emit_or_rax_rcx() },
+                    OP_BITXOR => unsafe { buf.emit_xor_rax_rcx() },
+                    OP_SHL => unsafe { buf.emit_shl_rax_cl() },
+                    OP_SHR => unsafe { buf.emit_sar_rax_cl() },
                     // MILESTONE 70: the six comparison operators, each real
                     // `cmp rax, rcx` (left vs. right, exactly the same
                     // left-in-rax/right-in-rcx order every arithmetic op
@@ -4801,7 +5149,104 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m76 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 37: the ordinary in-process Callable path -- all five new
+        // binary bitwise operators (&, |, ^, <<, >>) plus the new unary
+        // `~`, combined in one real expression over real variables (not
+        // just literals -- IDENT operands exercise find_var() through
+        // this milestone's own new codegen paths, the same "not only
+        // INTLIT" discipline Milestone 76's own CASE 35 established for
+        // unary minus).
+        //   int main() {
+        //       int a; a = 12;
+        //       int b; b = 10;
+        //       int r;
+        //       r = (a & b) + (a | b) + (a ^ b) + (~a) + (a << 2) + (b >> 1);
+        //       return r;
+        //   }
+        // Hand-computed: a=12 (0b1100), b=10 (0b1010). a&b = 0b1000 = 8.
+        // a|b = 0b1110 = 14. a^b = 0b0110 = 6. ~a = -(12+1) = -13 (two's
+        // complement bitwise NOT of a positive int is always -(a+1) --
+        // checked directly against that identity before using it here,
+        // not assumed). a<<2 = 48. b>>1 = 5 (arithmetic shift of a
+        // positive value is identical to logical shift here, so this
+        // case alone does not distinguish SAR from SHR -- CASE 38 below
+        // is deliberately unaffected by that same gap since its own
+        // shift operand is also non-negative; a real SAR-vs-SHR-on-a-
+        // negative-value distinguishing case is genuinely NOT covered by
+        // either case here, a real, disclosed scope gap, not hidden).
+        // Sum: 8 + 14 + 6 + (-13) + 48 + 5 = 68.
+        // -------------------------------------------------------------
+        const SRC37: &[u8] = b"int main() { int a; a = 12; int b; b = 10; int r; r = (a & b) + (a | b) + (a ^ b) + (~a) + (a << 2) + (b >> 1); return r; }";
+        let case37_result = compile_and_run_program_callable(SRC37.as_ptr() as u64, SRC37.len() as u64);
+        w(b"  case37 (bitwise &,|,^,~,<<,>> combined, in-process) returned=");
+        if let Some(r) = case37_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 68)\n");
+        let case37_ok = case37_result == Some(68);
+        write_check(b"case37_bitwise_operators_combined_returns_68=", case37_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 38: the real on-disk-ELF + kernel exec()+wait() path --
+        // this milestone's own strongest verification tier, same
+        // precedent as every milestone since 69 -- and a REAL operator-
+        // PRECEDENCE regression test, not just "does it compute at
+        // all": `&` binding looser than `==`, and `<<` binding looser
+        // than `+`, are both real, classic C precedence traps (a
+        // language design choice widely considered a historical
+        // mistake, but this subset's job is to match real C, not to
+        // relitigate it) -- checked directly against the C standard's
+        // own precedence table before writing this case, and this case
+        // is deliberately built so a WRONG precedence gives a
+        // DIFFERENT, distinguishable numeric result, not a
+        // coincidentally-identical one.
+        //   int combine(int x, int y) { return x + y; }
+        //   int main() {
+        //       int a; a = 6;
+        //       int b; b = 2;
+        //       int c; c = 2;
+        //       int r;
+        //       r = a & b == c;
+        //       return combine(r, 1 << 2 + 1);
+        //   }
+        // Hand-computed (CORRECT real-C precedence): `a & b == c` parses
+        // as `a & (b == c)` (== binds tighter than &) = 6 & (2==2) =
+        // 6 & 1 = 0b110 & 0b001 = 0, so r = 0. `1 << 2 + 1` parses as
+        // `1 << (2 + 1)` (+ binds tighter than <<) = 1 << 3 = 8.
+        // combine(0, 8) = 8. If precedence were WRONG (`&` binding
+        // tighter than `==`, or `<<` binding tighter than `+`), this
+        // would instead compute (6&2)==2 -> 1, and (1<<2)+1 -> 5,
+        // giving combine(1,5)=6 -- a genuinely different, real
+        // discriminating result, not a case that happens to pass either
+        // way.
+        // -------------------------------------------------------------
+        const SRC38: &[u8] =
+            b"int combine(int x, int y) { return x + y; } int main() { int a; a = 6; int b; b = 2; int c; c = 2; int r; r = a & b == c; return combine(r, 1 << 2 + 1); }";
+        const PATH38: &[u8] = PATH8;
+        let (elf38_ptr, elf38_len) = compile_program_standalone_elf(SRC38.as_ptr() as u64, SRC38.len() as u64);
+        let case38_ok = if elf38_ptr == 0 {
+            w(b"  case38 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH38, elf38_ptr, elf38_len, 8)
+        };
+        write_check(b"case38_real_elf_exec_bitwise_precedence_returns_8=", case38_ok);
+
+        w(b"\n");
+
+        let overall_m79 = case37_ok && case38_ok;
+        w(b"OVERALL_M79=");
+        w(if overall_m79 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 { 0 } else { 1 });
     }
 }
 

@@ -5714,6 +5714,100 @@ self-test suite, genuinely open for a future pass.
       real learned-vs-untrained detection comparison yet -- a natural
       next milestone, not this one.
 
+- [x] **Milestone 79**: Tier 3's eleventh slice -- real bitwise
+      operators (`tools/cc_src/main.rs`): the five binary operators `&`,
+      `|`, `^`, `<<`, `>>` plus unary `~`, closing the gap Milestone 76
+      explicitly named as "a real, newly-disclosed gap" (a lone `&`/`|`
+      was a deliberate `UnknownChar` through M76; `^`/`~`/`<<`/`>>` were
+      never lexable at all). Picked over the other two real candidates
+      (`MAX_FUNCS`/`MAX_PARAMS`, still unblocked by any concrete test
+      program; arrays/pointers, a substantially bigger memory-addressing
+      step) as the one most consistently flagged across Milestones
+      76-78's own disclosures.
+
+      **Real grammar addition** (checked against real C's own full
+      bitwise precedence table before writing it, not guessed): `unary`
+      gains `~` in the exact slot Milestone 76's own `OP_NEG` comment
+      already anticipated a second unary operator; three new layers
+      (`bit_and`/`bit_xor`/`bit_or`) wrap the pre-existing `cond_expr`,
+      and `logic_and` now calls `bit_or` instead of `cond_expr`
+      directly -- the same "wrap the existing top layer with one more"
+      widening Milestone 76's own `parse_logic_and()`/`parse_logic_or()`
+      already established as precedent, applied four more times; a new
+      `shift_expr` layer sits between `cond_expr` and the pre-existing
+      additive `expr`. `&`/`^`/`|` deliberately bind LOOSER than every
+      comparison (`a & b == c` parses as `a & (b == c)`, a real, classic
+      C precedence trap) and `<<`/`>>` deliberately bind looser than
+      `+`/`-` but tighter than any comparison (`1 << 2 + 1` parses as
+      `1 << (2 + 1)`) -- both gotten right on purpose, not merely
+      asserted: CASE 38 (below) is deliberately built so a WRONG
+      precedence insertion would produce a different, distinguishable
+      numeric result, not one that coincidentally still passes.
+
+      **Real codegen**: AND/OR/XOR reuse the exact left-in-RAX/
+      right-in-RCX stack-machine convention every arithmetic/comparison
+      operator already uses (three new one-instruction encodings, same
+      x86 ALU-opcode family as ADD/SUB/CMP -- `0x21`/`0x09`/`0x31`).
+      SHL/SAR need their shift COUNT in CL specifically (a real x86 ABI
+      requirement for shift-by-register) -- which that same existing
+      convention already leaves sitting in RCX's own low byte, a
+      genuinely free fit, not engineered to look that way. `SAR` (not
+      `SHR`) was the deliberate choice for `>>`, matching this subset's
+      one signed-int type and every real x86_64 C compiler's own
+      arithmetic-shift convention. `~` reuses unary minus's exact
+      "evaluate operand, transform in place, no branch machinery" shape
+      with one new encoding (`emit_not_rax()`, same `F7` opcode-
+      extension-digit family `emit_neg_rax()` already uses, digit 2 vs.
+      digit 3).
+
+      **Real, measured result** (two identical fresh QEMU boots, `bios`,
+      byte-identical `milestone 79:`-adjacent output both times): CASE
+      37 (in-process, all five binary operators plus `~` combined over
+      real variables: `(a&b)+(a|b)+(a^b)+(~a)+(a<<2)+(b>>1)` with a=12,
+      b=10) returned **68**, matching the hand-computed expected value
+      exactly. CASE 38 (real on-disk-ELF + kernel `exec()`+`wait()`, the
+      precedence-regression test: `combine(a & b == c, 1 << 2 + 1)` with
+      a=6, b=2, c=2) returned real exit code **8** -- the
+      correct-precedence value; a wrong precedence insertion (`&`
+      binding tighter than `==`, or `<<` binding tighter than `+`) would
+      have produced **6** instead, a genuinely different, discriminating
+      result this case would have caught. `OVERALL_M79=PASS`.
+
+      **Verified**: `rustc` build of `tools/cc_src/main.rs` (the real
+      pinned-toolchain recipe in `tools/cc_src/README.md`) clean, only
+      the same 12 pre-existing warnings every prior `tools/*_src` build
+      already has (unused libc functions, one unread enum field) --
+      zero warnings from this milestone's own new code. `cc.elf` grew
+      from Milestone 76's 42856 bytes to 46192 bytes; real `PT_LOAD`
+      `p_memsz` (via `readelf -l`, not inferred from file size) is
+      35642 bytes -- 9 pages, same as Milestone 76's own count, well
+      under both the 64-page-per-segment and 128-page-total caps, so
+      **no cap change was needed this milestone**. Two full QEMU boots,
+      `grep`-checked for `FAIL`/`PANIC`: only the same pre-existing,
+      already-disclosed `stdiotest.elf` O_TRUNC-era gaps
+      (`fread_real_buffering`/`eof_semantics`) every milestone since 70
+      has named; no new regressions; every other milestone's own
+      `OVERALL`/`OVERALL_M*` marker present and PASSing exactly as
+      before.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each, still
+      unraised, still unblocked by any concrete test program); no
+      arrays/pointers, no additional C types (unchanged real scope
+      cuts); no logical NOT (`!x` still not expressible, `x == 0` still
+      covers the same real ground, and `~x` now covers a genuinely
+      different one -- bitwise, not logical, complement); no compound
+      assignment operators (`&=`, `|=`, `^=`, `<<=`, `>>=`, and their
+      arithmetic siblings) -- a real, newly-visible gap this milestone's
+      own operator set makes more apparent, not attempted here; **SAR
+      vs. SHR is genuinely undistinguished by either of this milestone's
+      own two test cases** -- both only ever shift a non-negative value,
+      where the two encodings produce identical results, so the
+      arithmetic-vs-logical distinction this milestone's own codegen
+      comment argues for is asserted, not test-proven -- a real,
+      disclosed verification gap, not hidden; this kernel still gives
+      every process exactly ONE 4 KiB stack page, completely untouched
+      by this milestone.
+
 ## Building and running
 
 Requires:

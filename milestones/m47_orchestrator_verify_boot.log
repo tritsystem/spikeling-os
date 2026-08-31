@@ -1,0 +1,244 @@
+warning: static `ALTENTRY_TEST_ELF_BYTES` is never used
+   --> kernel\src\loader.rs:402:8
+    |
+402 | static ALTENTRY_TEST_ELF_BYTES: &[u8] = include_bytes!("../assets/testelf_altentry.elf");
+    |        ^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `extra_frames` is never read
+   --> kernel\src\process.rs:573:5
+    |
+537 | pub struct Process {
+    |            ------- field in this struct
+...
+573 |     extra_frames: Vec<PhysFrame<Size4KiB>>,
+    |     ^^^^^^^^^^^^
+
+warning: `kernel` (bin "kernel") generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 0.21s
+     Running `target\release\spikeling-os.exe bios`
+INFO : Framebuffer info: FrameBufferInfo { byte_len: 2764800, width: 1280, height: 720, pixel_format: Bgr, bytes_per_pixel: 3, stride: 1280 }
+INFO : 4th Stage
+INFO : BiosInfo { stage_4: Region { start: 130000, len: 25200 }, kernel: Region { start: 1000000, len: 117820 }, ramdisk: Region { start: 1118000, len: 0 }, config_file: Region { start: 1118000, len: 0 }, last_used_addr: 1117fff, framebuffer: BiosFramebufferInfo { region: Region { start: fd000000, len: 2a3000 }, width: 500, height: 2d0, bytes_per_pixel: 3, stride: 500, pixel_format: Bgr }, memory_map_addr: 12114, memory_map_len: 7 }
+INFO : BIOS boot
+INFO : Elf file loaded at Pointer {
+    addr: 0x0000000001000000,
+    metadata: 1144864,
+}
+INFO : virtual_address_offset: 0x10000000000
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(4), offset: 0, virtual_addr: 0, physical_addr: 0, file_size: 22fbc, mem_size: 22fbc, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(5), offset: 22fc0, virtual_addr: 23fc0, physical_addr: 23fc0, file_size: 7d2cb, mem_size: 7d2cb, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: a0290, virtual_addr: a2290, physical_addr: a2290, file_size: b508, mem_size: bd70, align: 1000 })
+INFO : Mapping bss section
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: ab798, virtual_addr: ae798, physical_addr: ae798, file_size: 14a8, mem_size: 1c9e0, align: 1000 })
+INFO : Mapping bss section
+INFO : Entry point at: 0x1000006bd60
+INFO : Creating GDT at PhysAddr(0x115f000)
+INFO : Map framebuffer
+INFO : Map physical memory
+INFO : Allocate bootinfo
+INFO : Create Memory Map
+INFO : Create bootinfo
+INFO : Jumping to kernel entry point at VirtAddr(0x1000006bd60)
+spikeling-os: kernel entered
+boot info: BootInfo { api_version: ApiVersion { version_major: 0, version_minor: 11, version_patch: 17, pre_release: false }, memory_regions: MemoryRegions { ptr: 0x380000000e8, len: 10 }, framebuffer: Some(FrameBuffer { buffer_start: 2199023255552, info: FrameBufferInfo { byte_len: 2764800, width: 1280, height: 720, pixel_format: Bgr, bytes_per_pixel: 3, stride: 1280 } }), physical_memory_offset: Some(2748779069440), recursive_index: None, rsdp_addr: Some(1004256), tls_template: None, ramdisk_addr: None, ramdisk_len: 0, kernel_addr: 16777216, kernel_len: 1144864, kernel_image_offset: 1099511627776, kernel_stack_bottom: 1649267445760, kernel_stack_len: 81920, _test_sentinel: 0 }
+milestone 1: boot -> kernel handoff confirmed working
+milestone 2: drew 1280x720 Bgr gradient to framebuffer
+milestone 7: console initialized on the framebuffer
+milestone 3: heap mapped at 0x444444440000, 102400 bytes
+milestone 3: heap allocation verified -- Vec<u64> of 500 elements summed correctly (124750), Box<u64> round-tripped correctly
+milestone 27: user-mode test page mapped -- code at 0x555550000000, stack top at 0x555560001000
+milestone 30: saved kernel's own PML4 frame 0x1118000 (cr3 flags 0x0) for restore-on-exit
+milestone 30: creating process A's private address space...
+milestone 30: process A -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process A -- new pml4 0x22000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process A -- private code page mapped to frame 0x23000, private stack page mapped to frame 0x24000
+milestone 33: process A -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [167936, 176128, 180224, 184320]
+milestone 34: process A -- copied 192 image bytes into private code frame 0x23000
+milestone 30: process A created -- pml4=0x22000 code=0x23000 stack=0x24000
+milestone 42: process A -- pgid=1 (founder of its own group)
+milestone 30: creating process B's private address space...
+milestone 30: process B -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process B -- new pml4 0x2e000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process B -- private code page mapped to frame 0x2f000, private stack page mapped to frame 0x30000
+milestone 33: process B -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [217088, 225280, 229376, 233472]
+milestone 34: process B -- copied 192 image bytes into private code frame 0x2f000
+milestone 30: process B created -- pml4=0x2e000 code=0x2f000 stack=0x30000
+milestone 42: process B -- pgid=2 (founder of its own group)
+milestone 30: process A + process B private address spaces created -- see serial log above for each one's own pml4/code/stack physical frames
+milestone 35: creating FDTEST_PROCESS's private address space...
+milestone 30: process fdtest -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process fdtest -- new pml4 0x3a000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process fdtest -- private code page mapped to frame 0x3b000, private stack page mapped to frame 0x3c000
+milestone 33: process fdtest -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [266240, 274432, 278528, 282624]
+milestone 34: process fdtest -- copied 264 image bytes into private code frame 0x3b000
+milestone 35: FDTEST_PROCESS created -- pml4=0x3a000 code=0x3b000 stack=0x3c000
+milestone 35: FDTEST_PROCESS private address space created
+milestone 37: creating FORK_TEST_PROCESS's private address space...
+milestone 30: process fork-test -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process fork-test -- new pml4 0x46000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process fork-test -- private code page mapped to frame 0x47000, private stack page mapped to frame 0x48000
+milestone 33: process fork-test -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [315392, 323584, 327680, 331776]
+milestone 34: process fork-test -- copied 712 image bytes into private code frame 0x47000
+milestone 37: FORK_TEST_PROCESS created -- pml4=0x46000 code=0x47000 stack=0x48000
+milestone 37: FORK_TEST_PROCESS private address space created
+milestone 41: creating SIGSEGV_TEST_PROCESS's private address space...
+milestone 30: process sigsegv-test -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process sigsegv-test -- new pml4 0x52000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process sigsegv-test -- private code page mapped to frame 0x53000, private stack page mapped to frame 0x54000
+milestone 33: process sigsegv-test -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [364544, 372736, 376832, 380928]
+milestone 34: process sigsegv-test -- copied 57 image bytes into private code frame 0x53000
+milestone 41: SIGSEGV_TEST_PROCESS created -- pml4=0x52000 code=0x53000 stack=0x54000
+milestone 41: SIGSEGV_TEST_PROCESS private address space created
+milestone 41: creating SIGKILL_TEST_PROCESS's private address space...
+milestone 30: process sigkill-test -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process sigkill-test -- new pml4 0x5e000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process sigkill-test -- private code page mapped to frame 0x5f000, private stack page mapped to frame 0x60000
+milestone 33: process sigkill-test -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [413696, 421888, 425984, 430080]
+milestone 34: process sigkill-test -- copied 32 image bytes into private code frame 0x5f000
+milestone 41: SIGKILL_TEST_PROCESS created -- pml4=0x5e000 code=0x5f000 stack=0x60000
+milestone 41: SIGKILL_TEST_PROCESS private address space created
+milestone 43: creating WAITSTATUS_TEST_PROCESS's private address space...
+milestone 30: process waitstatus-test -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process waitstatus-test -- new pml4 0x6a000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process waitstatus-test -- private code page mapped to frame 0x6b000, private stack page mapped to frame 0x6c000
+milestone 33: process waitstatus-test -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [462848, 471040, 475136, 479232]
+milestone 34: process waitstatus-test -- copied 12 image bytes into private code frame 0x6b000
+milestone 43: WAITSTATUS_TEST_PROCESS created -- pml4=0x6a000 code=0x6b000 stack=0x6c000
+milestone 43: WAITSTATUS_TEST_PROCESS private address space created
+milestone 34: frame allocator + phys-mem offset published globally -- 'runfile PATH' can now load and run programs from the real filesystem
+milestone 34: self-test -- check_program_size(31) accepted=true (expected true), check_program_size(5096) rejected=true (expected true, 5096 is 1000 bytes over the 4096-byte cap)
+milestone 35: self-test -- FDTEST_PROGRAM layout check: path1('fdtest')=true path2('fdout')=true wdata(69 bytes)=true -- all match, layout confirmed
+milestone 36: self-test -- parsed the embedded testelf.elf: e_entry=0x555550000000 (expected 0x555550000000), 2 PT_LOAD segment(s)
+milestone 36: self-test -- PT_LOAD[0]: p_vaddr=0x555550000000 p_offset=0xb0 p_filesz=0x8 p_memsz=0x8 p_flags=0x5
+milestone 36: self-test -- PT_LOAD[1]: p_vaddr=0x555550001000 p_offset=0xc0 p_filesz=0x84 p_memsz=0x84 p_flags=0x5
+milestone 37: self-test -- FORK_TEST_PROGRAM layout check: parent_msg=true waitdone_msg=true fallback_msg=true exec_path=true -- all match, layout confirmed
+fs self-test: disk write+read roundtrip OK -- real bytes matched
+milestone 40: self-test -- pipe mechanics: write_ok=true roundtrip_ok=true dup_ok=true dup2_ok=true -- all real, real bytes matched through every path
+milestone 42: self-test -- FORK_TEST_PROCESS's own pgid: Some(5) (expected Some(5), founder of its own group)
+milestone 30: process forked-child -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process forked-child -- new pml4 0x76000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process forked-child -- private code page mapped to frame 0x77000, private stack page mapped to frame 0x78000
+milestone 33: process forked-child -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [512000, 520192, 524288, 528384]
+milestone 34: process forked-child -- copied 4096 image bytes into private code frame 0x77000
+milestone 37: fork() -- child's code frame 0x77000 holds a REAL byte-for-byte copy of the parent's code frame 0x47000 (independently verifiable: same virtual address USER_CODE_ADDR under either process's own CR3, genuinely different physical frames)
+milestone 37: syscall FORK (process 5, 'fork-test') -- created child pid 10: pml4=0x76000 code_frame=0x77000 resume point rip=0x0 rsp=0x0
+milestone 42: self-test -- forked child pid 10, its pgid: Some(5) (expected Some(5), real inheritance from the parent) -- confirmed
+milestone 42: syscall SETPGID (process 5) -- pid 10's pgid set to 10
+milestone 42: self-test -- setpgid(child, child) result=true, child's pgid now Some(10) (expected Some(10)), parent's pgid still Some(5) (expected unchanged Some(5)) -- confirmed, real independent per-process state
+milestone 42: syscall SETPGID (process 1) -- REFUSED, pid 10 is neither this process itself nor a live child OF it -- returning failure
+milestone 42: self-test -- setpgid() from an unrelated process (PROCESS_A, not this child's parent) correctly refused: true
+milestone 41: syscall KILL (process 5) -- pid 10 terminated WITHOUT ever running (bypassed wait()'s normal run-then-reap contract), slot freed for reuse
+milestone 42: self-test -- cleanup kill(child) result=true (frees the PROCESS_TABLE slot for later self-tests)
+milestone 42: self-test -- OVERALL: PASS
+milestone 9: LIF neuron network initialized (LeftKey/RightKey -> Motor)
+milestone 11: no saved weights found on disk -- starting from neutral defaults
+milestone 4: kernel survived defect injection at slot 3 -- 7 slots still alive and scheduled, no panic
+milestone 4: topological (g=+0.6) post-defect fire counts: min=289 max=366 fairness=0.790
+milestone 4: trivial     (g=-0.6) post-defect fire counts: min=294 max=342 fairness=0.860
+milestone 4: result -- topological coupling did NOT stay fairer under the defect here (reporting honestly, not the assumed outcome)
+milestone 5a: GDT/TSS + IDT loaded
+EXCEPTION: BREAKPOINT
+InterruptStackFrame {
+    instruction_pointer: VirtAddr(
+        0x10000054571,
+    ),
+    code_segment: SegmentSelector {
+        index: 1,
+        rpl: Ring0,
+    },
+    cpu_flags: RFlags(
+        ZERO_FLAG | PARITY_FLAG | 0x2,
+    ),
+    stack_pointer: VirtAddr(
+        0x18000014208,
+    ),
+    stack_segment: SegmentSelector {
+        index: 0,
+        rpl: Ring0,
+    },
+}
+milestone 5a: resumed after breakpoint exception -- handler returned correctly
+milestone 20: PCI bus 0 scan found 6 device(s)
+milestone 20: 00:00.0 vendor=8086 device=1237 class=06 subclass=00
+milestone 20: 00:01.0 vendor=8086 device=7000 class=06 subclass=01
+milestone 20: 00:01.1 vendor=8086 device=7010 class=01 subclass=01
+milestone 20: 00:01.3 vendor=8086 device=7113 class=06 subclass=80
+milestone 20: 00:02.0 vendor=1234 device=1111 class=03 subclass=00
+milestone 20: 00:03.0 vendor=8086 device=100e class=02 subclass=00
+milestone 20: network controller found -- vendor=8086 device=100e
+milestone 24: e1000 NIC initialized -- MAC 52:54:00:12:34:56 (address-valid bit: true)
+milestone 47: ARP self-test PASS -- 10.0.2.2 is-at 52:55:0a:00:02:02 (real reply from QEMU's slirp gateway over the actual netdev backend, loopback OFF)
+milestone 5b: PIC initialized, interrupts enabled
+milestone 41: self-test -- SIGSEGV_TEST_PROGRAM layout check: message=true -- confirmed
+milestone 41: self-test -- running SIGSEGV_TEST_PROCESS, expecting a real page fault to terminate it without panicking the kernel...
+milestone 30: runproc 6 (process sigsegv-test) -- about to switch CR3 to process pml4 0x52000
+milestone 30: CR3 switched -- entering ring 3 for process 6 at 0x555550000000
+milestone 31: syscall WRITE (process 6) -- hardware-recorded CS=0x1b (CPL=3) -- ptr=0x55555000002c len=13 -- raw bytes >>>
+SIGSEGV test
+
+<<< end of write (13 bytes)
+milestone 33: syscall WRITE (process 6) also reads its own private heap at 0x555570000000 -- marker byte 0x00 (' ')
+milestone 41: SIGSEGV -- process 6 page-faulted at Ok(VirtAddr(0x123456780000)) (real hardware CPL=3, error code PageFaultErrorCode(USER_MODE)) -- terminating this process, kernel continues
+milestone 30: runproc 6 -- resumed in kernel context (CR3 already restored by the exit syscall before this point)
+milestone 41: self-test -- run() returned normally after the fault (the kernel did not panic/hlt_loop) -- ACTIVE_PROCESS reset to 0 (expected 0)
+milestone 41: self-test -- running PROCESS_A right after the fault, real proof of genuine recovery, not just 'hasn't crashed yet'...
+milestone 30: runproc 1 (process A) -- about to switch CR3 to process pml4 0x22000
+milestone 30: CR3 switched -- entering ring 3 for process 1 at 0x555550000000
+milestone 33: syscall SBRK (process 1) -- hardware-recorded CS=0x1b (CPL=3) -- requested 16 bytes, returning heap pointer 0x555570000000
+milestone 31: syscall WRITE (process 1) -- hardware-recorded CS=0x1b (CPL=3) -- ptr=0x555550000080 len=64 -- raw bytes >>>
+hello from process A -- via real write(ptr,len)!                
+<<< end of write (64 bytes)
+milestone 33: syscall WRITE (process 1) also reads its own private heap at 0x555570000000 -- marker byte 0x41 ('A')
+milestone 30: syscall EXIT -- hardware-recorded CS=0x1b (CPL=3) -- discarding ring-3 context, resuming kernel context
+milestone 30: runproc 1 -- resumed in kernel context (CR3 already restored by the exit syscall before this point)
+milestone 41: self-test -- PROCESS_A ran normally after the SIGSEGV -- kernel genuinely recovered, not just still standing
+milestone 41: self-test -- running SIGKILL_TEST_PROCESS (fork, kill without running, fork again to prove the slot was really freed)...
+milestone 30: runproc 7 (process sigkill-test) -- about to switch CR3 to process pml4 0x5e000
+milestone 30: CR3 switched -- entering ring 3 for process 7 at 0x555550000000
+milestone 30: process forked-child -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process forked-child -- new pml4 0x82000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process forked-child -- private code page mapped to frame 0x83000, private stack page mapped to frame 0x84000
+milestone 33: process forked-child -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [561152, 569344, 573440, 577536]
+milestone 34: process forked-child -- copied 4096 image bytes into private code frame 0x83000
+milestone 37: fork() -- child's code frame 0x83000 holds a REAL byte-for-byte copy of the parent's code frame 0x5f000 (independently verifiable: same virtual address USER_CODE_ADDR under either process's own CR3, genuinely different physical frames)
+milestone 37: syscall FORK (process 7, 'sigkill-test') -- created child pid 10: pml4=0x82000 code_frame=0x83000 resume point rip=0x555550000007 rsp=0x555560001000
+milestone 37: syscall FORK (process 7) -- hardware-recorded CS=0x1b (CPL=3) -- created child pid 10
+milestone 41: syscall KILL (process 7) -- pid 10 terminated WITHOUT ever running (bypassed wait()'s normal run-then-reap contract), slot freed for reuse
+milestone 41: syscall KILL (process 7) -- hardware-recorded CS=0x1b (CPL=3) -- target pid 10, result=true
+milestone 30: process forked-child -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process forked-child -- new pml4 0x8e000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process forked-child -- private code page mapped to frame 0x8f000, private stack page mapped to frame 0x90000
+milestone 33: process forked-child -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [610304, 618496, 622592, 626688]
+milestone 34: process forked-child -- copied 4096 image bytes into private code frame 0x8f000
+milestone 37: fork() -- child's code frame 0x8f000 holds a REAL byte-for-byte copy of the parent's code frame 0x5f000 (independently verifiable: same virtual address USER_CODE_ADDR under either process's own CR3, genuinely different physical frames)
+milestone 37: syscall FORK (process 7, 'sigkill-test') -- created child pid 10: pml4=0x8e000 code_frame=0x8f000 resume point rip=0x555550000017 rsp=0x555560001000
+milestone 37: syscall FORK (process 7) -- hardware-recorded CS=0x1b (CPL=3) -- created child pid 10
+milestone 30: syscall EXIT -- hardware-recorded CS=0x1b (CPL=3) -- discarding ring-3 context, resuming kernel context
+milestone 30: runproc 7 -- resumed in kernel context (CR3 already restored by the exit syscall before this point)
+milestone 41: self-test -- SIGKILL_TEST_PROCESS completed -- PROCESS_TABLE occupied slots: [0] (expected exactly [0]: the SECOND fork's child, since the FIRST was killed unrun and its slot reused)
+milestone 30: process forked-child -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process forked-child -- new pml4 0x9a000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process forked-child -- private code page mapped to frame 0x9b000, private stack page mapped to frame 0x9c000
+milestone 33: process forked-child -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [1052672, 1060864, 1064960, 1069056]
+milestone 34: process forked-child -- copied 4096 image bytes into private code frame 0x9b000
+milestone 37: fork() -- child's code frame 0x9b000 holds a REAL byte-for-byte copy of the parent's code frame 0x6b000 (independently verifiable: same virtual address USER_CODE_ADDR under either process's own CR3, genuinely different physical frames)
+milestone 37: syscall FORK (process 8, 'waitstatus-test') -- created child pid 11: pml4=0x9a000 code_frame=0x9b000 resume point rip=0x555550000000 rsp=0x555560001000
+milestone 37: wait() -- switching CR3 to forked child pid 11's own pml4 0x9a000, resuming at rip=0x555550000000 rsp=0x555560001000 (its own fork()-time snapshot, rax forced to 0)
+milestone 30: syscall EXIT -- hardware-recorded CS=0x1b (CPL=3) -- discarding ring-3 context, resuming kernel context
+milestone 37: wait() -- forked child pid 11 resumed in kernel context (its own exit() syscall ran; CR3 is currently the KERNEL's own, restored to the parent's by wait_for_child() next)
+milestone 43: syscall WAIT (process 8) -- child pid 11 ran to completion and was reaped (real exit code 42), CR3 restored to parent's own pml4 0x6a000
+milestone 43: self-test -- forked+ran child pid 11, wait() reported Exited(reaped=11, code=42) (expected Exited(11, 42)) -- confirmed
+milestone 30: process forked-child -- user p4 index computed as 170 (code 0x555550000000, stack 0x555560000000)
+milestone 30: process forked-child -- new pml4 0x106000 populated: 511 kernel-space entries shared, index 170 left private
+milestone 30: process forked-child -- private code page mapped to frame 0x107000, private stack page mapped to frame 0x108000
+milestone 33: process forked-child -- private heap mapped: 4 pages at 0x555570000000..0x555570003fff, backed by physical frames [1101824, 1110016, 1114112, 1118208]
+milestone 34: process forked-child -- copied 4096 image bytes into private code frame 0x107000
+milestone 37: fork() -- child's code frame 0x107000 holds a REAL byte-for-byte copy of the parent's code frame 0x6b000 (independently verifiable: same virtual address USER_CODE_ADDR under either process's own CR3, genuinely different physical frames)
+milestone 37: syscall FORK (process 8, 'waitstatus-test') -- created child pid 11: pml4=0x106000 code_frame=0x107000 resume point rip=0x0 rsp=0x0
+milestone 41: syscall KILL (process 8) -- pid 11 terminated WITHOUT ever running (bypassed wait()'s normal run-then-reap contract), slot freed for reuse
+milestone 43: syscall WAIT (process 8) -- pid 11 was killed before it ever ran, reporting WaitOutcome::Killed
+milestone 43: self-test -- forked+killed child pid 11, wait() reported Killed(reaped=11) -- confirmed
+milestone 43: self-test -- OVERALL: PASS
+error: process didn't exit successfully: `target\release\spikeling-os.exe bios` (exit code: 2)

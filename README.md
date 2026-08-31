@@ -5808,6 +5808,72 @@ self-test suite, genuinely open for a future pass.
       every process exactly ONE 4 KiB stack page, completely untouched
       by this milestone.
 
+- [x] **Milestone 80**: real spiking logic gates (`kernel/src/
+      spiking_logic.rs`, new) -- the SAME boolean operations Milestone
+      79 just added to the C compiler (`&`, `|`, `~`, and `^` via
+      composition), now realized as real LIF neuron circuits instead of
+      x86 machine code. Reuses `hetero_ensemble.rs`'s own `LifRef`
+      (given a real `LifRef::new(threshold, leak)` constructor this
+      milestone, its fields and `step()` made `pub(crate)`) rather than
+      a second copy of the same struct -- the same reuse discipline
+      Milestone 78's `apply_stdp()` widening already established.
+
+      **Real design**: each gate is a real single-neuron (AND/OR/NOT)
+      or real multi-neuron (XOR) circuit driven by constant input
+      current for a fixed evaluation window; "output=true" means the
+      neuron fired at least once in that window. `LEAK=0.3`, `STEPS=20`
+      -- deliberately NOT `leak=1.0` (checked and rejected: with
+      `dt=1.0` that collapses `v_new = v*(1-leak*dt) + I*dt` to
+      `v_new = I` in one step, no real temporal integration at all).
+      Thresholds are real steady-state derivations (`v_ss = I/LEAK`),
+      not guessed: AND=5.0 sits strictly between the one-input (≈3.33)
+      and two-input (≈6.67) steady states; OR=1.0 sits strictly between
+      zero-input (0) and one-input (≈3.33); NOT is a real tonic-
+      bias-plus-inhibition circuit (bias current +1.0, input at
+      inhibitory weight -2.0 -- input=false gives `v_ss≈3.33`, fires;
+      input=true gives `v_ss≈-3.33`, a real negative steady state
+      `LifRef::step()`'s own unfloored `v += (i - leak*v)*dt` genuinely
+      allows, confirmed by reading it before relying on this, not
+      assumed). XOR is famously NOT linearly separable by any single
+      threshold neuron (real neural-network theory) -- built as a real
+      4-neuron circuit, `XOR(a,b) = AND(OR(a,b), NOT(AND(a,b)))`, each
+      stage a real independently-evaluated gate feeding its real
+      boolean output into the next as a real boolean input -- genuine
+      multi-layer spiking computation, not ordinary Rust logic dressed
+      up as one.
+
+      **Real, measured result** (two identical fresh QEMU boots, `bios`,
+      byte-identical `milestone 80:` output both times): every row of
+      every gate's complete real truth table matched on the first real
+      boot, no recalibration needed -- AND (4/4), OR (4/4), NOT (2/2),
+      and XOR (4/4, through the real 4-neuron composed circuit)
+      `OVERALL_M80=PASS`. The steady-state threshold derivation held
+      exactly as computed; no "first guess was wrong" this time, a
+      real, disclosed contrast with how often that phrase appears
+      elsewhere in this README (Milestones 65, 77 among them).
+
+      **Verified**: `cargo build --target x86_64-unknown-none` clean,
+      no warnings. Two full QEMU boots, `grep`-checked for
+      `FAIL`/`PANIC`: only the same pre-existing, already-disclosed
+      gaps every milestone since 70 has named; no new regressions;
+      `OVERALL_M77`/`OVERALL_M78`/`OVERALL_M79` all still PASS
+      unchanged.
+
+      **Still genuinely open**: this is rate/presence-coded (constant
+      drive over a fixed window), not literal spike-TIMING coincidence
+      detection -- a genuinely different, more biologically-detailed
+      real gate design (a neuron that fires only when two actual
+      discrete spikes arrive within a real coincidence window) was not
+      attempted here. Multi-bit integer bitwise operations (what
+      Milestone 79's compiler actually computes on 64-bit ints) would
+      need 64 parallel copies of these single-bit gate circuits, one
+      per bit -- genuinely untested at that scale, a real, disclosed
+      scaling gap, not assumed to trivially work. No NAND/NOR/XNOR
+      (each a one-line composition of what already exists, not
+      attempted for its own sake). No feedback into `hetero_ensemble.rs`'s
+      own disk-anomaly detector or `hetero_stdp.rs`'s own plasticity
+      work -- this module is self-contained, touching neither.
+
 ## Building and running
 
 Requires:

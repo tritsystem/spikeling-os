@@ -36,6 +36,7 @@ mod scheduler;
 mod shell;
 mod signal;
 mod speaker;
+mod spiking_logic;
 mod tasks;
 mod ternary;
 mod usertest;
@@ -1073,6 +1074,11 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // heterogeneous neuron types' own step() calls), no ELF process, no
     // ring-3/RFLAGS.IF ordering constraint.
     hetero_stdp::self_test_hetero_stdp();
+
+    // MILESTONE 80: same reasoning as Milestones 77/78 immediately
+    // above -- pure kernel-space computation (LifRef::step() calls
+    // only), no ELF process, no ring-3/RFLAGS.IF ordering constraint.
+    spiking_logic::self_test_spiking_logic();
 
     for _ in 0..80 {
         x86_64::instructions::hlt();

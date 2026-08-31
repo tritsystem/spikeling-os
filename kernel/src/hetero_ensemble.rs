@@ -117,7 +117,21 @@ pub(crate) struct LifRef {
 }
 
 impl LifRef {
-    fn step(&mut self, i: f32, dt: f32) -> bool {
+    /// MILESTONE 80: real constructor with CALLER-CHOSEN threshold/leak,
+    /// not `make_neuron()`'s own fixed-range randomization -- needed for
+    /// `spiking_logic.rs`'s real gate circuits, whose real per-gate
+    /// steady-state math (see that module's own doc comment) requires
+    /// specific, deliberately-calibrated values Milestone 77's own
+    /// `rng.uniform(0.8, 1.3)` range was never meant to produce. Fields
+    /// stay private; this is the one real, controlled way to set them
+    /// from outside this file, same "add the real capability, don't
+    /// duplicate the struct" discipline `network.rs::apply_stdp`'s own
+    /// Milestone 78 `pub(crate)` widening already established.
+    pub(crate) fn new(threshold: f32, leak: f32) -> Self {
+        LifRef { v: 0.0, threshold, leak }
+    }
+
+    pub(crate) fn step(&mut self, i: f32, dt: f32) -> bool {
         self.v += (i - self.leak * self.v) * dt;
         if self.v >= self.threshold {
             self.v = 0.0;

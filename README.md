@@ -4892,6 +4892,234 @@ self-test suite, genuinely open for a future pass.
       minus/`&&`/`||`) -- either a legitimate next dependency-ordered
       step, not attempted here.
 
+- [x] **Milestone 74**: Tier 3's eighth slice -- real FORWARD calls, and by
+      direct consequence real MUTUAL recursion -- the dependency-order
+      restriction Milestone 72 disclosed and Milestone 73's own closing
+      disclosure explicitly re-confirmed still open ("a genuinely
+      UNSUPPORTED case, not just untested"). Picked over the other real
+      candidates in the dependency-ordered queue (growing the grammar
+      itself -- unary minus, `&&`/`||`; raising `MAX_FUNCS`/`MAX_PARAMS`;
+      a kernel-side recursion-depth guard) because it is the one that
+      unlocks a genuinely NEW CLASS of program this subset could not
+      express at all before today -- no reordering of source lines makes
+      mutual recursion expressible under the old restriction -- not just a
+      wider version of something already possible, and because
+      gen_program()'s own existing FuncSym table plus CodeBuf's own
+      existing emit-placeholder/patch_rel32 machinery (built for if/else's
+      forward jumps, Milestone 70) already carried almost the whole real
+      mechanism needed. Checked directly against `gen_program()`,
+      `find_func()`, and `CodeBuf::emit_call()` in `tools/cc_src/main.rs`
+      before starting (not just this README's own prior wording): through
+      Milestone 73, `emit_call()` computed and wrote its `call rel32`
+      displacement in a single pass against an already-known target
+      offset, with no forward-reference placeholder/patch step at all
+      (unlike `emit_jz_placeholder()`/`emit_jmp_placeholder()`, which
+      Milestone 70 built specifically because if/else's own forward
+      branches have no choice) -- confirming the restriction was a real,
+      structural single-pass limitation, not a grammar gap (parsing itself
+      never enforced any call-target ordering).
+
+      **What this milestone actually built**: this stays a "grow codegen,
+      not grammar" milestone -- `program`, `function`, `factor`'s call
+      production, and `args` are all completely unchanged from Milestone
+      72; zero new AST node kinds, zero new lexer/parser productions.
+      `gen_program()` now runs a real TWO-PASS structure: pass one (new)
+      walks the whole function list and registers every function's own
+      name/`param_count` into `funcs_ptr` up front, before any body is
+      compiled, with each entry's own `code_off` starting at a new real
+      sentinel, `UNRESOLVED_CODE_OFF` (`u64::MAX`, never a real in-buffer
+      offset for this subset's 2048-byte-capped `CodeBuf`). Pass two is
+      the original per-function compile loop, unchanged in shape, except
+      it now overwrites each function's own already-present table entry
+      with its real `code_off` immediately before that SAME function's own
+      body is compiled -- the exact ordering Milestone 73 already verified
+      makes direct self-recursion resolvable (own entry real before own
+      body compiles), now true for every OTHER function in the table from
+      the very start of pass two, not just those compiled so far.
+      `find_func()` gained a third real return value -- the callee's own
+      table INDEX, not just its `code_off`/`param_count` -- so a
+      call site whose callee is a genuine forward reference (found by
+      name, but its own `code_off` is still the unresolved sentinel) can
+      record which table entry to resolve against later. Two new `CodeBuf`
+      encodings: `emit_call_placeholder()` (the same real "opcode + 4 zero
+      bytes, return the field's own offset" shape
+      `emit_jz_placeholder()`/`emit_jmp_placeholder()` already established,
+      generalized to CALL's own 0xE8 opcode) and `patch_call_rel32()`
+      (deliberately NOT `patch_rel32()` reused unchanged -- that function
+      always patches against the buffer's CURRENT end, correct for
+      if/else's own immediately-following branch bodies but wrong for a
+      forward call, whose real target was emitted earlier in the SAME
+      buffer, at a caller-supplied absolute offset, not `self.len`). A new
+      small, fixed-cap pending-call patch list (`MAX_PENDING_CALLS = 8`,
+      real, deliberate, small headroom, the same discipline
+      `MAX_FUNCS`/`MAX_PARAMS`/`MAX_VARS` already established) is
+      allocated once per program and threaded through `gen_expr()`/
+      `gen_stmt_list()` the same inert-when-unused way `funcs_ptr`/
+      `nfuncs` already are (`(0, 0)` for the original single-function
+      `gen_function()` path, CASE 1-22, completely unchanged). A call to
+      an already-compiled function (backward reference, or self) still
+      takes the exact original single-instruction `emit_call()` fast path,
+      unmodified -- a real, additive capability, not a rewrite of what
+      Milestone 72 already verified. Once `gen_program()`'s own
+      per-function loop finishes (every function's own real `code_off` is
+      now final, full stop), a new final backpatch pass walks the pending
+      list and writes each placeholder's real rel32 displacement against
+      its own callee's now-resolved `code_off`. One new `CodeGenError`
+      variant, `TooManyForwardCalls` (the pending-list's own cap
+      exceeded) -- real, disclosed, but not exercised by this milestone's
+      own self-test cases (both stay well under the cap), the same status
+      `ArgCountMismatch` already carries.
+
+      Self-tested two ways, both new, both using ONLY grammar that already
+      existed before this milestone (if/else, arithmetic, one `int`
+      parameter, function calls). CASE 32: the ordinary in-process
+      Callable path -- `int main() { return add5(10); } int add5(int x) {
+      return x + 5; }` -- `main` is defined FIRST and calls `add5`,
+      defined AFTER it: a genuine forward reference, mechanically
+      impossible to express under Milestone 72/73's own restriction (there
+      is no way to reorder this source to avoid it -- `main` must call
+      `add5`, and `add5`'s own body does not call `main`). Hand-computed
+      `10 + 5 = 15`, a real, distinguishing check: a wrong rel32 patch
+      would jump into garbage mid-instruction or into an unrelated
+      function's own bytes, not silently produce a near-miss number. CASE
+      33: genuine MUTUAL recursion -- `int is_even(int n) { if (n == 0) {
+      return 1; } else { return is_odd(n - 1); } } int is_odd(int n) { if
+      (n == 0) { return 0; } else { return is_even(n - 1); } } int main()
+      { return is_even(10); }` -- `is_even`'s own call to `is_odd` is a
+      real FORWARD reference (`is_odd` is defined after `is_even`, so its
+      own `code_off` is still the unresolved sentinel when `is_even`'s own
+      body is compiled -- exercising this milestone's new placeholder/
+      patch-list path), while `is_odd`'s own call to `is_even` is a real
+      BACKWARD reference (`is_even` was already compiled by the time
+      `is_odd`'s own body compiles -- exercising the ORIGINAL, unmodified
+      `emit_call()` fast path). Both directions of the SAME mutually-
+      recursive pair are real and exercised in one program, not just one
+      direction in isolation -- run through the real on-disk-ELF + kernel
+      `exec()` + `wait()` path Milestone 69 established, the strongest
+      verification tier, same as every milestone since 69's own
+      precedent. Hand-computed: `is_even(10)` -> `is_odd(9)` ->
+      `is_even(8)` -> ... -> `is_even(0)` = 1 (true), 11 real stack
+      frames -- the same small, hand-verified recursion-depth envelope
+      Milestone 73's own CASE 30 already used and disclosed, not a new or
+      larger stack-depth risk.
+
+      **Real verification loop**: `cargo build` from the repo root (a
+      clean workspace build with only the pre-existing, already-disclosed
+      warning set, e.g. `ArgCountMismatch`'s own unread-field warning --
+      no new warnings), then the project's own pinned-nightly `rustc`
+      recipe (unchanged, see `tools/cc_src/README.md`) to rebuild
+      `kernel/assets/cc.elf` (grown from Milestone 73's 36424 bytes to
+      38408 bytes; the real number that matters for the page cap, the one
+      `PT_LOAD` segment's own `p_memsz`, is 29284 bytes -- 8 pages,
+      inspected directly via `readelf -l` against the ELF program header
+      rather than inferred from file size -- still comfortably under
+      Milestone 70's 64-page per-segment cap and 128-page total cap, so
+      **no cap change was needed this milestone**), then a second `cargo
+      build` from the repo root to re-embed the new `cc.elf` into the
+      kernel binary via `include_bytes!` (`kernel/src/loader.rs`'s
+      `CC_ELF_BYTES`, unchanged), then two real QEMU boots (`cargo run --
+      bios` with `SPIKELING_QEMU_MONITOR_PORT` set -- the real, pre-
+      existing Milestone 33 monitor-port mechanism, driving the exact same
+      `bus=ide.1`/`unit=0`/`unit=1` secondary-bus drive topology
+      `src/main.rs` already builds unmodified, not a hand-rolled
+      alternative -- `quit` sent over that monitor port once the boot
+      reached its own steady-state `hlt_loop`, evidenced by the Milestone
+      25 "background task scheduling enabled" line) -- one genuinely
+      fresh-disk boot (`target/persist.img`/`persist2.img` deleted and
+      recreated blank first) and one immediately-following boot reusing
+      that same disk, unmodified. Quoted from the fresh-disk boot's own
+      serial log (`m74_fresh_boot.log`):
+      ```
+      milestone 74: cc forward-call and mutual-recursion verification starting
+        case32 (main calls add5, defined AFTER it -- real forward call) returned=15 (expected 15)
+      case32_forward_call_add5_returns_15=PASS
+        real on-disk ELF written, real fork()+exec()+wait() -- child exited=true real exit code=1 (expected exited=true code=1)
+      case33_real_elf_exec_mutual_recursion_is_even_10_returns_1=PASS
+      OVERALL_M74=PASS
+      ```
+      CASE 32's own `15` is only reachable if the real forward-patched
+      `call` genuinely lands on `add5`'s own real prologue (a wrong
+      displacement would land mid-instruction inside whatever bytes happen
+      to follow the placeholder, producing a hardware fault or an
+      arbitrary wrong number, not a plausible near-miss). CASE 33's own
+      `1` (true) is only reachable if BOTH the forward direction
+      (`is_even` -> `is_odd`) AND the backward direction (`is_odd` ->
+      `is_even`) of the same mutually-recursive pair resolve correctly
+      across 11 real alternating stack frames -- a bug in either direction
+      alone would produce a different, specific wrong number or a real
+      hardware fault (a bad `call` target), not a silent near-miss. In the
+      same boot: `OVERALL=` PASS x4 (Milestones 1-66's own aggregate
+      checks), `OVERALL_M68=PASS` through `OVERALL_M73=PASS`, `fs
+      self-test: permissions OVERALL=PASS`, `fs self-test: symlinks
+      OVERALL=PASS`, `fread_real_buffering=PASS` (real on a genuinely
+      fresh disk), zero `EXCEPTION: DOUBLE FAULT`/`EXCEPTION: TRIPLE
+      FAULT` and zero `panicked at`/`kernel panicked` anywhere in the log
+      (checked case-sensitively via `grep -a -c` against the raw serial
+      log, per Milestone 72's own caught-and-fixed methodology trap). All
+      four counts were exactly 0. Independently re-confirmed on the
+      immediately-following reused-disk boot (`m74_reused_boot.log`):
+      identical `OVERALL_M74=PASS` with both CASE 32/33 individually
+      `PASS` and the same real CASE 33 `exec()`/`wait()`
+      teardown-and-reap unchanged, zero panics/unhandled exceptions
+      (re-checked the same case-sensitive way) -- the only failures in
+      that second boot were the SAME two pre-existing, already-disclosed
+      reused-disk gaps Milestone 70/71/72/73's own entries already named
+      (`stdiotest.elf`'s `fread_real_buffering=FAIL`/`eof_semantics=FAIL`,
+      the Milestone 61 O_TRUNC gap; `fs self-test: permissions`/`symlinks`
+      both `OVERALL=FAIL`, the Milestone 62-era `permtestdir`/`symtestdir`
+      fixture-cleanup gap) -- neither touched nor caused by this
+      milestone, both real and unfixed, exactly as before. `tasklist`
+      confirmed zero `qemu-system-x86_64.exe` processes both before this
+      milestone's work began and after each of the two boots above (each
+      stopped cleanly via its own real monitor-port `quit`, independently
+      re-checked with `tasklist` each time). No evidence of concurrent
+      editing found: `git status`/`git diff --stat` checked both before
+      this milestone's own work began and after it finished matched the
+      exact same pre-existing modified/untracked file set throughout, with
+      `git diff --stat -- kernel/src` in particular showing the IDENTICAL
+      per-file insertion/deletion counts at both checkpoints -- confirming
+      zero `kernel/src/*.rs` changes happened during this milestone's own
+      work, whether from this session or any other, consistent with this
+      milestone's own design (forward-call/mutual-recursion codegen is
+      pure userspace toolchain work, needing no new syscall or
+      kernel-loader behavior) and with the unchanged kernel/src diffstat
+      itself. Only this milestone's own edits (`tools/cc_src/main.rs`,
+      `tools/cc_src/README.md`, `kernel/assets/cc.elf`, this README.md
+      entry, and the new `m74_*.log` verification logs) are layered on top
+      of the same pre-existing working-tree state this whole Tier 3 arc
+      has been accumulating uncommitted, milestone over milestone, exactly
+      as the project's own process expects.
+
+      **Still genuinely open**: up to 4 functions and up to 4
+      parameters/arguments (`MAX_FUNCS`/`MAX_PARAMS`), both real,
+      deliberately small, unraised caps, unchanged from Milestone 72; a
+      genuinely new, small, fixed cap on forward-reference call SITES per
+      program (`MAX_PENDING_CALLS = 8`), real but not exercised by this
+      milestone's own self-test cases; direct/mutual self-recursion's own
+      STACK-DEPTH SAFETY at anything beyond small, hand-verified depths
+      remains real, unmeasured, and undisclosed-as-safe, completely
+      UNCHANGED by this milestone -- this kernel's single 4KiB per-process
+      stack page still has no guard against a deep or runaway call chain,
+      whether self-recursive, forward, or mutual, and this milestone
+      deliberately did not attempt one (Milestone 73's own open item,
+      still a real, disclosed, smaller next increment, not attempted
+      here); no 5th-or-later argument, no standalone call-as-statement, no
+      `break`/`continue`, no unary minus, no `&&`/`||`, no additional C
+      types, no arrays/pointers, no preprocessor, no comparison chaining,
+      no bare `else if` (all unchanged from prior milestones' own
+      disclosed scope cuts); the `fs.rs` 8-entry directory cap, the
+      trailing `leave; ret`/`sys_exit` safety backstop for a missing
+      `return`, the `fs.rs` self-test reused-disk directory-already-exists
+      gap (permissions/symlinks), and the `stdiotest.elf` O_TRUNC gap
+      Milestone 70/62/61 respectively already disclosed are all still real
+      and unfixed, untouched by this milestone. The natural next Tier 3
+      milestone: growing the grammar itself (unary minus, `&&`/`||`,
+      arrays/pointers, more C types) or a real kernel-side recursion-depth
+      guard (a real, disclosed, kernel-side -- not pure-userspace --
+      increment, needing extra care given this milestone continues the
+      "userspace-only" streak) -- either a legitimate next dependency-
+      ordered step, not attempted here.
+
 ## Building and running
 
 Requires:

@@ -5988,6 +5988,66 @@ self-test suite, genuinely open for a future pass.
       idempotent across a persisted disk -- orthogonal to this milestone,
       same disclosed gap.
 
+- [x] **Milestone 83**: real logical NOT (`!`) in the self-hosted
+      subset-C compiler (`tools/cc_src`) -- the last remaining
+      unary-operator gap every "still genuinely open" disclosure since
+      Milestone 76 has named (`!x` was simply not expressible; `!` was
+      lexed only as the first half of `!=`). Picked over the other two
+      standing candidates -- `MAX_FUNCS`/`MAX_PARAMS` (still 4 each,
+      still unblocked by any concrete test program) and compound
+      assignment (`+=`/`&=`/... , a wider slice touching every
+      `assign_stmt`) -- as the smallest cleanly-dependency-ordered
+      increment, and one that completes a set: unary `-` (M76), `~`
+      (M79), and now `!` are the whole real unary surface for this
+      subset.
+
+      **Grammar**: `unary := ("-" | "~" | "!") unary | factor` -- `!`
+      slots into the exact production `-`/`~` already share, so it binds
+      at the same (tightest) precedence (`!a * b` is `(!a) * b`, `!a < b`
+      is `(!a) < b`) and composes with the other two and itself (`!!x`,
+      `!-x`, `~!x`). Every layer above `unary` -- `term`, `expr`,
+      `shift_expr`, `cond_expr`, the three bit layers, `logic_and`,
+      `logic_or` -- is completely unchanged. The lexer gains one token
+      (`TOK_BANG`); `!=` was and stays a two-char token checked first, so
+      `a != b` is untouched.
+
+      **Codegen**: `!` is a real boolean-producing operator (result is
+      exactly 0 or 1), so unlike `-`/`~` (which transform RAX in place
+      via the F7 opcode family) it reuses the exact `test rax, rax` +
+      `setcc` + `movzx eax, al` normalize idiom `OP_NE` and every
+      comparison arm already use -- here with `sete` (AL := 1 iff the
+      operand was 0). **Zero new CodeBuf encodings** -- all three
+      helpers already existed (Milestone 70/76). One new `EXPR_UNARY` op
+      sentinel (`OP_LOGNOT`), the extension point `OP_NEG`/`OP_BITNOT`'s
+      own comments already named.
+
+      **Verified**: `cargo build --target x86_64-unknown-none` clean, no
+      warnings; `cc.elf` rebuilt (13 expected "never used" warnings,
+      unchanged set). Two full QEMU boots, a genuine fresh-disk then
+      reused-disk pair. CASE 39 (in-process Callable path -- `!` on zero
+      and nonzero operands, doubled `!!`, on a comparison result, and as
+      `&&`'s left operand, over real variables) returns exactly `3` both
+      boots; CASE 40 (real on-disk-ELF + kernel `exec()`+`wait()` path --
+      a precedence-regression test built so a wrong `!`-vs-`*` binding
+      gives `2` instead of `4`) returns `4` both boots.
+      `OVERALL_M83=PASS`, `OVERALL_M68`..`OVERALL_M79` all still PASS,
+      `milestone 64`/`65`/`stdiotest` all still PASS. Fresh vs. reused
+      OVERALL markers byte-identical. Only `FAIL` lines are the same
+      disclosed set every milestone since 70 has named (permissions/
+      symlinks reused-disk non-idempotency, the four deliberately-
+      negative syscall tests, `milestone 6`'s keyboard harness). No new
+      regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each,
+      unraised); compound assignment operators (`+=`, `-=`, `*=`, `/=`,
+      `&=`, `|=`, `^=`, `<<=`, `>>=`) -- now the oldest-standing named
+      grammar gap, a real candidate for the next slice; no arrays/
+      pointers, no additional C types (unchanged real scope cuts); SAR
+      vs. SHR still undistinguished by any test case (Milestone 79's own
+      open verification gap, untouched here); this kernel still gives
+      every process exactly ONE 4 KiB stack page (a pure userspace
+      toolchain change).
+
 ## Building and running
 
 Requires:

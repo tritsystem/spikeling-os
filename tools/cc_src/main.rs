@@ -480,6 +480,54 @@
 // this kernel still gives every process exactly ONE 4 KiB stack page,
 // completely untouched by this milestone.
 //
+// MILESTONE 83 closes the logical-NOT gap Milestone 76's and Milestone
+// 79's own "still genuinely open" disclosures both named ("no logical
+// NOT (`!` alone) ... `!x` is not expressible") -- the last remaining
+// unary-operator gap, picked over the other two standing candidates
+// (MAX_FUNCS/MAX_PARAMS, still unblocked by any concrete test program;
+// compound assignment `+=`/`&=`/... , a wider slice touching every
+// assign_stmt) as the smallest cleanly-dependency-ordered increment
+// that also completes a set: unary `-` (M76), `~` (M79), and now `!`
+// are the whole real unary operator surface for this subset.
+// Grammar addition:
+//   unary := ("-" | "~" | "!") unary | factor
+// `!` slots into the exact same `unary` production `-` and `~` already
+// share, so it binds at the same (tightest) precedence -- `!a * b` is
+// `(!a) * b`, `!a < b` is `(!a) < b` -- and composes with the other two
+// and itself through the same recursive-unary call (`!!x`, `!-x`,
+// `~!x`). `cond_expr`/`shift_expr`/the bit layers/`logic_and`/
+// `logic_or` are all COMPLETELY UNCHANGED. The lexer gains one token
+// (`TOK_BANG`) for a lone `!`; `!=` was and stays a two-char token
+// checked first, so `a != b` is untouched.
+//
+// Codegen: `!` is a real BOOLEAN-producing operator (result is exactly
+// 0 or 1), so unlike `-`/`~` (which transform RAX in place via the F7
+// opcode family) it reuses the exact `test rax, rax` + `setcc` + `movzx
+// eax, al` normalize idiom OP_NE and every comparison arm already use --
+// here with `sete` (AL := 1 iff the operand was 0). ZERO new CodeBuf
+// encodings -- `emit_test_rax_rax()`, `emit_setcc()`, `emit_movzx_eax_al()`
+// all already exist (Milestone 70/76). One new EXPR_UNARY op sentinel
+// (`OP_LOGNOT`), the exact extension point OP_NEG's/OP_BITNOT's own
+// comments named.
+//
+// Two new self-test cases verify this for real: CASE 39 (the in-process
+// Callable path -- `!` on zero and nonzero operands, doubled `!!`, on a
+// comparison result, and as `&&`'s left operand, over real variables)
+// and CASE 40 (the real on-disk-ELF + kernel exec()+wait() path -- this
+// milestone's strongest tier, a REAL precedence-regression test built so
+// a wrong `!`-vs-`*` binding gives a different, distinguishable result).
+//
+// Still genuinely open after this milestone: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each, still unraised, still unblocked by any concrete program);
+// compound assignment operators (`+=`, `-=`, `*=`, `/=`, `&=`, `|=`,
+// `^=`, `<<=`, `>>=` -- now the oldest-standing named grammar gap, a
+// real candidate for the next slice); no arrays/pointers, no additional
+// C types (unchanged real scope cuts); SAR vs. SHR still UNDISTINGUISHED
+// by any test case (Milestone 79's own open verification gap, untouched
+// here); this kernel still gives every process exactly ONE 4 KiB stack
+// page, completely untouched by this milestone (a pure userspace
+// toolchain change).
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -612,6 +660,14 @@ const TOK_CARET: u8 = 29; // "^"
 const TOK_TILDE: u8 = 30; // "~" (unary only in this subset -- same "no bare use beyond its one real grammar slot" scope as every other operator token here)
 const TOK_SHL: u8 = 31; // "<<"
 const TOK_SHR: u8 = 32; // ">>"
+// MILESTONE 83: real logical NOT. "!" was lexable ONLY as the first half
+// of "!=" through Milestone 82 (see lex()'s own comment: "'!' has no
+// standalone token ... only '!=' is recognized"); a lone '!' was a
+// deliberate UnknownChar. This is the last unary-operator gap every
+// "still genuinely open" disclosure since Milestone 70 has named, now
+// closed: unary "-" (M76), "~" (M79), and "!" (this milestone) are the
+// complete real unary set for this subset.
+const TOK_BANG: u8 = 33; // "!"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -731,10 +787,10 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
         // MILESTONE 70: two-char lookahead for the four comparison
         // operators that share a first byte with a shorter token
         // ('=' alone is TOK_ASSIGN, "==" is TOK_EQ; '<'/'>' alone are
-        // TOK_LT/TOK_GT, "<="/">=" are TOK_LE/TOK_GE; '!' has no
-        // single-char meaning in this subset -- only "!=" is legal, a
-        // lone '!' is a real, deliberate UnknownChar). Checked BEFORE
-        // the single-char match below so the longer token always wins.
+        // TOK_LT/TOK_GT, "<="/">=" are TOK_LE/TOK_GE; '!' alone is
+        // TOK_BANG as of MILESTONE 83, "!=" is TOK_NE). Checked BEFORE
+        // the single-char match below so the longer token always wins
+        // (a lone '!' still falls through to the single-char match).
         let next = if i + 1 < src_len { Some(unsafe { core::ptr::read((src_ptr + i + 1) as *const u8) }) } else { None };
         if b == b'=' && next == Some(b'=') {
             unsafe { tok_write(toks_ptr, n, Token { kind: TOK_EQ, int_val: 0, ident_off: 0, ident_len: 0 }) };
@@ -818,6 +874,11 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             b'|' => TOK_PIPE,
             b'^' => TOK_CARET,
             b'~' => TOK_TILDE,
+            // MILESTONE 83: lone '!' -- unreached for a genuine "!="
+            // (that `continue`s above, before this match runs), so a
+            // '!' followed by anything other than '=' correctly lands
+            // here as the real logical-NOT operator.
+            b'!' => TOK_BANG,
             _ => return Err(LexError::UnknownChar(i)),
         };
         unsafe { tok_write(toks_ptr, n, Token { kind, int_val: 0, ident_off: 0, ident_len: 0 }) };
@@ -883,6 +944,13 @@ const OP_BITAND: u8 = 12;
 const OP_SHL: u8 = 13;
 const OP_SHR: u8 = 14;
 const OP_BITNOT: u8 = 15;
+// MILESTONE 83: one more EXPR_UNARY op sentinel -- logical NOT ("!"),
+// third sibling to OP_NEG/OP_BITNOT, exactly the extension point those
+// comments already named. `!x` is 1 when x == 0 and 0 otherwise; unlike
+// OP_BITNOT it is a real boolean-producing operator (0/1 result), so
+// its codegen reuses the same test/setcc/movzx normalize idiom OP_NE
+// and the comparison operators already use, not the F7 in-place family.
+const OP_LOGNOT: u8 = 16;
 
 #[repr(C)]
 struct ExprNode {
@@ -1266,12 +1334,20 @@ impl Parser {
     /// tighter than `*`/`/`, real C's own ordering) and both compose
     /// with each other via the same recursive-unary call (`-~x`, `~-x`,
     /// `~~x` are all real, legal parses here, same as real C).
+    /// MILESTONE 83: extended once more for real logical `!` -- the same
+    /// slot again (`unary := ("-"|"~"|"!") unary | factor`), same
+    /// precedence as `-`/`~` (tighter than `*`/`/`, real C's own
+    /// ordering -- `!a * b` is `(!a) * b`), and it composes with the
+    /// other two and itself through the same recursive-unary call
+    /// (`!!x`, `!-x`, `-!x`, `~!x` are all real, legal parses here).
     unsafe fn parse_unary(&mut self) -> Result<u64, ParseError> {
         let k = unsafe { self.peek() }.kind;
         let op = if k == TOK_MINUS {
             OP_NEG
         } else if k == TOK_TILDE {
             OP_BITNOT
+        } else if k == TOK_BANG {
+            OP_LOGNOT
         } else {
             return unsafe { self.parse_factor() };
         };
@@ -2755,10 +2831,22 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         // place, no jump machinery needed" shape unary minus already
         // established; only which real one-operand encoding runs
         // differs (emit_not_rax() vs. emit_neg_rax()).
+        // MILESTONE 83: extended for real logical `!` -- still the same
+        // "evaluate the one operand into RAX, transform in place, no
+        // jump machinery" shape, but `!` is a BOOLEAN-producing operator
+        // (result is exactly 0 or 1), so instead of an F7-family in-place
+        // bit transform it reuses the exact `test rax,rax` + `setcc` +
+        // `movzx eax,al` normalize idiom OP_NE and every comparison arm
+        // already use -- here with `sete` (0x94: AL := 1 iff ZF, i.e.
+        // iff the operand was 0), zero new CodeBuf encodings.
         EXPR_UNARY => {
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
             if e.op == OP_BITNOT {
                 unsafe { buf.emit_not_rax() };
+            } else if e.op == OP_LOGNOT {
+                unsafe { buf.emit_test_rax_rax() };
+                unsafe { buf.emit_setcc(0x94) }; // sete al -- AL := (operand == 0)
+                unsafe { buf.emit_movzx_eax_al() };
             } else {
                 unsafe { buf.emit_neg_rax() };
             }
@@ -5246,7 +5334,86 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m79 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // CASE 39: the ordinary in-process Callable path -- real logical
+        // NOT (`!`) in every shape that matters: applied to a zero and a
+        // nonzero operand (result must be EXACTLY 1 / EXACTLY 0, not
+        // merely "nonzero"), doubled (`!!b` normalizes any nonzero to a
+        // clean 1), applied to a comparison's own 0/1 result, and as the
+        // left operand of `&&`. IDENT operands (not just literals)
+        // exercise find_var() through the new codegen path, same "not
+        // only INTLIT" discipline CASE 35/37 established.
+        //   int main() {
+        //       int a; a = 0;
+        //       int b; b = 7;
+        //       int r;
+        //       r = (!a) + (!b) + (!!b) + (!(a < b)) + (!a && b);
+        //       return r;
+        //   }
+        // Hand-computed: !a = !0 = 1. !b = !7 = 0. !!b = !(!7) = !0 = 1.
+        // !(a < b) = !(0 < 7) = !1 = 0. (!a && b) = (1 && 7) = 1 (`&&`
+        // normalizes to a clean 1). Sum: 1 + 0 + 1 + 0 + 1 = 3. Any bug
+        // that leaves `!` producing a raw non-0/1 value (e.g. a bitwise
+        // ~ by mistake, -1 for a true operand) would blow this exact sum.
+        // -------------------------------------------------------------
+        const SRC39: &[u8] = b"int main() { int a; a = 0; int b; b = 7; int r; r = (!a) + (!b) + (!!b) + (!(a < b)) + (!a && b); return r; }";
+        let case39_result = compile_and_run_program_callable(SRC39.as_ptr() as u64, SRC39.len() as u64);
+        w(b"  case39 (logical ! in five shapes, in-process) returned=");
+        if let Some(r) = case39_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case39_ok = case39_result == Some(3);
+        write_check(b"case39_logical_not_five_shapes_returns_3=", case39_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 40: the real on-disk-ELF + kernel exec()+wait() path --
+        // this milestone's own strongest verification tier, same
+        // precedent as every milestone since 69 -- and a REAL operator-
+        // PRECEDENCE regression test: unary `!` binds TIGHTER than `*`
+        // (and transitively than `+`), real C's own ordering, checked
+        // against the C precedence table before writing this, and this
+        // case is built so a WRONG precedence gives a DIFFERENT,
+        // distinguishable result.
+        //   int main() {
+        //       int a; a = 0;
+        //       int b; b = 3;
+        //       int r;
+        //       r = !a * b;
+        //       return r + !(b - 3);
+        //   }
+        // Hand-computed (CORRECT precedence, `!` tighter than `*`):
+        // `!a * b` = (!0) * 3 = 1 * 3 = 3, so r = 3. `b - 3` = 0,
+        // `!(b - 3)` = !0 = 1. return 3 + 1 = 4. If `!` bound LOOSER
+        // than `*` (parsing `!a * b` as `!(a * b)`), this would compute
+        // `!(0 * 3)` = !0 = 1, so r = 1, and `1 + !(3 - 3)` = 1 + 1 = 2
+        // -- a genuinely different, real discriminating result, not one
+        // that passes either way.
+        // -------------------------------------------------------------
+        const SRC40: &[u8] =
+            b"int main() { int a; a = 0; int b; b = 3; int r; r = !a * b; return r + !(b - 3); }";
+        const PATH40: &[u8] = PATH8;
+        let (elf40_ptr, elf40_len) = compile_program_standalone_elf(SRC40.as_ptr() as u64, SRC40.len() as u64);
+        let case40_ok = if elf40_ptr == 0 {
+            w(b"  case40 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH40, elf40_ptr, elf40_len, 4)
+        };
+        write_check(b"case40_real_elf_exec_logical_not_precedence_returns_4=", case40_ok);
+
+        w(b"\n");
+
+        let overall_m83 = case39_ok && case40_ok;
+        w(b"OVERALL_M83=");
+        w(if overall_m83 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 { 0 } else { 1 });
     }
 }
 

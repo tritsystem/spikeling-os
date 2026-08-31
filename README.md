@@ -4705,6 +4705,193 @@ self-test suite, genuinely open for a future pass.
       itself (arrays/pointers, more C types) -- either a legitimate next
       dependency-ordered step, not attempted here.
 
+- [x] **Milestone 73**: Tier 3's seventh slice -- real VERIFICATION (no
+      new grammar or codegen) of direct self-recursion, the one item
+      Milestone 72's own closing disclosure explicitly left "mechanically
+      reachable by this codegen but NOT tested or verified" -- picked over
+      the other real candidates in the dependency-ordered queue (forward
+      calls/mutual recursion; raising `MAX_FUNCS`/`MAX_PARAMS`; unary minus
+      and `&&`/`||`) because it is the one closing a genuinely UNKNOWN
+      (not just unbuilt) item this codebase already flagged against itself,
+      it is small and honestly containable in one slice unlike the
+      two-pass rework forward calls would need, and unlocking verified
+      recursion is real, load-bearing value for a self-hosting toolchain.
+      Checked directly against `gen_program()`'s own doc comment in
+      `tools/cc_src/main.rs` before starting (not just this README's own
+      prior wording): a function's own `FuncSym` (name, code offset,
+      parameter count) is written into the function-symbol table BEFORE
+      that function's own body is compiled, so a call inside a function's
+      own body to ITS OWN name already resolves against an already-real,
+      already-written table entry through the exact same `find_func()`/
+      `emit_call()` path an ordinary call to an earlier-defined sibling
+      function already takes -- confirming the gap was purely evidentiary
+      ("the mechanism looks right" was never actually exercised end to
+      end), not a missing grammar or codegen feature.
+
+      **What this milestone actually built**: two new self-test cases in
+      `tools/cc_src/main.rs`, using ONLY grammar that already existed
+      before this milestone (if/else, arithmetic, one `int` parameter) --
+      zero new AST node kinds, zero new `CodeGenError` variants, zero new
+      `CodeBuf` encodings. CASE 30: `int sum_to(int n) { if (n == 0) {
+      return 0; } else { return n + sum_to(n - 1); } } int main() {
+      return sum_to(10); }`, run through the ordinary in-process Callable
+      path. This is a real, DISTINGUISHING check, not just "some number
+      came back": `n` is added to the recursive result AFTER
+      `sum_to(n-1)` returns, so `n` must survive in the CALLER's own
+      stack-frame slot across a nested call that allocates its own fresh
+      frame at a lower address -- a shared/clobbered-slot bug (the kind a
+      naive implementation could have) would not produce the hand-computed
+      55 (`10+9+...+1+0`). CASE 31: a DIFFERENT self-recursive function --
+      `int fact(int n) { if (n == 0) { return 1; } else { return n *
+      fact(n - 1); } } int main() { return fact(5); }`, hand-computed
+      `5*4*3*2*1*1 = 120` -- deliberately multiplication instead of
+      addition so a CASE-30-only bug that happened to cancel out
+      arithmetically wouldn't also cancel out here, run through the real
+      on-disk-ELF + kernel `exec()` + `wait()` path Milestone 69
+      established, the strongest verification tier this Tier has, same as
+      every milestone since 69's own precedent. Both cases use small,
+      hand-verified recursion depths (CASE 30: 11 stack frames, `n` = 10
+      down to 0; CASE 31: 6 stack frames, `n` = 5 down to 0) -- a real,
+      deliberate choice, not an oversight: this kernel gives each process
+      exactly ONE 4KiB stack page (`kernel/src/process.rs`, unchanged by
+      this milestone), and neither this codegen nor the kernel enforces
+      any real stack-depth guard on a self-recursive call chain, so deeper
+      self-recursion carries a real, unmeasured risk of silently
+      overrunning that single page -- this milestone verifies CORRECTNESS
+      at shallow, hand-checked depth, not SAFETY at unbounded depth, and
+      says so plainly rather than implying the latter. `gen_program()`'s
+      own doc comment in `main.rs` was updated to reflect the new,
+      checked status (self-recursion: verified; deep-recursion stack
+      safety: still a real, open, disclosed gap).
+
+      **Real verification loop**: `cargo build` from the repo root, then
+      the project's own pinned-nightly `rustc` recipe (unchanged, see
+      `tools/cc_src/README.md`) to rebuild `kernel/assets/cc.elf` (grown
+      from Milestone 72's 34896 bytes to 36424 bytes; the real number that
+      matters for the page cap, the one `PT_LOAD` segment's own
+      `p_memsz`, is 27302 bytes -- 7 pages, inspected directly via
+      `readelf -l` against the ELF program header rather than inferred
+      from file size -- still comfortably under Milestone 70's 64-page
+      per-segment cap and 128-page total cap, so **no cap change was
+      needed this milestone**), then a second `cargo build` from the repo
+      root to re-embed the new `cc.elf` into the kernel binary via
+      `include_bytes!` (`kernel/src/loader.rs`'s `CC_ELF_BYTES`,
+      unchanged), then two real QEMU boots (`qemu-system-x86_64` launched
+      directly, matching this project's own `src/main.rs` drive topology
+      exactly -- `target/persist.img` as the secondary-bus IDE master and
+      `target/persist2.img` as the secondary-bus IDE slave, `bus=ide.1`
+      `unit=0`/`unit=1` -- with `-serial file:<path>` and a `-monitor
+      tcp:127.0.0.1:<port>`, `quit` sent over that monitor port once the
+      boot reached its own steady-state `hlt_loop` after the Milestone 25
+      "background task scheduling enabled" line) -- one genuinely
+      fresh-disk boot (`target/persist.img`/`persist2.img` recreated blank
+      first) and one immediately-following boot reusing that same disk,
+      unmodified. Quoted from the fresh-disk boot's own serial log
+      (`m73_fresh_boot.log`; condensed into `m73_fresh_boot_condensed.log`
+      by concatenating every real `milestone 31: syscall WRITE` payload in
+      order, the same technique Milestone 72's own verification used --
+      see that raw file for the full, uncondensed record of every byte,
+      hardware-recorded CPL included):
+      ```
+      milestone 73: cc direct self-recursion verification starting
+        case30 (sum_to(10) = 10+9+...+0, real self-recursive call) returned=55 (expected 55)
+      case30_self_recursive_sum_returns_55=PASS
+        real on-disk ELF written, real fork()+exec()+wait() -- child exited=true real exit code=120 (expected exited=true code=120)
+      case31_real_elf_exec_self_recursive_factorial_returns_120=PASS
+      OVERALL_M73=PASS
+      ```
+      CASE 30's own 55 is only reachable if EVERY one of `n`'s 11 real
+      per-frame stack slots (one per recursive invocation, `n` = 10 down
+      to 0) independently held its own invocation's own value across the
+      nested `call`/`ret` -- a swapped or shared-slot bug would produce a
+      different, specific wrong number (e.g. a slot aliasing bug that
+      always saw the SAME `n` would produce something far from 55, not a
+      near-miss). CASE 31's own real `exec()`/`wait()` teardown-and-reap in
+      the same boot shows the same real `milestone 45: syscall EXEC`
+      teardown-and-rebuild and `milestone 43: syscall WAIT ... real exit
+      code 120` pattern every prior real-ELF case in this Tier already
+      established, with the hand-predicted exit code (120) matched by the
+      kernel's own real `wait()` syscall. In the same boot: `OVERALL=`
+      PASS x4 (Milestones 1-66's own aggregate checks), `OVERALL_M68=
+      PASS`, `OVERALL_M69=PASS`, `OVERALL_M70=PASS`, `OVERALL_M71=PASS`,
+      `OVERALL_M72=PASS`, `fs self-test: permissions OVERALL=PASS`,
+      `fs self-test: symlinks OVERALL=PASS`, `fread_real_buffering=PASS`
+      (real on a genuinely fresh disk), zero `EXCEPTION: DOUBLE FAULT`/
+      `EXCEPTION: TRIPLE FAULT` and zero `panicked at`/`kernel panicked`
+      anywhere in the log (checked case-sensitively via `grep -a -c`
+      against the raw serial log, per Milestone 72's own caught-and-fixed
+      methodology trap -- a case-INsensitive match would false-positive on
+      this same boot's own benign `self_test_cc()`-style "ran to
+      completion... (no panic, no double fault)" status lines). All four
+      counts were exactly 0. Independently re-confirmed on the
+      immediately-following reused-disk boot (`m73_reused_boot.log`):
+      identical `OVERALL_M73=PASS` with both CASE 30/31 individually
+      `PASS` and the same real CASE 31 `exec()`/`wait()`
+      teardown-and-reap unchanged, zero panics/unhandled exceptions
+      (re-checked the same case-sensitive way) -- the only failures in
+      that second boot were the SAME two pre-existing, already-disclosed
+      reused-disk gaps Milestone 70/71/72's own entries already named
+      (`stdiotest.elf`'s `fread_real_buffering=FAIL`/`eof_semantics=FAIL`,
+      the Milestone 61 O_TRUNC gap; `fs self-test: permissions`/`symlinks`
+      both `OVERALL=FAIL`, the Milestone 62-era `permtestdir`/`symtestdir`
+      fixture-cleanup gap) -- neither touched nor caused by this
+      milestone, both real and unfixed, exactly as before. `tasklist`
+      confirmed zero `qemu-system-x86_64.exe` processes after each boot in
+      this session (both instances stopped cleanly via their own real
+      monitor-port `quit`, independently re-checked with `tasklist` each
+      time, plus one additional stray instance from an early
+      wrong-drive-topology attempt that was caught before any boot log was
+      trusted and killed via `Stop-Process`, independently re-confirmed
+      gone via `tasklist`). No evidence of concurrent editing found:
+      `git status`/`git diff --stat` checked both before this milestone's
+      own work began and after it finished matched the exact same
+      pre-existing modified/untracked file set throughout, with `git diff
+      --stat -- kernel/src` in particular showing the IDENTICAL per-file
+      insertion/deletion counts at both checkpoints -- confirming zero
+      `kernel/src/*.rs` changes happened during this milestone's own work,
+      whether from this session or any other, consistent with this
+      milestone's own design (self-recursion verification is pure
+      userspace codegen/test work, needing no new syscall or
+      kernel-loader behavior) and with the unchanged kernel/src diffstat
+      itself. Only this milestone's own edits (`tools/cc_src/main.rs`,
+      `tools/cc_src/README.md`, `kernel/assets/cc.elf`, this README.md
+      entry, and the new `m73_*.log`/`m73_*_condensed.log` verification
+      logs) are layered on top of the same pre-existing working-tree state
+      this whole Tier 3 arc has been accumulating uncommitted, milestone
+      over milestone, exactly as the project's own process expects.
+
+      **Still genuinely open**: no forward calls and no mutual recursion
+      (Milestone 72's own real, disclosed dependency-order scope cut,
+      completely unchanged by this milestone -- self-recursion and mutual
+      recursion are NOT the same capability, and only the former was in
+      scope here); self-recursion's own STACK-DEPTH SAFETY at anything
+      beyond this milestone's small, hand-verified depths (11/6 frames)
+      remains real, unmeasured, and undisclosed-as-safe -- this kernel's
+      single 4KiB per-process stack page has no guard against a deep or
+      runaway self-recursive call chain, and this milestone deliberately
+      did not attempt to add one (a real, disclosed, smaller next
+      increment -- e.g. a compile-time or run-time recursion-depth check
+      -- not attempted here); up to 4 functions and up to 4
+      parameters/arguments (`MAX_FUNCS`/`MAX_PARAMS`), both real,
+      deliberately small, unraised caps, unchanged from Milestone 72; no
+      5th-or-later argument, no standalone call-as-statement, no `break`/
+      `continue`, no unary minus, no additional C types, no
+      arrays/pointers, no preprocessor, no comparison chaining, no bare
+      `else if` (all unchanged from prior milestones' own disclosed scope
+      cuts); the `fs.rs` 8-entry directory cap, the trailing
+      `leave; ret`/`sys_exit` safety backstop for a missing `return`, the
+      `fs.rs` self-test reused-disk directory-already-exists gap
+      (permissions/symlinks), and the `stdiotest.elf` O_TRUNC gap
+      Milestone 70/62/61 respectively already disclosed are all still
+      real and unfixed, untouched by this milestone. The natural next
+      Tier 3 milestone: forward calls and mutual recursion (real
+      forward-patch call-site machinery, generalizing `if`/`else`'s own
+      `jz`/`jmp` forward-patch technique to `call` sites -- Milestone 72's
+      own closing disclosure already named this, still unattempted), or
+      growing the grammar itself (arrays/pointers, more C types, unary
+      minus/`&&`/`||`) -- either a legitimate next dependency-ordered
+      step, not attempted here.
+
 ## Building and running
 
 Requires:

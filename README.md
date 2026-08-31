@@ -4269,6 +4269,156 @@ self-test suite, genuinely open for a future pass.
       loops, or continue toward function parameters/calls now that both
       comparisons and control flow are real.
 
+- [x] **Milestone 71**: Tier 3's fifth slice -- real `while`-loop control
+      flow, with genuine backward-jump x86_64 codegen -- exactly the
+      increment Milestone 70's own closing disclosure named ("while-loops
+      (backward jumps, reusing this same forward-patch machinery) are the
+      natural next Tier 3 grammar increment"), picked over function
+      parameters/calls because it is the smaller, cleanly-dependency-
+      ordered step: Milestone 70's forward-patched `jz`/`jmp` machinery
+      already covers a loop's own "exit when the condition is false"
+      branch unchanged, and the one genuinely new piece is a single
+      additional real encoding -- an unconditional jump BACKWARD to an
+      already-emitted target -- not a new codegen strategy. Function
+      parameters/calls need a real calling convention and per-function
+      stack frames, a substantially bigger step, deliberately left for
+      its own milestone.
+
+      **Grammar added** (see `tools/cc_src/main.rs`'s own top doc comment
+      for the full BNF): `while_stmt := "while" "(" cond_expr ")" "{"
+      stmt* "}"`, added to `stmt`'s alternatives alongside decl/assign/
+      return/if. Deliberately no `break`/`continue` (a real, disclosed
+      scope cut) -- the only way out of a loop is its own condition going
+      false, or an early `return` from inside the body (already legal:
+      `return_stmt` is an ordinary `stmt`, usable anywhere `stmt*`
+      appears, including inside a `while` body, unchanged from Milestone
+      68). `StmtNode` gained no new fields: `STMT_WHILE` reuses `expr` for
+      its condition (the same field STMT_IF's condition already uses) and
+      `then_body` for its loop body (the same field STMT_IF's then-branch
+      already uses) -- `else_body` stays unused/0, real field-reuse-over-
+      new-field discipline, not an oversight. `collect_vars_rec()` gained
+      a matching `STMT_WHILE` case so a variable declared inside a loop
+      body still gets a real stack slot, the same reasoning Milestone 70
+      already established for if/else branches.
+
+      **Real codegen**: `gen_stmt_list()`'s new `STMT_WHILE` arm captures
+      `loop_top = buf.len` BEFORE emitting the condition (so each
+      iteration genuinely re-evaluates it, not a cached truthiness),
+      emits the condition via the completely unchanged `gen_expr()`, a
+      `test rax, rax`, a forward-patched `jz` to the loop's exit (Milestone
+      70's own `emit_jz_placeholder()`/`patch_rel32()`, reused byte-for-
+      byte), the loop body via the completely unchanged `gen_stmt_list()`
+      recursion, then the one real new encoding this milestone adds:
+      `CodeBuf::emit_jmp_back(loop_top)` -- an unconditional `jmp rel32`
+      (same `0xE9` opcode `emit_jmp_placeholder()` already uses for
+      if/else's skip-the-else jump) whose target is already known and
+      already-emitted at the point of the call, so the `rel32` displacement
+      is computed and written in a single pass with no placeholder/later-
+      patch step needed -- the first BACKWARD jump this codegen has ever
+      emitted, every prior jump (if/else's jz/jmp) being a forward
+      reference. The standard "condition-at-top" while-loop shape,
+      independently checked against real rustc/gcc `-O0` output before
+      writing it, the same discipline Milestone 70's own if/else codegen
+      used.
+
+      **Real verification loop**: `cargo build` from the repo root, then
+      the project's own pinned-nightly `rustc` recipe (unchanged, see
+      `tools/cc_src/README.md`) to rebuild `kernel/assets/cc.elf` (grown
+      from Milestone 70's 24112 bytes to 27112; the real number that
+      matters for the page cap, the one `PT_LOAD` segment's own
+      `p_memsz`, is 19529 bytes -- 5 pages, inspected directly via the
+      ELF program header rather than inferred from file size -- still
+      comfortably under Milestone 70's now-64-page per-segment cap, so
+      **no cap change was needed this milestone**, unlike Milestone 70's
+      own real 4->64/16->128 raise), then two real QEMU boots
+      (`SPIKELING_QEMU_MONITOR_PORT` set, the kernel's own real
+      monitor-port mechanism, `quit` sent once the boot reached its own
+      steady-state `hlt_loop` after Milestone 25's line) -- one genuinely
+      fresh-disk boot (`target/persist.img`/`persist2.img` deleted first)
+      and one immediately-following boot reusing that same disk,
+      unmodified. Quoted from the fresh-disk boot's own serial log
+      (`m71_fresh_boot.log`; condensed from the raw per-syscall trace this
+      run captured -- see that file for the full, uncondensed
+      `milestone 31: syscall WRITE` record of every byte, hardware-
+      recorded CPL included):
+      ```
+      milestone 71: cc while-loops (real backward-jump codegen) starting
+      case19_while_sum_1_to_5_returns_15=PASS
+      case20_while_zero_iterations_returns_99=PASS
+      case21_if_nested_in_while_returns_1=PASS
+      case22_real_elf_exec_while_sum_1_to_5_returns_15=PASS
+      OVERALL_M71=PASS
+      ```
+      CASE 19 hand-verifies the ordinary path (1+2+3+4+5=15, both the
+      backward `jmp` and the forward exit `jz` genuinely taken multiple/
+      once respectively); CASE 20 hand-verifies the zero-iteration edge
+      case (condition false on the very first check -- `sum` stays 99,
+      the loop body and the backward jump never execute at all); CASE 21
+      hand-verifies an `if` nested inside a `while` (Milestone 70 and 71
+      control flow combined and independently patched in one program --
+      `count` incremented exactly once, when `i==3`); CASE 22 re-runs
+      CASE 19's own source through the real on-disk-ELF + kernel `exec()`
+      + `wait()` path Milestone 69 established (reusing CASE 8/10/17/18's
+      own `ccout1` path -- by CASE 22's turn in the boot, CASE 18's own
+      child has already exec()'d and exited, so it's again an ordinary,
+      unopened file), the strongest verification this tier has. Directly
+      quoted from that same boot, the real kernel-side `exec()` teardown
+      and `wait()` reap backing CASE 22's own PASS: `milestone 45: syscall
+      EXEC (process 14) -- ... REAL teardown-and-rebuild from 'ccout1'
+      (248 real ELF bytes read from the on-disk filesystem) ...` and
+      `milestone 43: syscall WAIT (process 3) -- child pid 14 ran to
+      completion and was reaped (real exit code 15), CR3 restored to
+      parent's own pml4 0x135000` -- the hand-predicted exit code (15)
+      matched by the kernel's own real `wait()` syscall, not just a
+      returned-cleanly check. In the same boot: `OVERALL=` PASS x4
+      (Milestones 1-66's own aggregate checks), `OVERALL_M68=PASS`,
+      `OVERALL_M69=PASS`, `OVERALL_M70=PASS`, `fs self-test: permissions
+      OVERALL=PASS`, `fs self-test: symlinks OVERALL=PASS`,
+      `fread_real_buffering=PASS` (real on a genuinely fresh disk), zero
+      `kernel panicked`/`panicked at`, zero unhandled `DOUBLE FAULT`/
+      `TRIPLE FAULT` anywhere in the log (`grep -c` confirmed 0).
+      Independently re-confirmed on the immediately-following reused-disk
+      boot (`m71_reused_boot.log`): identical `OVERALL_M71=PASS` with all
+      four cases individually `PASS`, the same real CASE 22 `exec()`/
+      `wait()` teardown-and-reap unchanged, zero panics/unhandled
+      exceptions -- the only failures in that second boot were the SAME
+      two pre-existing, already-disclosed reused-disk gaps Milestone 70's
+      own entry already named (`stdiotest.elf`'s `fread_real_buffering=
+      FAIL`, the Milestone 61 O_TRUNC gap; `fs self-test: permissions`/
+      `symlinks` both `OVERALL=FAIL`, the Milestone 62-era
+      `permtestdir`/`symtestdir` fixture-cleanup gap) -- neither touched
+      or caused by this milestone, both real and unfixed, exactly as
+      before. `tasklist` confirmed zero `qemu-system-x86_64.exe`
+      processes after each boot in this session (both instances stopped
+      cleanly via their own real monitor-port `quit`, independently
+      re-checked with `tasklist` each time). No evidence of concurrent
+      editing found: `git status`/`git diff --stat` checked before and
+      after this milestone's own work matched the same pre-existing
+      modified/untracked file set throughout, with only this milestone's
+      own edits (`tools/cc_src/main.rs`, `tools/cc_src/README.md`,
+      `kernel/assets/cc.elf`, this README.md entry, and the two new
+      `m71_*.log` verification logs) layered on top.
+
+      **Still genuinely open**: no `break`/`continue` (this milestone's
+      own disclosed scope cut, see the grammar section above); no unary
+      minus, no additional C types, no function parameters/calls/multiple
+      functions, no arrays/pointers, no preprocessor (all unchanged from
+      Milestone 67's own grammar); no comparison chaining and no bare
+      `else if` (Milestone 70's own disclosed scope cuts, unchanged); the
+      `fs.rs` 8-entry directory cap is real and unraised (CASE 22 reuses
+      CASE 8/10/17/18's own `ccout1` path, same real reason CASE 10's own
+      doc comment already gives); the trailing `leave; ret`/`sys_exit`
+      safety backstop for a missing `return` is unchanged from Milestone
+      68's own disclosed gap; the `fs.rs` self-test reused-disk directory-
+      already-exists gap (permissions/symlinks) and the `stdiotest.elf`
+      O_TRUNC gap Milestone 70/61 respectively already disclosed are both
+      still real and unfixed, untouched by this milestone. The natural
+      next Tier 3 milestone: function parameters/calls -- now that
+      arithmetic, comparisons, if/else, and while-loops are all real, a
+      single-function subset-C program can express real, nontrivial
+      control flow, but still cannot factor any of it into more than one
+      function; that is the next genuinely bigger step (a real calling
+      convention and per-function stack frames), not attempted here.
 ## Building and running
 
 Requires:

@@ -5874,6 +5874,55 @@ self-test suite, genuinely open for a future pass.
       own disk-anomaly detector or `hetero_stdp.rs`'s own plasticity
       work -- this module is self-contained, touching neither.
 
+- [x] **Milestone 81**: real 8-bit multi-bit AND/OR/XOR/NOT, scaling
+      Milestone 80's single-bit gates the same way real hardware
+      scales single-bit logic to a multi-bit word: 8 INDEPENDENT
+      parallel 1-bit gate circuits, one per bit position (a real
+      bit-sliced architecture, not one gate that somehow "knows" about
+      8 bits). `gate_and8()`/`gate_or8()`/`gate_xor8()`/`gate_not8()`
+      each loop over the 8 bit positions of their `u8` operand(s),
+      extract each bit, run the exact same Milestone 80 single-bit
+      circuit (`gate_and()`/`gate_or()`/`gate_xor()`/`gate_not()`,
+      unchanged) on it, and reassemble the result bit-by-bit -- 8x20
+      real LIF neuron-steps per AND/OR/NOT8 call, 8x(4 neurons x 20
+      steps) for XOR8's own real per-bit 4-neuron composition.
+
+      **Real, measured result** (two identical fresh QEMU boots,
+      `bios`, byte-identical `milestone 81:` output both times): 8 real
+      hand-computed test pairs (0x00/0x00, 0xFF/0xFF, 0xFF/0x00,
+      0x0F/0xF0, 0xAA/0x55, 0xAA/0xAA, 0x3C/0xC3, 0x12/0x34 -- chosen
+      for real coverage: all-zero, all-one, alternating bits, nibble
+      patterns, one arbitrary combined value) verified against real
+      hand-computed `a&b`/`a|b`/`a^b` for AND8/OR8/XOR8, plus 5 real
+      values for NOT8 -- every one matched exactly on the first real
+      boot, same as Milestone 80's own first-try result. `OVERALL_
+      M81=PASS`.
+
+      **Real, deliberate scope cut**: 8 real test pairs per operation,
+      not an exhaustive 65536-pair (256x256) sweep -- the same
+      hand-verified-representative-cases discipline every
+      `tools/cc_src` CASE test already uses, not brute-force
+      exhaustion, and a real, disclosed choice, not an oversight.
+
+      **Verified**: `cargo build --target x86_64-unknown-none` clean,
+      no warnings. Two full QEMU boots, `grep`-checked for
+      `FAIL`/`PANIC`: only the same pre-existing, already-disclosed
+      gaps every milestone since 70 has named; no new regressions;
+      `OVERALL_M77`/`OVERALL_M78`/`OVERALL_M79`/`OVERALL_M80` all still
+      PASS unchanged.
+
+      **Still genuinely open**: this kernel's own native word is 64
+      bits, not 8 -- scaling this same bit-sliced approach from 8 to 64
+      parallel gates per operation is a real, straightforward-looking
+      next step that is nonetheless genuinely UNTESTED at that scale,
+      not assumed to trivially work just because 8 did. No SHL8/SHR8
+      (Milestone 79's own compiler-side shift operators have no spiking
+      circuit equivalent here yet -- a real, different kind of circuit,
+      not a same-shape extension of AND/OR/XOR/NOT). Still no NAND/
+      NOR/XNOR, still no feedback into either `hetero_ensemble.rs` or
+      `hetero_stdp.rs`, same disclosed gaps Milestone 80 named,
+      unchanged by this milestone.
+
 ## Building and running
 
 Requires:

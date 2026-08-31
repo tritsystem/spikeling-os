@@ -5321,6 +5321,161 @@ self-test suite, genuinely open for a future pass.
       C types) or raising `MAX_FUNCS`/`MAX_PARAMS` -- both legitimate
       next dependency-ordered steps, not attempted here.
 
+- [x] **Milestone 76**: Tier 3's tenth slice -- real grammar growth: unary
+      minus and the two real short-circuit logical operators `&&`/`||`.
+      Picked over the other real dependency-ordered candidate (raising
+      `MAX_FUNCS`/`MAX_PARAMS` past 4) after checking both against this
+      kernel's actual current code, not just prior README wording:
+      `MAX_FUNCS`/`MAX_PARAMS`=4 has not yet blocked a single real test
+      program this toolchain has tried to express, so raising it now would
+      be speculative headroom with no concrete program driving it, while
+      unary minus and `&&`/`||` are grammar gaps Milestones 73/74/75's own
+      "still genuinely open" disclosures each independently re-named,
+      unchanged, three milestones running -- the older, more consistently
+      deferred of the two real candidates. Also weighed against and passed
+      over: arrays/pointers (real memory-addressing codegen beyond simple
+      rbp-relative locals, a substantially bigger step needing its own
+      honestly scoped slice) and additional C types (this subset's `int`
+      is this kernel's own native 64-bit machine word throughout gen_expr()
+      -- see its own "value in RAX" postcondition -- so a second type would
+      need real width-tracking through every AST node and codegen path,
+      not a small addition either).
+
+      **The real grammar addition** (`tools/cc_src/main.rs`'s own top doc
+      comment has the complete derivation):
+      ```
+      unary       := "-" unary | factor
+      term        := unary (("*" | "/") unary)*
+      logic_and   := cond_expr ("&&" cond_expr)*
+      logic_or    := logic_and ("||" logic_and)*
+      ```
+      `factor` (INTLIT | IDENT | IDENT "(" args? ")" | "(" cond_expr ")")
+      and `cond_expr` (Milestone 70's single, deliberately non-chaining
+      relop) are both completely UNCHANGED -- `unary` slots in directly
+      above `factor`, so unary minus binds tighter than `*`/`/` and,
+      transitively, tighter than binary `+`/`-` too; `logic_and`/
+      `logic_or` wrap `cond_expr` as two new real top-level layers, `&&`
+      binding tighter than `||`, both binding looser than any comparison
+      -- checked against real C's own operator-precedence table before
+      picking this exact layering, not guessed. `parse_logic_or()` (not
+      the narrower `parse_cond_expr()` Milestone 70 originally wired them
+      to) is now what every assign_stmt/return_stmt/if_stmt/while_stmt
+      condition, call argument, and parenthesized sub-expression actually
+      calls -- a real, deliberate widening of what a "condition" or
+      "value" can be, the same kind of widening Milestone 70's own
+      factor-recurses-through-cond_expr change already established as
+      this codegen's own precedent for growing an expression grammar's
+      top layer without touching any lower one. Two new lexer tokens
+      (`TOK_ANDAND`/`TOK_OROR`, same two-char-lookahead shape as the four
+      comparison operators); a lone `&` or `|` remains a real, deliberate
+      `UnknownChar` -- this subset still has no bitwise operators at all.
+
+      **The one real codegen subtlety this milestone did NOT shortcut**:
+      `&&`/`||` genuinely SHORT-CIRCUIT (`gen_expr()`'s own `EXPR_BINARY`
+      arm, `kernel/assets` build source), reusing the exact same
+      `emit_jz_placeholder()`/`emit_jmp_placeholder()`/`patch_rel32()`
+      forward-patch machinery Milestone 70/71 already built for if/else
+      and while, rather than the easy-but-wrong fake of evaluating both
+      operands unconditionally and combining them with a bitwise AND/OR.
+      That shortcut would have been WRONG C semantics, not merely an
+      unoptimized correct answer: a right operand containing a function
+      call must genuinely not execute once the left operand already
+      decides the result -- checked directly against the C standard's own
+      "`&&`/`||` are sequence points; the second operand is evaluated only
+      if needed" rule before writing this, not assumed. `a && b` evaluates
+      `a`, and only when `a` is true does it evaluate `b` (jumping straight
+      to a false result otherwise); `a || b` evaluates `a`, and only when
+      `a` is false does it evaluate `b` (jumping straight to a true result
+      otherwise) -- both normalize their final result to a clean 0/1 via
+      the existing `setne al`/`movzx eax, al` idiom OP_NE already
+      established, exactly real C's own `&&`/`||` result type (`1 && 5` is
+      `1`, not `5`). Unary minus needed exactly one new real CodeBuf
+      encoding (`emit_neg_rax()`, `neg r/m64`, REX.W F7 /3); `&&`/`||`
+      needed zero new encodings, only existing primitives composed into
+      two new real branching shapes -- every byte hand-verified against
+      the Intel SDM's own encoding tables, the same discipline every prior
+      milestone's own CodeBuf methods already used.
+
+      **Real, end-to-end verification**, two new self-test cases: CASE 35
+      (the in-process Callable path -- unary minus combined with `&&` and
+      an existing comparison, `int main() { int a; a = -3; int r; if (a <
+      0 && a > -10) { r = 1; } else { r = 0; } return r + -a; }`,
+      hand-computed `r + -a` = `1 + 3` = `4`, including unary minus applied
+      to an IDENT operand, not just an INTLIT) and CASE 36 (the real
+      on-disk-ELF + kernel `exec()`+`wait()` path -- this milestone's own
+      strongest verification tier, same precedent as every milestone since
+      69 -- `||`'s own real short-circuit behavior, unary minus used as a
+      CALL ARGUMENT (`classify(-5)`), and a function call inside `||`'s
+      own right operand, proving that operand is ordinary executable code,
+      not a restricted sub-grammar: `int classify(int x) { if (x < 0 || x
+      > 100) { return 0; } else { return 1; } } int main() { return
+      classify(-5) + classify(50) + classify(200); }`, hand-computed
+      `0 + 1 + 0` = `1`). Quoted directly from the fresh-disk boot's own
+      serial log (`m76_fresh_boot.log`):
+      ```
+      milestone 76: cc unary-minus and short-circuit &&/|| verification starting
+      case35 (unary minus + && + comparison, in-process) returned=4 (expected 4)
+      case35_unary_minus_and_logical_and_returns_4=PASS
+      real on-disk ELF written, real fork()+exec()+wait() -- child exited=true real exit code=1 (expected exited=true code=1)
+      case36_real_elf_exec_logical_or_shortcircuit_returns_1=PASS
+      OVERALL_M76=PASS
+      ```
+      In the same boot: `OVERALL=` PASS x4 (Milestones 1-66's own
+      aggregate checks), `OVERALL_M68` through `OVERALL_M75` all
+      independently re-confirmed PASS, `fs self-test: permissions
+      OVERALL=PASS`, `fs self-test: symlinks OVERALL=PASS`,
+      `fread_real_buffering=PASS`/`eof_semantics=PASS` (both real on a
+      genuinely fresh disk), zero `EXCEPTION: DOUBLE FAULT`/`EXCEPTION:
+      TRIPLE FAULT` and zero `panicked at`/`kernel panicked` anywhere in
+      the log (checked case-sensitively via `grep -a -c` against the raw
+      serial log, per Milestone 72/75's own caught-and-fixed methodology
+      discipline -- content-based checks, not line-position diffing).
+      Independently re-confirmed on the immediately-following reused-disk
+      boot (`m76_reused_boot.log`): identical `case35_...=PASS`,
+      `case36_...=PASS`, `OVERALL_M76=PASS`, `OVERALL_M68` through
+      `OVERALL_M75` all still PASS, zero panics/unhandled exceptions
+      (re-checked the same case-sensitive way) -- the only failures in
+      that second boot were the SAME two pre-existing, already-disclosed
+      reused-disk gaps every milestone since 70 has named
+      (`fs self-test: permissions`/`symlinks` both `OVERALL=FAIL`, the
+      Milestone 62-era fixture-cleanup gap; `stdiotest.elf`'s own true
+      final `OVERALL=FAIL`, with `fread_real_buffering=FAIL`/
+      `eof_semantics=FAIL` individually confirmed as its real cause, the
+      Milestone 61 O_TRUNC gap) -- neither touched nor caused by this
+      milestone, both real and unfixed, exactly as before. `cc.elf` grew
+      from Milestone 75's 39664 bytes to 42856 bytes; the real `PT_LOAD`
+      segment `p_memsz` (inspected directly via `readelf -l` against the
+      ELF program header, not inferred from file size) is 33110 bytes -- 9
+      pages, up from Milestone 75's 8, still comfortably under the
+      64-page per-segment cap and 128-page total cap, so **no cap change
+      was needed this milestone**. `tasklist` confirmed zero
+      `qemu-system-x86_64.exe` processes both before this milestone's own
+      work began and after each of the two boots above (each stopped
+      cleanly via its own real monitor-port `quit`, independently
+      re-checked with `tasklist` each time). No evidence of concurrent
+      editing found: `git status`/`git diff --stat -- kernel/src` checked
+      both before this milestone's own work began and after it finished
+      showed the exact same pre-existing modified/untracked file set with
+      IDENTICAL per-file insertion/deletion counts throughout -- this
+      milestone touches only `tools/cc_src/main.rs` (an untracked source
+      file), the untracked `kernel/assets/cc.elf` it builds, and this
+      README; `kernel/src/*` was never touched at all.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each,
+      unraised, the real next candidate); no arrays/pointers, no
+      additional C types (both real, substantially bigger steps, not
+      attempted here); no bitwise operators (`&`, `|`, `^`, `~`, `<<`,
+      `>>`) -- a real, newly-visible gap this milestone's own lexer change
+      makes slightly more apparent, since `&`/`|` are now lexed at all,
+      just only as the first half of `&&`/`||`; no logical NOT (`!` alone
+      is still only legal as the first half of `!=`, unchanged since
+      Milestone 70 -- `!x` is not directly expressible, though `x == 0`
+      already covers the same real ground for this subset's own
+      boolean-as-int convention); this kernel still gives every process
+      exactly ONE 4 KiB stack page, completely untouched by this
+      milestone -- a pure userspace toolchain change, unlike Milestone
+      75's own kernel-side diagnostic.
+
 ## Building and running
 
 Requires:

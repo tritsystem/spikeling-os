@@ -1405,6 +1405,97 @@
 // concept and no bounds/validity checking on any dereference (the same
 // standing gap every pointer milestone since 109 has carried, for the
 // same reasons).
+//
+// MILESTONE 113: `char *` crossing a real function-call boundary --
+// parameters AND return values -- for the first time, the exact
+// candidate Milestone 112's own closing disclosure named ("a future
+// milestone extending `char *` across a call boundary ... would likely
+// need real, declared-type tracking through `ParamInfo`/`FuncDef`,
+// which does not exist today for ANY type in this codegen"), the same
+// step Milestone 110 already took for `int *` after Milestone 109.
+// Grammar delta:
+//   param       := ("int" "*"? | "char" "*"?) IDENT | ... (unchanged otherwise)
+//   function    := ("int" "*"? | "char" "*"?) IDENT "(" params? ")" ...
+// (both `*`s optional after EITHER keyword now; previously `char`'s own
+// `*` was only legal in a local `decl_stmt`, never here).
+//
+// **The one genuinely new field**: `ParamInfo::is_char_ptr` (a new `u8`
+// on a struct that, until now, had exactly one field, `is_char`) --
+// `parse_params()`'s own `char` arm now checks for a following `*`
+// exactly the way its `int` arm already did (Milestone 110), but for
+// `char` this genuinely changes what gets recorded: a `char *p`
+// parameter must end up with `is_char == 0` (its OWN value is an
+// address, never narrowed on read) and `is_char_ptr == 1` (a
+// dereference `*p` through it should narrow) -- the identical
+// `is_char`/`is_char_ptr` split `VarSlot` has carried for a LOCAL `char
+// *` since Milestone 112, now reaching a parameter's own `ParamInfo` for
+// the first time. `collect_vars_for_function()` threads `p.is_char_ptr`
+// straight into the parameter's own `VarSlot` (previously hardcoded 0,
+// per Milestone 112's own explicit "always 0 for a parameter" comment,
+// now genuinely variable) -- the ONLY codegen change this milestone
+// makes anywhere. `EXPR_UNARY`'s own `OP_DEREF` arm (Milestone 112)
+// already reads this field generically through `find_var()`, with zero
+// awareness of whether a given `VarSlot` came from a parameter or a
+// local declaration, so a parameter's own `*p` narrows correctly with
+// literally no change at that call site -- exactly the "accepting the
+// grammar plus threading the one flag IS the complete feature" shape
+// Milestone 110 already established for `int *` crossing a call
+// boundary. `int *` itself needs no equivalent new field (unchanged from
+// Milestone 110): an `int *` parameter's `VarSlot` is already
+// `is_char: 0, is_char_ptr: 0`, the correct shape for "an ordinary,
+// unnarrowed 8-byte pointer value" with no dedicated flag needed at all.
+//
+// **The return-type half needs no new field either** -- `parse_function()`'s
+// own `char` branch now also checks for a following `*`, but the
+// EXISTING `is_char_return: bool` already asked exactly the right
+// question ("narrow this function's return value on the way out?"):
+// `char *f(...)` sets it `false` (a pointer return, whether to `int` or
+// `char`, must never be narrowed -- narrowing would sign-extend the
+// returned ADDRESS's own low byte into a corrupted, essentially random
+// address, not merely give back a wrong VALUE), the identical treatment
+// `int *f(...)` already got from Milestone 110. `STMT_RETURN`'s own
+// codegen (unchanged) still just checks the one boolean.
+//
+// **Zero new x86_64 encodings**: this milestone is pure grammar-plus-one-
+// field-threading, the same "real capability, zero new machine code"
+// shape Milestone 110 already achieved for `int *` crossing a call
+// boundary -- every encoding this milestone's own new test cases exercise
+// (register/stack argument passing, RAX-based return, the narrowing
+// `emit_movsx_rax_mem_rax_byte()` load) was already hand-verified by an
+// earlier milestone (107, 110, 112 respectively).
+//
+// **A real, disclosed, newly-REACHABLE instance of an old restriction**:
+// Milestone 112's own `*p` narrowing is recognized only when the
+// dereferenced operand is syntactically a plain `EXPR_IDENT` -- in
+// Milestone 112's own scope this cost nothing reachable (no `char *`
+// return value existed, so a call result could never even be the operand
+// of `*`). THIS milestone makes `char *f(...)` a real return type, so
+// `*f(&c)` -- dereferencing a call result DIRECTLY, with no intervening
+// local-variable assignment -- is now a real, reachable program for the
+// first time, and it falls through to the ordinary un-narrowed load,
+// exactly like any other non-IDENT dereference operand already does.
+// This milestone does not resolve that restriction (see CASE 106 below
+// for the real, measured proof, not just an assumed claim) -- narrowing
+// a call result directly would need `gen_expr()`'s own `EXPR_CALL` arm to
+// carry pointee-type information forward, real new plumbing genuinely out
+// of scope here, honestly disclosed rather than silently left implicit
+// or papered over with a case that avoids exercising it.
+//
+// Scope, deliberately real and disclosed: exactly the two grammar
+// positions named above, nothing broader -- still no `char **` anywhere;
+// still no array-to-pointer decay to a `char *` (no `char[]` exists to
+// decay from, so unlike `int *`/array parameters there is no equivalent
+// of Milestone 110's own `sum3(arr)`-style decay case here); still no
+// pointer arithmetic; still no `int name[]`/`char name[]` bracket-array
+// parameter sugar; still no `p[idx]` byte-scaled indexing through a
+// `char *` (Milestone 112's own disclosed gap, untouched, now ALSO
+// reachable through a parameter -- `EXPR_INDEX`/`STMT_ASSIGN_INDEX` are
+// just as untouched by THIS milestone as they were by 112); still no
+// `*p += 1;`-style compound assignment through any pointer; still no type
+// system of any kind, so a mismatched `char *`/`int *` argument or return
+// is accepted without complaint exactly as every other shape mismatch
+// already silently is; still no NULL-pointer concept and no
+// bounds/validity checking on any dereference.
 #![no_std]
 #![no_main]
 
@@ -2270,6 +2361,19 @@ struct ParamInfo {
     // incoming register) -- only `EXPR_IDENT`'s existing narrowed-read
     // path (Milestone 102) is what makes this real.
     is_char: u8,
+    // MILESTONE 113: 1 if this parameter was declared `char *`, 0
+    // otherwise -- the real "declared-type bit" `collect_vars_for_
+    // function()`'s own Milestone 112 doc comment named as the missing
+    // piece for extending `char *` across a function-call boundary (it
+    // did not exist on this struct until now). Deliberately a SEPARATE
+    // field from `is_char` above, not a reuse: a `char *p` parameter's
+    // own resulting `VarSlot` must have `is_char == 0` (its OWN value is
+    // an address, never narrowed on read -- the same real, disclosed
+    // `is_char`/`is_char_ptr` distinction `VarSlot` itself has carried
+    // since Milestone 112) and `is_char_ptr == 1` (a dereference `*p`
+    // through it should narrow) -- `parse_params()` sets exactly one of
+    // `is_char`/`is_char_ptr`, never both, for any single parameter.
+    is_char_ptr: u8,
 }
 
 /// MILESTONE 72: the maximum number of parameters a single function may
@@ -3972,28 +4076,47 @@ impl Parser {
                 unsafe { self.expect(TOK_INT) }?;
                 false
             };
-            // MILESTONE 110: an optional `*` right after `int` (never
-            // after `char` -- pointers to `char` are out of scope, the
-            // same restriction every other `char` limitation in this
-            // file already carries) marks a POINTER parameter --
-            // `int *p`. This needs no new `ParamInfo` field and no
-            // codegen change of any kind: a pointer parameter is
-            // register/stack-passed exactly like an ordinary scalar
-            // `int` (Milestone 109's own "a pointer's runtime value is
-            // just another 8-byte value" design point, now reaching one
-            // more real call site) -- `collect_vars_for_function()`'s
-            // own Milestone 110 doc comment has the full reasoning for
-            // why its resulting `VarSlot` is `is_array: 0` either way.
-            // The token is simply consumed; nothing downstream needs to
-            // know it was there.
-            if !is_char && unsafe { self.peek() }.kind == TOK_STAR {
+            // MILESTONE 110: an optional `*` right after `int` marks a
+            // POINTER parameter -- `int *p`. This needs no new
+            // `ParamInfo` field and no codegen change of any kind: a
+            // pointer parameter is register/stack-passed exactly like an
+            // ordinary scalar `int` (Milestone 109's own "a pointer's
+            // runtime value is just another 8-byte value" design point,
+            // now reaching one more real call site) --
+            // `collect_vars_for_function()`'s own Milestone 110 doc
+            // comment has the full reasoning for why its resulting
+            // `VarSlot` is `is_array: 0` either way. The token is simply
+            // consumed; nothing downstream needs to know it was there.
+            //
+            // MILESTONE 113: the same optional `*`, now ALSO accepted
+            // right after `char` -- `char *p`, the exact grammar position
+            // Milestone 112's own closing disclosure named as needing "a
+            // real, declared-parameter-type bit through `ParamInfo`,
+            // which does not exist today." Unlike the `int *` case above,
+            // this one DOES need a new `ParamInfo` field
+            // (`is_char_ptr`, just added): a `char *` parameter's own
+            // resulting `VarSlot` must end up with `is_char == 0` (its
+            // OWN value, the address, is never narrowed on read) and
+            // `is_char_ptr == 1` (a dereference `*p` through it should
+            // narrow) -- genuinely different `VarSlot` shape than a plain
+            // `char` parameter (`is_char == 1`, `is_char_ptr == 0`), so
+            // `is_char` is deliberately reset to `false` here the moment
+            // a `*` is seen after `char`, rather than left `true` and
+            // combined with a second flag.
+            let mut is_char = is_char;
+            let mut is_char_ptr = false;
+            if unsafe { self.peek() }.kind == TOK_STAR {
                 unsafe { self.advance() };
+                if is_char {
+                    is_char = false;
+                    is_char_ptr = true;
+                }
             }
             let name = unsafe { self.expect(TOK_IDENT) }?;
             if count as u64 >= MAX_PARAMS {
                 return Err(ParseError::TooManyParams);
             }
-            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 } }) };
+            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 }, is_char_ptr: if is_char_ptr { 1 } else { 0 } }) };
             count += 1;
             if unsafe { self.peek() }.kind == TOK_COMMA {
                 unsafe { self.advance() };
@@ -4024,7 +4147,30 @@ impl Parser {
         // for how `is_char_return` reaches codegen from here.
         let is_char_return = if unsafe { self.peek() }.kind == TOK_CHAR {
             unsafe { self.advance() };
-            true
+            // MILESTONE 113: an optional `*` right after `char` (before
+            // the function's own name) marks a `char *` return type --
+            // `char *f(...)`, the exact grammar position Milestone 110
+            // already opened for `int *` and Milestone 112's own closing
+            // disclosure named as still missing for `char *`. Exactly the
+            // same reasoning as the `int *` branch below applies here:
+            // `STMT_RETURN`'s codegen only narrows when `is_char_return`
+            // is set, and a POINTER return -- whether to `int` or to
+            // `char` -- must never be narrowed (RAX already holds the
+            // correct raw 8-byte address; narrowing it would corrupt the
+            // address itself, not just the value it points to), so
+            // leaving `is_char_return` false when a `*` follows `char` is
+            // the complete, correct implementation. No new `FuncDef`
+            // field needed: `is_char_return` already meant "narrow this
+            // function's return value," which was already exactly the
+            // right question to ask regardless of whether the return
+            // type is a scalar `int`, a scalar `char`, an `int *`, or now
+            // a `char *`.
+            if unsafe { self.peek() }.kind == TOK_STAR {
+                unsafe { self.advance() };
+                false
+            } else {
+                true
+            }
         } else {
             unsafe { self.expect(TOK_INT) }?;
             // MILESTONE 110: an optional `*` right after `int` (before
@@ -4678,15 +4824,29 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // slot as if it WERE the array (which would be wrong -- see
         // those two codegen arms' own doc comments for the full
         // derivation).
-        // MILESTONE 112: `is_char_ptr` is always 0 for a parameter -- this
-        // milestone deliberately does not extend `char *` across a
-        // function-call boundary (no `char *` parameters/returns), the
-        // same real, disclosed scope cut Milestone 109 itself used for
-        // `int *` before Milestone 110 later closed it; a future
-        // milestone extending `char *` across calls the way Milestone 110
-        // did for `int *` would need to thread a real declared-parameter-
-        // type bit through `ParamInfo` here, which does not exist today.
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: 0 }) };
+        // MILESTONE 112 (superseded by 113 below): `is_char_ptr` was
+        // always 0 for a parameter -- Milestone 112 deliberately did not
+        // extend `char *` across a function-call boundary (no `char *`
+        // parameters/returns), the same real, disclosed scope cut
+        // Milestone 109 itself used for `int *` before Milestone 110
+        // later closed it.
+        // MILESTONE 113: `is_char_ptr` now carries straight through from
+        // `p.is_char_ptr` (the real declared-parameter-type bit
+        // `parse_params()` now records -- see `ParamInfo::is_char_ptr`'s
+        // own doc comment), the exact "thread a real declared-parameter-
+        // type bit through `ParamInfo`" step Milestone 112's own closing
+        // disclosure (quoted above) named as the missing piece. A
+        // `char *p` parameter's own `VarSlot` now correctly ends up with
+        // `is_char: 0, is_char_ptr: 1` (mirroring the local-variable
+        // shape Milestone 112 already established), so `EXPR_UNARY`'s
+        // `OP_DEREF` arm -- which already reads this field generically
+        // through `find_var()`, with zero awareness of whether a given
+        // slot came from a parameter or a local declaration -- narrows a
+        // parameter's own `*p` correctly with NO codegen change at that
+        // call site at all, the same "accepting the grammar plus
+        // threading the one flag IS the complete feature" shape Milestone
+        // 110 already established for `int *` parameters.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr }) };
         n += 1;
         pi += 1;
     }
@@ -10951,7 +11111,194 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m112 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 113: `char *` crossing a real function-call boundary
+        // -- parameters AND return values -- the exact candidate
+        // Milestone 112's own closing disclosure named ("no `char *`
+        // function parameters or return values ... a future milestone
+        // ... would need to thread a real declared-parameter-type bit
+        // through `ParamInfo`, which does not exist today"), the same
+        // step Milestone 110 already took for `int *` after Milestone
+        // 109. See this file's own top Milestone 113 doc comment,
+        // `ParamInfo::is_char_ptr`'s own doc comment, and
+        // `collect_vars_for_function()`'s own Milestone 113 comment for
+        // the full grammar/codegen derivation. All four cases run
+        // in-process (`CodegenMode::Callable`), the same tier Milestone
+        // 107 through 112 all already used for their own new cases -- no
+        // new real `fork()`/`exec()`/`wait()` cycle is added by this
+        // milestone.
+        //
+        // CASE 103: the real, distinguishing proof that a `char *`
+        // PARAMETER's own dereference-read still genuinely narrows --
+        // not merely that a `char *` local does (Milestone 112's own
+        // CASE 100 already proved that). `p` is passed as a real
+        // argument, received as a real parameter, and `*p` is
+        // dereferenced entirely inside the CALLEE -- a buggy
+        // implementation that left `ParamInfo::is_char_ptr` unthreaded
+        // (the exact bug this milestone's own `collect_vars_for_
+        // function()` fix closes) would produce a parameter `VarSlot`
+        // with `is_char_ptr == 0`, silently falling back to the
+        // un-narrowed `int *`-style load and reading back the raw 200
+        // instead of -56.
+        //   int read_narrow(char *p) { return *p == -56; }
+        //   int main() {
+        //       char c; c = 200;
+        //       char *p = &c;
+        //       return read_narrow(p);
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC103: &[u8] = b"int read_narrow(char *p) { return *p == -56; } int main() { char c; c = 200; char *p = &c; return read_narrow(p); }";
+        let case103_result = compile_and_run_program_callable(SRC103.as_ptr() as u64, SRC103.len() as u64);
+        w(b"  case103 (char* parameter dereference-read narrows across a real call boundary, in-process) returned=");
+        if let Some(r) = case103_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case103_ok = case103_result == Some(1);
+        write_check(b"case103_char_ptr_param_deref_read_narrows_returns_1=", case103_ok);
+
+        w(b"\n");
+
+        // CASE 104: the real, distinguishing proof that a WRITE through a
+        // `char *` PARAMETER is genuine aliasing into the CALLER's own
+        // real stack slot, crossing a function-call boundary -- the same
+        // "read back through a DIFFERENT access path than the one that
+        // wrote it" distinguishing shape Milestone 112's own CASE 101
+        // already established for a local `char *`, and Milestone 110's
+        // own CASE 96 already established for `int *`, now proven for a
+        // `char *` PARAMETER specifically: `write_it()`'s own `*p = 200;`
+        // must land on the exact same bytes `main()`'s own `c` occupies,
+        // not a disconnected copy. The write side stays deliberately
+        // un-narrowed (Milestone 112's own design choice, unaffected by
+        // this milestone): `c` is read back DIRECTLY (not through `p`),
+        // narrowing 200 to -56 via the ordinary, unchanged `char`-scalar
+        // read path.
+        //   int write_it(char *p) { *p = 200; return 0; }
+        //   int main() {
+        //       char c; c = 5;
+        //       char *p = &c;
+        //       int r; r = write_it(p);
+        //       return c == -56;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC104: &[u8] = b"int write_it(char *p) { *p = 200; return 0; } int main() { char c; c = 5; char *p = &c; int r; r = write_it(p); return c == -56; }";
+        let case104_result = compile_and_run_program_callable(SRC104.as_ptr() as u64, SRC104.len() as u64);
+        w(b"  case104 (char* parameter write aliases the CALLER's real stack slot across a call boundary, in-process) returned=");
+        if let Some(r) = case104_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case104_ok = case104_result == Some(1);
+        write_check(b"case104_char_ptr_param_write_aliases_caller_returns_1=", case104_ok);
+
+        w(b"\n");
+
+        // CASE 105: the real, distinguishing proof that a `char *`
+        // RETURN type works correctly -- specifically, that
+        // `parse_function()`'s own new star-check leaves `is_char_return`
+        // FALSE for a `char *` return (mirroring `int *`'s own Milestone
+        // 110 return-type treatment), so the returned ADDRESS reaches the
+        // caller un-corrupted. A buggy implementation that left
+        // `is_char_return` TRUE for `char *identity_char(...)` (treating
+        // the leading `char` keyword alone as the whole signal, ignoring
+        // the following `*`) would apply `emit_movsx_rax_al()` to the
+        // returned ADDRESS itself, not a char VALUE -- sign-extending its
+        // own low byte into a completely different, essentially random
+        // address -- so `q` would hold a corrupted pointer and `*q` would
+        // almost certainly read the wrong memory entirely (not merely the
+        // wrong VALUE), the same "this would be caught, not silently
+        // wrong" property Milestone 110's own CASE 97 doc comment already
+        // reasoned about for the analogous `int *` case. The result is
+        // assigned to a local `char *q` first (an ordinary STMT_ASSIGN,
+        // unaffected by this milestone) and dereferenced through THAT
+        // plain IDENT, staying within the real, disclosed EXPR_IDENT-only
+        // shape restriction Milestone 112's own `*p` codegen already
+        // established (see CASE 106 immediately below for the real,
+        // disclosed asymmetry this restriction still leaves open now
+        // that it is newly reachable).
+        //   char *identity_char(char *p) { return p; }
+        //   int main() {
+        //       char c; c = 200;
+        //       char *q; q = identity_char(&c);
+        //       return *q == -56;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC105: &[u8] = b"char *identity_char(char *p) { return p; } int main() { char c; c = 200; char *q; q = identity_char(&c); return *q == -56; }";
+        let case105_result = compile_and_run_program_callable(SRC105.as_ptr() as u64, SRC105.len() as u64);
+        w(b"  case105 (char* RETURN type crosses a call boundary un-corrupted, dereferenced via a local pointer, in-process) returned=");
+        if let Some(r) = case105_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case105_ok = case105_result == Some(1);
+        write_check(b"case105_char_ptr_return_crosses_call_returns_1=", case105_ok);
+
+        w(b"\n");
+
+        // CASE 106: a real, deliberate, DISCLOSED negative case, not a
+        // regression -- the exact same "resolved by operand SHAPE, not
+        // attempted for every expression" restriction Milestone 112's own
+        // `*p` codegen already established (`e.left` must be a plain
+        // `EXPR_IDENT`; a call result `*f()` falls through to the
+        // ordinary full-width load) was UNREACHABLE in Milestone 112's
+        // own scope (no `char *` return values existed yet) but is
+        // genuinely REACHABLE for the first time in THIS milestone's own
+        // scope, now that a function may return `char *`. This milestone
+        // does NOT resolve that restriction (narrowing `*f()` directly
+        // would need `gen_expr()`'s `EXPR_CALL` arm itself to carry
+        // pointee-type information forward, real new plumbing out of
+        // scope here) -- this case exists to PROVE the real, measured
+        // behavior rather than merely assert it in prose: `*identity_
+        // char2(&c)` dereferences a CALL result directly, `e.left.kind ==
+        // EXPR_CALL`, not `EXPR_IDENT`, so `is_char_pointee` is `false`
+        // and the ordinary un-narrowed `emit_mov_rax_mem_rax()` runs,
+        // reading back the raw 200 (not -56) -- `200 == -56` is false, 0.
+        // A future milestone that closes this gap must also update this
+        // case's own expected value and doc comment; until then, this is
+        // a real regression tripwire on the disclosed gap's exact
+        // numeric fingerprint, the same "diffed for equality across
+        // milestones, not silently accepted either way" discipline the
+        // fs self-test's own known FAIL-line-count baseline already uses
+        // for a different pre-existing, disclosed artifact.
+        //   char *identity_char2(char *p) { return p; }
+        //   int main() {
+        //       char c; c = 200;
+        //       return *identity_char2(&c) == -56;
+        //   }
+        // Hand-computed (real, current, disclosed-gap behavior, NOT the
+        // morally "correct" narrowed answer): 0.
+        // -------------------------------------------------------------
+        const SRC106: &[u8] = b"char *identity_char2(char *p) { return p; } int main() { char c; c = 200; return *identity_char2(&c) == -56; }";
+        let case106_result = compile_and_run_program_callable(SRC106.as_ptr() as u64, SRC106.len() as u64);
+        w(b"  case106 (DISCLOSED GAP: *call() dereferencing a char*-returning call result directly does NOT narrow -- real, measured, not yet fixed, in-process) returned=");
+        if let Some(r) = case106_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 0 -- the real, disclosed, un-narrowed fallback, NOT a bug this milestone introduces)\n");
+        let case106_ok = case106_result == Some(0);
+        write_check(b"case106_char_ptr_call_result_deref_disclosed_gap_returns_0=", case106_ok);
+
+        w(b"\n");
+
+        let overall_m113 = case103_ok && case104_ok && case105_ok && case106_ok;
+        w(b"OVERALL_M113=");
+        w(if overall_m113 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 { 0 } else { 1 });
     }
 }
 

@@ -8415,6 +8415,203 @@ self-test suite, genuinely open for a future pass.
       exactly one real subscriber (Milestone 106) all remain exactly as
       Milestone 111 left them -- unrelated to this milestone.
 
+- [x] **Milestone 113**: `char *` crossing a real function-call boundary --
+      parameters AND return values -- for the first time
+      (`tools/cc_src/main.rs`) -- the exact candidate Milestone 112's own
+      closing disclosure named ("no `char *` function parameters or
+      return values ... a future milestone extending `char *` across a
+      call boundary ... would need to thread a real declared-parameter-
+      type bit through `ParamInfo`, which does not exist today"), the
+      same step Milestone 110 already took for `int *` after Milestone
+      109.
+
+      **Grammar delta**: both `*`s that were previously legal only after
+      `int` are now ALSO legal after `char`: `param := ("int" "*"? |
+      "char" "*"?) IDENT`, and a function's own leading return-type
+      keyword accepts the identical optional `*`. `parse_params()`'s
+      `char` arm and `parse_function()`'s `char` arm each gained the exact
+      one-token-lookahead check their `int` siblings already had since
+      Milestone 110.
+
+      **The one genuinely new field -- `ParamInfo::is_char_ptr`**: a new
+      `u8` on a struct that, until this milestone, had exactly one field
+      (`is_char`). A `char *p` parameter must end up with `is_char == 0`
+      (its OWN value is an address, never narrowed on read) and
+      `is_char_ptr == 1` (a dereference `*p` through it should narrow) --
+      the identical split `VarSlot` has carried for a LOCAL `char *` since
+      Milestone 112, now reaching a parameter's own `ParamInfo` for the
+      first time. `collect_vars_for_function()` threads `p.is_char_ptr`
+      straight into the parameter's own `VarSlot` -- previously hardcoded
+      0, per Milestone 112's own explicit "always 0 for a parameter"
+      comment, now genuinely variable -- the ONLY codegen change this
+      milestone makes anywhere. `int *` needs no equivalent field
+      (unchanged from Milestone 110): an `int *` parameter's `VarSlot` is
+      already `is_char: 0, is_char_ptr: 0`, the correct shape for an
+      ordinary unnarrowed 8-byte pointer with no dedicated flag at all.
+
+      **The return-type half needs no new field either**: `is_char_return:
+      bool` already asked exactly the right question ("narrow this
+      function's return value on the way out?") -- `char *f(...)` sets it
+      `false` (a pointer return must never be narrowed, whether to `int`
+      or `char`; narrowing would sign-extend the returned ADDRESS's own
+      low byte into a corrupted, essentially random address, not merely
+      give back a wrong value), the identical treatment `int *f(...)`
+      already got from Milestone 110. `STMT_RETURN`'s own codegen,
+      unchanged, still just checks the one boolean.
+
+      **Zero new x86_64 encodings**: pure grammar-plus-one-field-threading,
+      the same "real capability, zero new machine code" shape Milestone
+      110 already achieved for `int *` crossing a call boundary -- every
+      encoding this milestone's own new cases exercise (register/stack
+      argument passing, RAX-based return, the narrowing
+      `emit_movsx_rax_mem_rax_byte()` load) was already hand-verified by
+      an earlier milestone (107, 110, 112 respectively). `EXPR_UNARY`'s
+      own `OP_DEREF` arm (Milestone 112) already reads `is_char_ptr`
+      generically through `find_var()`, with zero awareness of whether a
+      given `VarSlot` came from a parameter or a local declaration, so a
+      parameter's own `*p` narrows correctly with literally no change at
+      that call site.
+
+      **A real, disclosed, newly-REACHABLE instance of an old
+      restriction**: Milestone 112's own `*p` narrowing is recognized only
+      when the dereferenced operand is syntactically a plain `EXPR_IDENT`
+      -- in Milestone 112's own scope this cost nothing reachable (no
+      `char *` return value existed, so a call result could never even be
+      the operand of `*`). This milestone makes `char *f(...)` a real
+      return type, so `*f(&c)` -- dereferencing a call result DIRECTLY,
+      with no intervening local-variable assignment -- is now a real,
+      reachable program for the first time, and it falls through to the
+      ordinary un-narrowed load exactly like any other non-`EXPR_IDENT`
+      dereference operand already does. Not resolved here (narrowing a
+      call result directly would need `gen_expr()`'s own `EXPR_CALL` arm
+      to carry pointee-type information forward, real new plumbing out of
+      scope) -- and, per this project's own "real, measured results only"
+      discipline, proven with an actual running case rather than merely
+      asserted in prose (CASE 106 below).
+
+      **New self-test cases**, all four run in-process
+      (`CodegenMode::Callable`), the same tier Milestone 107 through 112
+      all already used for their own new cases -- no new real
+      `fork()`/`exec()`/`wait()` cycle is added by this milestone: CASE
+      103 (`read_narrow(p)` -- the real, distinguishing proof that a
+      `char *` PARAMETER's own dereference-read still genuinely narrows,
+      not merely that a local one does, the exact bug an unthreaded
+      `ParamInfo::is_char_ptr` would produce; expected `1`); CASE 104
+      (`write_it(p)` -- the real, distinguishing proof that a WRITE
+      through a `char *` PARAMETER is genuine aliasing into the CALLER's
+      own real stack slot, the same "read back through a different access
+      path than the one that wrote it" shape Milestone 112's own CASE 101
+      and Milestone 110's own CASE 96 already established, now proven for
+      a `char *` parameter specifically; expected `1`); CASE 105
+      (`identity_char(p)` returning `char *`, its result assigned to a
+      local `char *q` and dereferenced through that plain IDENT -- the
+      real, distinguishing proof that a `char *` return crosses a call
+      boundary un-corrupted, a buggy `is_char_return` computation would
+      corrupt the returned ADDRESS itself, not just a value, "caught, not
+      silently wrong" the same way Milestone 110's own CASE 97 doc comment
+      already reasoned for `int *`; expected `1`); CASE 106 (a real,
+      deliberate, DISCLOSED negative case, not a regression --
+      `*identity_char2(&c)` dereferences a call result DIRECTLY, proving
+      the newly-reachable old restriction named above with an actual
+      measured number rather than an assumed claim: expected `0`, the
+      real un-narrowed fallback value, not the morally "correct" narrowed
+      answer -- a real regression tripwire on the disclosed gap's exact
+      numeric fingerprint, the same "diffed for equality across
+      milestones" discipline the fs self-test's own known FAIL-line-count
+      baseline already uses for a different pre-existing artifact).
+
+      **No SNN/evidence-gate work this milestone, and correctly so**: this
+      is a pure compiler-frontend milestone -- one new `ParamInfo` field,
+      two new grammar-position checks, no kernel-side subsystem decision
+      anywhere in it for an evidence-gated hysteresis gate to meaningfully
+      subscribe to. The same "pure compiler-frontend features legitimately
+      don't need this" carve-out Milestone 107 through 112 all already
+      established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero warnings). `kernel/assets/cc.elf` rebuilt via the
+      project's own pinned-nightly `rustc` recipe (`tools/cc_src/
+      README.md`, unchanged) -- 97856 bytes, up from Milestone 112's
+      95816; the real `PT_LOAD` `p_memsz` via `readelf -l` is 83192 bytes,
+      21 pages, up from Milestone 112's own 20 -- comfortably under the
+      64-page per-segment cap and 128-page total cap, no cap change
+      needed. The rebuilt `cc.elf` was independently re-derived from the
+      current `main.rs` via a from-scratch invocation of the exact same
+      recipe and diffed byte-for-byte identical against the committed
+      binary (`cmp`, not eyeballed). **Zero new compiler warnings** --
+      verified the same way Milestone 109 through 112 verified their own:
+      reproducing the standalone `rustc` invocation against a `git stash`
+      of this milestone's own changes (a real, clean Milestone 112
+      checkout) and diffing the sorted warning list against this
+      milestone's own build -- byte-for-byte identical 16-warning set.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m113_fresh_boot.log`/`m113_reused_boot.log`), no
+      stray `qemu-system-x86_64.exe` process before or after either boot
+      (checked via `tasklist`). `OVERALL_M113=PASS` on both boots -- CASE
+      103 returns `1`, CASE 104 returns `1`, CASE 105 returns `1`, CASE
+      106 returns `0`, identically on both boots. Every marker this kernel
+      has ever produced was independently re-confirmed `PASS` on both
+      boots via a real script (not sampled or eyeballed) that reconstructs
+      the actual WRITE-syscall payload stream from each raw serial log
+      (concatenating every `milestone 31: syscall WRITE ... raw bytes >>>
+      ... <<< end of write` block in file order, matched against the
+      real `\r\n` line endings this kernel's serial writer actually uses)
+      to recover every `OVERALL`/`OVERALL_M*=` marker cc.elf's own
+      self-test ever prints, plus a separate raw-text scan for the
+      kernel's own older `milestone NN: self-test -- OVERALL: PASS` style
+      that prints directly to the serial port rather than through a
+      ring-3 WRITE syscall -- 50 total distinct markers across both styles
+      (up from Milestone 112's 49, the one new name being `OVERALL_M113`
+      itself), all `PASS`, fresh and reused in exact agreement, both
+      boots' reconstructed marker sets identical to each other. No
+      regressions: the reused boot's own `fs self-test: permissions`/
+      `symlinks` FAIL-line set was diffed directly (`diff`, not eyeballed)
+      against Milestone 112's own reused boot's FAIL-line set --
+      byte-for-byte identical, 54 lines, the same pre-existing,
+      already-disclosed Milestone 62-era fixture-cleanup artifact every
+      milestone since 70 has named; the fresh boot's own fs self-test
+      passes both suites cleanly (zero FAIL lines). `run_preemption_
+      demo()` ran to completion on BOTH boots (fresh: `task0=2464
+      task1=2479 task2=2736`; reused: `task0=2510 task1=2411
+      task2=2790` -- real inter-boot timing jitter, consistent with every
+      prior milestone's own two-boot pairs) -- zero `run_preemption_
+      demo() SKIPPED` lines on either boot. Milestone 104's own
+      heap-pressure evidence-gate state came out BYTE-IDENTICAL to
+      Milestone 108 through 112's own recorded baseline on both boots:
+      `samples_taken=68 gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0` -- zero drift, consistent with this
+      milestone being pure compiler-frontend work with no new kernel
+      allocation path. Zero `panicked at`/`kernel panicked` and zero
+      `DOUBLE FAULT`/`TRIPLE FAULT` in either log (checked directly,
+      `grep -c`, zero matches in both).
+
+      **Still genuinely open**: no `char **`/multi-level pointers of any
+      kind; no array-to-pointer decay to a `char *` (no `char[]` exists
+      anywhere in this subset, so unlike `int *`/array parameters there is
+      no equivalent of Milestone 110's own `sum3(arr)`-style decay case
+      here); no pointer arithmetic (the same standing gap `int *` has
+      carried since Milestone 109); no `int name[]`/`char name[]`
+      bracket-array parameter sugar; `p[idx]` byte-scaled indexing through
+      a `char *` remains the same real, disclosed, NOT silently-corrected
+      gap Milestone 112 left open, now ALSO reachable through a parameter
+      (`EXPR_INDEX`/`STMT_ASSIGN_INDEX` are just as untouched by THIS
+      milestone as they were by 112); the newly-reachable `*f()`
+      direct-call-result narrowing gap named above and proven by CASE 106
+      (an intervening local-variable assignment, as CASE 105 uses, is the
+      real, disclosed workaround, not a fix); no `*p += 1;`-style compound
+      assignment through any pointer; no type system of any kind, so a
+      mismatched `char *`/`int *` argument or return is accepted without
+      complaint exactly as every other shape mismatch already silently is;
+      no NULL-pointer concept and no bounds/validity checking on any
+      dereference. `MAX_PARAMS` (8), no `sizeof`, `char` as the only
+      non-`int` scalar TYPE, the compiler self-test's own per-compile
+      leak, `heap_guard::admit()` covering only its original two call
+      sites, and `evidence_gate.rs` still having exactly one real
+      subscriber (Milestone 106) all remain exactly as Milestone 112 left
+      them -- unrelated to this milestone.
+
 ## Building and running
 
 Requires:

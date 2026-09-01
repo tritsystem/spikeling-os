@@ -879,10 +879,24 @@
 // the Standalone/ELF64 backend -- with no dependency on cross-compile
 // heap survival). New check `OVERALL_M96 = case8_ok && overall_m69`.
 //
-// Still genuinely open after Milestone 96: `MAX_PARAMS` (4, needs
-// stack-passed arguments); no arrays/pointers; only the `int` type;
-// the compiler self-test still leaks per-compile (bounded by
-// `heap_reset()`, not eliminated); one 4 KiB stack page per process.
+// MILESTONE 97 adds character literals -- a lexer-only change. `'c'`
+// lexes to an ordinary TOK_INTLIT whose value is the character's byte;
+// the parser and codegen are untouched (a char literal IS an integer
+// literal to everything downstream). Common single-character escapes
+// are recognized: `\n \t \r \0 \\ \' \"`. Deliberate cuts: no
+// multi-character constants, no `\xNN` / octal `\NNN` numeric escapes,
+// no wide/unicode literals. An empty `''`, an unterminated `'`, an
+// unknown `\escape`, or a literal not closed exactly one character
+// later is a real LexError at the opening quote. CASE 66 (in-process --
+// `'A' + ('a'-'A') + '\n' + '\0'` -> 107) and CASE 67 (the
+// multi-char-constant LexError path).
+//
+// Still genuinely open after Milestone 97: `MAX_PARAMS` (4, needs
+// stack-passed arguments); no arrays/pointers; only the `int` type
+// (a `char` literal is just an int, there is still no `char` type or
+// any width tracking); the compiler self-test still leaks per-compile
+// (bounded by `heap_reset()`, not eliminated); one 4 KiB stack page
+// per process.
 //
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
@@ -1322,6 +1336,58 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             }
             unsafe { tok_write(toks_ptr, n, Token { kind: TOK_INTLIT, int_val: val, ident_off: 0, ident_len: 0 }) };
             n += 1;
+            continue;
+        }
+        // MILESTONE 97: a character literal 'c' lexes to an ordinary
+        // TOK_INTLIT whose value is the character's byte -- no new token
+        // kind, no type system, the parser and codegen treat it exactly
+        // like the integer it already is. Supports the common
+        // single-character escapes: \n \t \r \0 \\ \' \". Deliberate
+        // cuts: no multi-character constants ('ab'), no \xNN or octal
+        // \NNN numeric escapes, no wide/unicode literals. An empty '',
+        // an unterminated ', an unrecognized \escape, or a literal that
+        // is not closed by a quote exactly one character later are all a
+        // real LexError::UnknownChar pointing at the opening quote --
+        // the same "point at the offending byte" convention every other
+        // lex error uses.
+        if b == b'\'' {
+            if i + 1 >= src_len {
+                return Err(LexError::UnknownChar(i));
+            }
+            let c1 = unsafe { core::ptr::read((src_ptr + i + 1) as *const u8) };
+            let (val, consumed): (u64, u64) = if c1 == b'\\' {
+                if i + 2 >= src_len {
+                    return Err(LexError::UnknownChar(i));
+                }
+                let e = unsafe { core::ptr::read((src_ptr + i + 2) as *const u8) };
+                let v: u64 = match e {
+                    b'n' => 10,
+                    b't' => 9,
+                    b'r' => 13,
+                    b'0' => 0,
+                    b'\\' => 92,
+                    b'\'' => 39,
+                    b'"' => 34,
+                    _ => return Err(LexError::UnknownChar(i)),
+                };
+                (v, 3)
+            } else if c1 == b'\'' {
+                // an empty literal ''
+                return Err(LexError::UnknownChar(i));
+            } else {
+                (c1 as u64, 2)
+            };
+            if i + consumed >= src_len
+                || unsafe { core::ptr::read((src_ptr + i + consumed) as *const u8) } != b'\''
+            {
+                return Err(LexError::UnknownChar(i));
+            }
+            if n >= max_toks {
+                return Err(LexError::TooManyTokens);
+            }
+            unsafe { tok_write(toks_ptr, n, Token { kind: TOK_INTLIT, int_val: val, ident_off: 0, ident_len: 0 }) };
+            n += 1;
+            i += consumed + 1;
             continue;
         }
         // MILESTONE 70: two-char lookahead for the four comparison
@@ -7690,7 +7756,60 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m95 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 97: character literals (lexer only -- a `'c'` lexes
+        // to an ordinary TOK_INTLIT). CASE 66 (in-process Callable
+        // path): plain chars, an arithmetic difference of two chars, and
+        // two escapes.
+        //   int main() {
+        //       int a = 'A';         // 65
+        //       int b = 'a' - 'A';   // 32
+        //       int nl = '\n';       // 10
+        //       int z = '\0';        //  0
+        //       return a + b + nl + z;
+        //   }
+        // Hand-computed: 65 + 32 + 10 + 0 = 107. A char literal parsed
+        // as anything other than its byte value would miss 107.
+        // -------------------------------------------------------------
+        const SRC66: &[u8] = b"int main() { int a = 'A'; int b = 'a' - 'A'; int nl = '\\n'; int z = '\\0'; return a + b + nl + z; }";
+        let case66_result = compile_and_run_program_callable(SRC66.as_ptr() as u64, SRC66.len() as u64);
+        w(b"  case66 (char literals + escapes, in-process) returned=");
+        if let Some(r) = case66_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 107)\n");
+        let case66_ok = case66_result == Some(107);
+        write_check(b"case66_char_literals_and_escapes_return_107=", case66_ok);
+
+        w(b"\n");
+
+        // CASE 67: a multi-character constant 'ab' is a real LexError
+        // (the byte after the first char is not the closing quote) --
+        // same Err-path discipline as CASE 3 / 63 / 65.
+        //   int main() { return 'ab'; }
+        const SRC67: &[u8] = b"int main() { return 'ab'; }";
+        let case67_ok = match lex_and_parse(SRC67.as_ptr() as u64, SRC67.len() as u64) {
+            Err(_) => {
+                w(b"  case67 multi-character constant 'ab' rejected, as expected\n");
+                true
+            }
+            Ok(_) => {
+                w(b"  case67 expected a LexError for the multi-char constant 'ab', got Ok\n");
+                false
+            }
+        };
+        write_check(b"case67_multichar_constant_is_a_lex_error=", case67_ok);
+
+        w(b"\n");
+
+        let overall_m97 = case66_ok && case67_ok;
+        w(b"OVERALL_M97=");
+        w(if overall_m97 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 { 0 } else { 1 });
     }
 }
 

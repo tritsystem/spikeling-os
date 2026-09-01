@@ -6558,6 +6558,35 @@ self-test suite, genuinely open for a future pass.
       self-test still leaks per-compile (bounded by `heap_reset()`, not
       eliminated); one 4 KiB stack page per process.
 
+- [x] **Milestone 97**: character literals in the self-hosted subset-C
+      compiler -- a **lexer-only** change. `'c'` lexes to an ordinary
+      `TOK_INTLIT` whose value is the character's byte; the parser and
+      codegen are untouched, because a character literal simply *is* an
+      integer literal to everything downstream. Common single-character
+      escapes are recognized: `\n` `\t` `\r` `\0` `\\` `\'` `\"`.
+      **Deliberate cuts**: no multi-character constants (`'ab'`); no
+      `\xNN` or octal `\NNN` numeric escapes; no wide/unicode literals;
+      and no `char` *type* -- width tracking through the AST and codegen
+      is still a separate, unstarted milestone. An empty `''`, an
+      unterminated `'`, an unknown `\escape`, or a literal not closed by
+      a quote exactly one character later is a real `LexError` at the
+      opening quote.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`, 73488
+      bytes). Two QEMU boots, fresh then reused. CASE 66 (in-process --
+      `'A' + ('a' - 'A') + '\n' + '\0'`, plain chars, a char-difference,
+      and two escapes) returns `107`; CASE 67 exercises the
+      multi-character-constant `LexError` path. Both boots.
+      `OVERALL_M97=PASS`, `OVERALL_M68`..`M96` all still PASS
+      (`OVERALL_M69` still PASS -- Milestone 96's fix holds) and
+      byte-identical fresh vs. reused. `milestone 64`/`65` kernel
+      self-tests PASS both boots. No regressions.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; the `char` *type* and all width
+      tracking; the compiler self-test still leaks per-compile (bounded,
+      not eliminated); one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

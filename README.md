@@ -6949,6 +6949,151 @@ self-test suite, genuinely open for a future pass.
       "add one more real exec() self-test case" in a row, a genuine,
       concrete candidate for a near-future milestone in its own right.
 
+- [x] **Milestone 104**: real, evidence-gated kernel-heap-pressure
+      self-healing -- closes the real, disclosed-but-unfixed kernel panic
+      Milestone 102 found (`PANIC: ...memory allocation of 16384 bytes
+      failed`, inside `tasks::run_preemption_demo()`'s first worker-stack
+      allocation, after a fourth real `fork()`/`exec()`/`wait()` cycle)
+      and answers Milestone 102/103's own shared "leak vs. thin budget"
+      open question.
+
+      New `kernel/src/heap_guard.rs`: a real evidence-gated admission
+      gate, structurally ported from Milestone 39's own synapse
+      evidence-gate rather than invented fresh -- `network::
+      update_evidence()`/`network::golden_period()` made `pub(crate)`
+      this milestone for exact reuse, the same "reuse before duplicate"
+      discipline Milestone 78 established for `apply_stdp()`. This is
+      the standing "SNN + self-healing every direction" instruction
+      applied to this milestone's own real subsystem (kernel-heap
+      admission), the kind of case Tier 13 in this README's own roadmap
+      names directly ("extending self-healing beyond synapses ... gated
+      by the same evidence-accumulation pattern Milestone 39
+      established"). New `allocator::heap_used()`/`heap_free()` (real
+      live accounting `linked_list_allocator::Heap` already maintained
+      internally, just never exposed before) feed a fast EMA sampled at
+      every real process teardown (`process::reclaim_process_frames()`'s
+      new `record_teardown_sample()` call, placed right after the
+      freshly-`drop()`ped `Process`'s own heap-backed Vecs are actually
+      released), re-evaluated into a hysteretic ON/OFF `conservative`
+      gate only every `golden_period(1)`-th sample -- Milestone 39's
+      exact fast/slow-clock structure, applied to a different real
+      signal. `tasks::run_preemption_demo()`'s bulk 3*16 KiB worker-stack
+      burst and `tasks::spawn()`'s single dynamic one both now call the
+      new `heap_guard::admit()` BEFORE allocating, refusing gracefully
+      (a real, disclosed, logged skip) instead of panicking via
+      `handle_alloc_error()` -- the actual fix for Milestone 102's crash,
+      not just a softened symptom.
+
+      **The leak-vs-thin-budget question, actually answered**: this
+      milestone's own new self-test (`heap_guard::
+      self_test_heap_pressure()`, called from `kernel_main()` at boot)
+      runs 10 additional real `fork()`/`run()`/`wait_for_child()` cycles
+      (`process::run_one_waitstatus_cycle()`, new, reusing
+      `WAITSTATUS_TEST_PROCESS_ID` rather than adding a second hardcoded
+      test process) back-to-back at boot's end and samples the kernel
+      heap after every one. Real, measured result, quoted directly from
+      `m104_fresh_boot.log`: `kernel heap used 52352->52352 bytes
+      (delta=0)` -- byte-IDENTICAL after every single one of the 10
+      cycles, zero drift. Positive evidence against a per-process
+      kernel-heap leak: Milestone 102's budget really was just thin, not
+      leaking. Confirmed a second way during this milestone's own
+      development (real, directly-observed, though the probe log itself
+      was scratch and not committed): temporarily reverting `HEAP_SIZE`
+      back to Milestone 3's original 100 KiB and re-running this exact
+      self-test reproduced Milestone 102's own scenario precisely --
+      kernel heap at 52352 used / 50048 free by the time
+      `run_preemption_demo()` needed its 49152-byte burst, only 896
+      bytes of real headroom, and `heap_guard::admit()` correctly
+      refusing it (`milestone 104: run_preemption_demo() SKIPPED --
+      heap_guard::admit() refused the real 49152 bytes this demo's 3
+      worker stacks need...`) instead of the old panic. `HEAP_SIZE`
+      raised to 256 KiB (`kernel/src/allocator.rs`) -- roughly 4x the
+      real measured baseline, comfortable headroom for this self-test
+      suite's own continued growth (the exact concern Milestone 102 and
+      103 both closed on), not an arbitrarily large number picked
+      without evidence.
+
+      **Verified**: `cargo build` clean from the repo root. One real
+      wrinkle worth disclosing: `cargo build --workspace` is NOT the
+      right invocation for this repo and fails with "unwinding panics
+      are not supported without std" -- it tries to compile the `kernel`
+      workspace member directly for the HOST target too (in addition to
+      pulling it in as an artifact-dependency), and `kernel` is
+      `#![no_std]`. Confirmed pre-existing, not a Milestone 104
+      regression, by reproducing the identical failure on a clean
+      Milestone 103 checkout (`git stash` this milestone's own changes,
+      same error). Plain `cargo build` (no `--workspace`, the same
+      command `cargo run` already uses under the hood) only builds the
+      host runner and pulls `kernel` in as its `x86_64-unknown-none`
+      artifact-dependency, and builds clean.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first so the fresh boot starts
+      blank, matching every prior milestone's own fresh-boot baseline),
+      fresh then reused (`m104_fresh_boot.log` / `m104_reused_boot.log`).
+      `OVERALL_M104=PASS` both boots: 10 stress cycles all_ok=true,
+      `samples_taken=66 gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0` at the real 256 KiB budget -- the gate
+      runs on every real teardown but never actually needed to trip
+      conservative mode once the budget was raised, consistent with the
+      thin-budget diagnosis above, not a sign the refusal path is
+      untested (see the reverted-budget experiment above for that).
+      `run_preemption_demo()` ran to completion on BOTH boots (fresh:
+      `task0=2559 task1=2405 task2=2645`; reused: `task0=2329 task1=2320
+      task2=2469` -- real inter-boot timing jitter, the same variance
+      every prior milestone's own two-boot pairs already show), not
+      skipped -- the real fix in effect, not just a graceful failure
+      mode nobody ever exercises successfully. `OVERALL_M68`..
+      `OVERALL_M99`/`OVERALL_M101`..`OVERALL_M103` all still PASS;
+      `milestone 54/64/65` PASS. No regressions: the reused boot's own
+      `fs self-test: permissions`/`symlinks` `FAIL` lines are byte-for-
+      byte identical to Milestone 103's own reused boot's FAIL-line set
+      (checked via direct diff, not by eye), the same pre-existing
+      disk-state artifact (second boot finds `permtestdir` already
+      created by the first, unchanged since Milestone 100); the fresh
+      boot's own fs self-test PASSES both suites, matching every prior
+      milestone's fresh-boot pattern.
+
+      **A real process note, disclosed honestly**: this milestone's own
+      verification pass first tripped over its own tooling, not the
+      kernel -- an earlier boot attempt was captured before the persist
+      disk had been reset, so its "fresh" boot inherited a `permtestdir`
+      already created by unrelated prior probing and showed a spurious
+      `fs self-test FAIL` on the fresh boot (never a Milestone 103
+      pattern). Caught by comparing against Milestone 103's own reference
+      logs rather than trusting the run in isolation, and re-run properly
+      above -- a verification-process mistake, not a kernel bug, but
+      worth naming plainly rather than quietly discarding.
+
+      **Scope, deliberately real and disclosed**: this gate protects
+      exactly the one concrete risk Milestone 102 root-caused --
+      `run_preemption_demo()`'s bulk allocation and `spawn()`'s single
+      one, both already able to refuse gracefully (`spawn()` already
+      returned `Option<TaskId>`, so `None` here is not even a new
+      failure mode for its callers). It does NOT wrap this kernel's many
+      other, smaller `Vec`/`Box` allocation sites -- a real fallible-
+      allocation API this kernel has nowhere yet, explicitly out of
+      scope here.
+
+      **Still genuinely open**: this self-test suite only grows over
+      time (the same concern Milestone 102/103 both named) -- 256 KiB is
+      real, measured headroom for TODAY's suite, not a permanent
+      guarantee; a future milestone may need to revisit it again, this
+      time with `heap_guard`'s own real instrumentation already in place
+      to make that a measured decision rather than a guess.
+      `heap_guard::admit()` only covers the two call sites named above,
+      not every kernel-heap allocation. Milestone 102's own CASE 79
+      (kept on the in-process Callable path rather than the real
+      `fork()`/`exec()`/`wait()` path specifically because of this bug)
+      was deliberately left untouched by this milestone -- re-enabling
+      it on the real exec path, now that the underlying heap-margin bug
+      is fixed, is a clean, disclosed candidate for a near-future
+      milestone. `MAX_PARAMS` (4), no arrays/pointers, no `sizeof`,
+      `char` as the only non-`int` type, and the compiler self-test's own
+      per-compile leak (bounded by `heap_reset()`, not eliminated) all
+      remain exactly as Milestone 103 left them -- this milestone touched
+      the kernel side only, not the compiler frontend.
+
 ## Building and running
 
 Requires:

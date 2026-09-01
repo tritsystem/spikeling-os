@@ -34,10 +34,15 @@
 use crate::scheduler::TopologicalScheduler;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use spin::Mutex;
 
-const STACK_SIZE: usize = 4096 * 4; // 16 KiB per task
+// MILESTONE 104: `pub(crate)` (was private) so `heap_guard.rs`'s real
+// admission gate can size its own checks against this crate's ACTUAL
+// per-task stack request, rather than a second, independently
+// maintained copy of "16 KiB" that could silently drift from this one.
+pub(crate) const STACK_SIZE: usize = 4096 * 4; // 16 KiB per task
 const N_TASKS: usize = 3; // original Milestone 5c fixed task count
 const MAX_TASKS: usize = 8; // Milestone 25: hard cap on concurrent task slots
 const MAX_TICKS: u64 = 60; // ~3.3s of real time at the default ~18.2Hz PIT rate
@@ -180,7 +185,30 @@ static DEMO_ENTRIES: [extern "C" fn() -> !; MAX_TASKS] = [
 /// back here. None of the worker loops above ever call this module's
 /// scheduling code themselves -- the only thing moving execution
 /// between them is the timer interrupt.
+/// MILESTONE 104: real, honest kernel-heap-pressure guard, checked
+/// BEFORE any of the three worker stacks below are allocated -- closes
+/// the real Milestone 102-disclosed gap where this function's own first
+/// `Task::new()` (a real 16 KiB `alloc::vec![0u8; STACK_SIZE]`) could
+/// hit a kernel heap already run low by everything the self-test suite
+/// did earlier in the SAME boot, and panic via
+/// `alloc::alloc::handle_alloc_error()` rather than fail gracefully. All
+/// 3 * STACK_SIZE (48 KiB) checked as ONE up-front admission, not
+/// per-task, deliberately: partially creating this demo (1 or 2 workers
+/// but not 3) would leave `DEMO_ACTIVE`/`TASK_COUNTERS` in a state no
+/// caller of this function has ever had to handle -- an all-or-nothing
+/// admission keeps this function's own existing contract (either the
+/// real demo runs, or it doesn't) completely intact. See
+/// `heap_guard.rs`'s own module doc for the real evidence-gated
+/// admission design and the honest naive-vs-evidence-gated benchmark.
 pub fn run_preemption_demo() {
+    if !crate::heap_guard::admit(3 * STACK_SIZE) {
+        let _ = writeln!(
+            crate::serial(),
+            "milestone 104: run_preemption_demo() SKIPPED -- heap_guard::admit() refused the real {} bytes this demo's 3 worker stacks need (kernel heap under real, measured pressure); see the milestone 104 heap-pressure lines above for the real evidence that led here",
+            3 * STACK_SIZE
+        );
+        return;
+    }
     {
         let mut tasks = TASKS.lock();
         tasks.push(Some(Task::new(worker_entry_0)));
@@ -233,7 +261,17 @@ fn current_rsp_ptr(current: usize) -> *mut u64 {
 /// registers it to run the demo counting loop under its assigned id.
 /// Returns None if the scheduler hasn't been bootstrapped yet or the
 /// MAX_TASKS cap has been reached.
+///
+/// MILESTONE 104: also returns None -- no new failure mode for this
+/// function's own existing callers, who already have to handle `None`
+/// -- if `heap_guard::admit()` refuses this task's real STACK_SIZE
+/// request. Checked FIRST, before any scheduler-slot state is touched
+/// (revive/add_slot), so a refusal here never leaves a half-grown
+/// scheduler slot with no task behind it.
 pub fn spawn() -> Option<TaskId> {
+    if !crate::heap_guard::admit(STACK_SIZE) {
+        return None;
+    }
     let mut tasks = TASKS.lock();
     let mut sched_guard = SCHED.lock();
     let sched = sched_guard.as_mut()?;

@@ -241,7 +241,13 @@ fn gcd(a: u64, b: u64) -> u64 {
 /// = round(18.33) = 18; gcd(18,7)=1, already coprime) -- ~990ms @
 /// ~18.2Hz, i.e. the gate is re-checked roughly once a second, on a
 /// cadence that never lines up evenly with the 7-tick fast cadence.
-fn golden_period(fast_tau: u64) -> u64 {
+/// MILESTONE 104: made `pub(crate)` so `heap_guard.rs` can reuse this
+/// EXACT formula for its own real evidence-gated kernel-heap-pressure
+/// gate, ported structurally from this milestone's own two-timescale
+/// design -- same "reuse before duplicate" discipline Milestone 78
+/// already established for `apply_stdp()` above. Zero behavior change
+/// for this file's own existing callers.
+pub(crate) fn golden_period(fast_tau: u64) -> u64 {
     const PHI: f32 = 1.618_034;
     let mut p = (libm::roundf(PHI * PHI * fast_tau as f32) as u64).max(2);
     loop {
@@ -259,7 +265,11 @@ fn golden_period(fast_tau: u64) -> u64 {
 /// `weight` -- the independent-sensing-channel property tritkit's own
 /// module doc identifies as the fix for the self-reinforcing lockout
 /// failure mode.
-fn update_evidence(evidence: &mut f32, hit: bool) {
+/// MILESTONE 104: made `pub(crate)` for the exact same reason as
+/// `golden_period()` immediately above -- `heap_guard.rs` reuses this
+/// identical EMA formula for its own real evidence signal rather than
+/// re-deriving it.
+pub(crate) fn update_evidence(evidence: &mut f32, hit: bool) {
     let sample = if hit { 1.0 } else { 0.0 };
     *evidence = *evidence * EVIDENCE_BETA + sample * (1.0 - EVIDENCE_BETA);
 }

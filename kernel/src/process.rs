@@ -217,9 +217,11 @@
 //! `self_test_real_exec()` against a genuine ELF64 target instead. See
 //! this milestone's own report for the real captured serial log.
 
+use crate::allocator;
 use crate::elf;
 use crate::errno;
 use crate::fs;
+use crate::heap_guard;
 use crate::memory;
 use crate::serial;
 use crate::signal;
@@ -2698,6 +2700,7 @@ fn count_private_page_tables(pml4_frame: PhysFrame<Size4KiB>, phys_mem_offset: V
 /// place (see `create_process_from_image()`/`create_process_from_elf()`),
 /// so returning them to that same allocator is always well-formed.
 fn reclaim_process_frames(p: Process) {
+    let label = p.label;
     let phys_mem_offset = memory::phys_mem_offset();
     let freed = memory::with_frame_allocator(|fa| {
         let mut n = reclaim_private_page_tables(p.pml4_frame, phys_mem_offset, fa);
@@ -2735,12 +2738,31 @@ fn reclaim_process_frames(p: Process) {
         }
         n
     });
+    // MILESTONE 104: `p` is fully dropped HERE (its own `heap_frames`/
+    // `extra_frames`/`extra_stack_frames`/`fds`/`mmaps` Vecs, every one
+    // of them kernel-heap-backed, released back to `allocator.rs`'s
+    // global heap) before the real post-teardown `heap_used()` sample
+    // below is taken -- explicit `drop()` rather than relying on
+    // end-of-scope, so this measurement genuinely reflects "after this
+    // process's own kernel-heap footprint is gone", not "sometime before
+    // the function returns".
+    drop(p);
+    let heap_after = allocator::heap_used();
     let _ = writeln!(
         serial(),
         "milestone 54: reclaim_process_frames('{}') -- freed {} physical frame(s) back to the allocator's free list",
-        p.label,
+        label,
         freed.unwrap_or(0)
     );
+    let _ = writeln!(
+        serial(),
+        "milestone 104: reclaim_process_frames('{}') -- kernel heap used={} bytes free={} bytes (of {} KiB budget) after this teardown",
+        label,
+        heap_after,
+        allocator::heap_free(),
+        allocator::HEAP_SIZE / 1024
+    );
+    heap_guard::record_teardown_sample(heap_after);
 }
 
 /// MILESTONE 45: like `with_process_mut()` above, but replaces the
@@ -5562,6 +5584,30 @@ pub fn self_test_wait_status() {
         "milestone 43: self-test -- OVERALL: {}",
         if exited_ok && killed_ok { "PASS" } else { "FAIL" }
     );
+}
+
+/// MILESTONE 104: one real `fork()`+`run()`(via `wait_for_child()` ->
+/// `run_forked_child()`)+`wait_for_child()` cycle against
+/// WAITSTATUS_TEST_PROCESS_ID, mechanically identical to
+/// `self_test_wait_status()`'s own "Part 1" above -- kept as a SEPARATE
+/// function (not a shared call from that self-test) specifically so
+/// that self-test's own already-verified "milestone 43:" log lines stay
+/// byte-for-byte unchanged for every future boot's regression
+/// comparison. Deliberately QUIET (no per-cycle serial output) so
+/// `heap_guard::self_test_heap_pressure()` can run this many times in a
+/// row as real, repeated kernel-heap pressure without flooding the boot
+/// log with a dozen-plus near-identical "milestone 43"-style lines.
+/// Returns whether the child genuinely exited with the expected code
+/// 42, the same real pass/fail condition Part 1 above checks.
+pub(crate) fn run_one_waitstatus_cycle() -> bool {
+    let stack_top = usertest::USER_STACK_ADDR + usertest::USER_STACK_SIZE;
+    match fork(WAITSTATUS_TEST_PROCESS_ID, usertest::USER_CODE_ADDR, stack_top) {
+        Some(pid) => matches!(
+            wait_for_child(WAITSTATUS_TEST_PROCESS_ID, pid),
+            Some((reaped, WaitOutcome::Exited(42))) if reaped == pid
+        ),
+        None => false,
+    }
 }
 
 /// MILESTONE 45: the `exec()` syscall's REAL kernel-side implementation

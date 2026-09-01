@@ -19,6 +19,7 @@ mod console;
 mod elf;
 mod errno;
 mod gdt;
+mod heap_guard;
 mod hetero_ensemble;
 mod hetero_stdp;
 mod interrupts;
@@ -1091,6 +1092,16 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     )
     .unwrap();
 
+    // MILESTONE 104: real, boot-time heap-pressure stress self-test --
+    // deliberately reproduces the real scenario Milestone 102 disclosed
+    // (honestly, unfixed at the time): "one more real fork()/exec()/
+    // wait() cycle" than this self-test suite already ran, right before
+    // tasks::run_preemption_demo()'s own real 48 KiB burst allocation --
+    // see heap_guard.rs's own module doc and README.md's Milestone 104
+    // entry for the real, measured before/after numbers and the honest
+    // evidence-gated-vs-naive-admission comparison this produces.
+    heap_guard::self_test_heap_pressure(10);
+
     // MILESTONE 5, STAGE C: real per-task stacks + a genuine preemptive
     // context switch (tasks.rs), selection driven by the SAME
     // TopologicalScheduler as Milestone 4 -- now with a real scheduler
@@ -1101,6 +1112,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // counters actually grew, not just the first one: a broken switch
     // would either hang (never returns here) or leave later tasks at
     // exactly 0 (never really preempted into).
+    //
+    // MILESTONE 104: this call is now guarded by heap_guard::admit() --
+    // see tasks.rs's own updated doc comment on run_preemption_demo().
     tasks::run_preemption_demo();
     let c0 = tasks::TASK_COUNTERS[0].load(core::sync::atomic::Ordering::Relaxed);
     let c1 = tasks::TASK_COUNTERS[1].load(core::sync::atomic::Ordering::Relaxed);

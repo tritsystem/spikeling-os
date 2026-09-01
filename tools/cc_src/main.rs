@@ -1496,6 +1496,56 @@
 // is accepted without complaint exactly as every other shape mismatch
 // already silently is; still no NULL-pointer concept and no
 // bounds/validity checking on any dereference.
+//
+// MILESTONE 114: `p[idx]` (`EXPR_INDEX`) and `p[idx] = expr;`
+// (`STMT_ASSIGN_INDEX`) now genuinely byte-scale AND (on the read side)
+// narrow when `p` is a `char *` -- closing the exact asymmetry Milestone
+// 112's own closing disclosure named and Milestone 113's own closing
+// disclosure re-named as newly reachable through a parameter. No grammar
+// change at all: `p[idx]` already parsed identically regardless of `p`'s
+// own declared pointee type. The real fix is entirely in what these two
+// arms' existing address-scaling codegen does once `find_var()`'s own
+// `is_char_ptr` field (already threaded to both call sites since
+// Milestone 112, simply never consulted by either arm before now) comes
+// back true: `EXPR_INDEX` skips `emit_shl_rcx_imm8(3)` (leaving the raw
+// index UNSCALED in RCX -- real C's own "one `char` is one byte" rule,
+// genuinely different from every `int`/`int *`/array index's own
+// "one element is 8 bytes" convention) and loads through the resulting
+// address with `emit_movsx_rax_mem_rax_byte()` instead of the ordinary
+// full-width `emit_mov_rax_mem_rax()` -- the exact same narrowing
+// encoding Milestone 112's own `*p` read already introduced, reused here
+// completely UNCHANGED (a real, deliberate "same instruction, different
+// address-computation caller" reuse, not a new encoding -- this
+// milestone adds ZERO new x86_64 encodings). `STMT_ASSIGN_INDEX` gets
+// only the unscaled-index half (also skips `emit_shl_rcx_imm8(3)` when
+// `is_char_ptr != 0`) -- the STORE itself stays deliberately full-width
+// regardless, exactly matching `*p = expr;`'s own Milestone 112
+// write-side convention (narrowing only ever happens on READ).
+//
+// At `idx == 0`, this makes `p[0]` compute the byte-identical address
+// and narrowed load `*p` already does -- the real, honest identity real
+// C itself guarantees (`p[0] == *(p+0) == *p`), and the ONLY case this
+// milestone independently hand-verifies (CASE 107/108 below): no packed
+// multi-char buffer exists anywhere in this language (no `char[]`, no
+// `malloc`-backed byte buffer, the same standing gap Milestone 112
+// already named), so a real `char *` in this subset's own grammar only
+// ever points at a single scalar `char` variable's own 8-byte `VarSlot`
+// (via `&c`) -- a nonzero index steps byte-by-byte into whatever real
+// memory happens to sit adjacent to that slot, the same real, disclosed,
+// undefined-but-not-new "no bounds checking, wild address reads whatever
+// is there" territory an out-of-range array index already occupies
+// (Milestone 108's own disclosure), not a gap this milestone introduces
+// or could honestly fabricate a hand-computed nonzero-index test for.
+//
+// Scope, deliberately real and disclosed: exactly the two codegen arms
+// named above, nothing broader -- still no `char **`; still no
+// array-to-pointer decay to a `char *`; still no pointer arithmetic
+// (`p + 1`/`p++` remain entirely unimplemented, so `p[idx]`'s own
+// internal address arithmetic is the ONLY byte-scaled `char *` addressing
+// this codegen performs anywhere); still no `*p += 1;`/`p[idx] += 1;`
+// compound assignment through any pointer; still no type system of any
+// kind; still no NULL-pointer concept and no bounds/validity checking on
+// any dereference or index.
 #![no_std]
 #![no_main]
 
@@ -5772,10 +5822,49 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         // what makes `p[idx]` inside the callee land on the EXACT same
         // bytes `arr[idx]` would inside the caller, the two conventions
         // made to agree by construction.
+        // MILESTONE 114: `p[idx]` through a `char *` now genuinely
+        // byte-scales AND narrows, closing the exact asymmetry Milestone
+        // 112's own closing disclosure named ("`p[idx]` byte-scaled
+        // indexing through a `char *` is a real, disclosed, NOT
+        // silently-corrected gap") and Milestone 113's own closing
+        // disclosure re-named as newly reachable through a parameter too.
+        // `find_var()`'s own `is_char_ptr` field (already threaded here
+        // since Milestone 112, just never consulted by this arm before
+        // now) selects a THIRD address-scaling/load shape alongside the
+        // two `is_array` already distinguishes: for a `char *`
+        // (`is_char_ptr != 0`), the index is used UNSCALED (no
+        // `emit_shl_rcx_imm8()` at all -- `RCX` already holds the raw
+        // index, real C's own "one `char` is one byte" rule, genuinely
+        // different from this codegen's own "one array ELEMENT is 8
+        // bytes" convention every `int`/`int *` index already used), and
+        // the load narrows via `emit_movsx_rax_mem_rax_byte()` -- the
+        // exact same encoding Milestone 112's own `*p` narrowing read
+        // already introduced and hand-verified, reused here completely
+        // UNCHANGED (a real, deliberate "same narrowing load, different
+        // address-computation caller" reuse, not a new encoding). At
+        // `idx == 0` this makes `p[0]` and `*p` compute the byte-identical
+        // address and load -- the real, honest identity real C itself
+        // guarantees (`p[0] == *(p+0) == *p`) -- CASE 107 below proves
+        // exactly this. For `idx != 0`, the byte-stride fix is real and
+        // structurally correct (this is what "`p[idx] == *(p+idx)`,
+        // byte-addressed" genuinely means), but this milestone does NOT
+        // independently hand-verify a nonzero-index case: no packed
+        // multi-char buffer exists anywhere in this language (no
+        // `char[]`, no `malloc`-backed byte buffer, the same standing gap
+        // Milestone 112 already named), so a real `char *` in this
+        // subset's own grammar only ever points at a single scalar
+        // `char` variable's own 8-byte `VarSlot` (via `&c`) -- `p[1]`
+        // steps one byte into whatever real memory happens to sit
+        // adjacent to that slot, exactly the same real, disclosed,
+        // undefined-but-not-new "no bounds checking, wild address reads
+        // whatever is there" territory an out-of-range array index
+        // already occupies (Milestone 108's own disclosure), not a gap
+        // this milestone introduces or could meaningfully fabricate a
+        // hand-computed test for.
         EXPR_INDEX => {
             let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
-            let (base_off, is_array) = match slot {
-                Some((o, _is_char, is_array, _is_char_ptr)) => (o, is_array),
+            let (base_off, is_array, is_char_ptr) = match slot {
+                Some((o, _is_char, is_array, is_char_ptr)) => (o, is_array, is_char_ptr),
                 None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
             };
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
@@ -5786,9 +5875,14 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 unsafe { buf.emit_mov_rax_rbp_off(base_off) };
             }
             unsafe { buf.emit_pop_reg(REG_RCX) };
-            unsafe { buf.emit_shl_rcx_imm8(3) };
-            unsafe { buf.emit_sub_rax_rcx() };
-            unsafe { buf.emit_mov_rax_mem_rax() };
+            if is_char_ptr != 0 {
+                unsafe { buf.emit_sub_rax_rcx() };
+                unsafe { buf.emit_movsx_rax_mem_rax_byte() };
+            } else {
+                unsafe { buf.emit_shl_rcx_imm8(3) };
+                unsafe { buf.emit_sub_rax_rcx() };
+                unsafe { buf.emit_mov_rax_mem_rax() };
+            }
         }
         // MILESTONE 72: a call expression's own real codegen -- evaluate
         // every argument into RAX, PUSHing each one immediately after
@@ -6422,10 +6516,19 @@ unsafe fn gen_stmt_list(
             // both cases is what makes a callee's `p[idx] = ...` write
             // land on the exact same bytes a caller's own `arr[idx]`
             // occupies.
+            // MILESTONE 114: `p[idx] = expr;` through a `char *` now
+            // ALSO byte-scales the index -- the write-side half of the
+            // same fix EXPR_INDEX's own Milestone 114 doc comment above
+            // fully derives. The STORE itself stays deliberately
+            // full-width regardless (no narrowing change here at all --
+            // `emit_mov_mem_rcx_rax()` is completely unchanged), exactly
+            // matching `*p = expr;`'s own Milestone 112 write-side
+            // convention (narrowing only ever happens on READ, never on
+            // WRITE, for either dereference syntax).
             STMT_ASSIGN_INDEX => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
-                let (base_off, is_array) = match slot {
-                    Some((o, _is_char, is_array, _is_char_ptr)) => (o, is_array),
+                let (base_off, is_array, is_char_ptr) = match slot {
+                    Some((o, _is_char, is_array, is_char_ptr)) => (o, is_array, is_char_ptr),
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.then_body) }?;
@@ -6436,7 +6539,9 @@ unsafe fn gen_stmt_list(
                     unsafe { buf.emit_mov_rax_rbp_off(base_off) };
                 }
                 unsafe { buf.emit_pop_reg(REG_RCX) };
-                unsafe { buf.emit_shl_rcx_imm8(3) };
+                if is_char_ptr == 0 {
+                    unsafe { buf.emit_shl_rcx_imm8(3) };
+                }
                 unsafe { buf.emit_sub_rax_rcx() };
                 unsafe { buf.emit_push_rax() };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
@@ -11298,7 +11403,126 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m113 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 114: `p[idx]`/`p[idx] = expr;` through a `char *` now
+        // genuinely byte-scale (both arms) AND narrow (the read arm) --
+        // closing the exact asymmetry Milestone 112's own closing
+        // disclosure named and Milestone 113's own closing disclosure
+        // re-named as newly reachable through a parameter. See this
+        // file's own top Milestone 114 doc comment and `EXPR_INDEX`'s own
+        // inline Milestone 114 comment for the full derivation. All three
+        // cases run in-process (`CodegenMode::Callable`), the same tier
+        // Milestone 107 through 113 all already used for their own new
+        // cases -- no new real `fork()`/`exec()`/`wait()` cycle is added
+        // by this milestone.
+        //
+        // CASE 107: the real, distinguishing proof that `p[0]` through a
+        // `char *` now narrows exactly like `*p` already does -- the
+        // honest identity real C guarantees (`p[0] == *(p+0) == *p`). A
+        // pre-fix build (this milestone's own committed Milestone 113
+        // baseline) would compute the SAME address at `idx == 0` (the
+        // byte-vs-8-byte scale only matters for a nonzero index) but load
+        // the full, un-narrowed 8 bytes, reading back the raw 200 instead
+        // of -56 -- so this case is a real regression check on the exact
+        // pre-fix baseline, not merely a fresh assertion.
+        //   int main() {
+        //       char c; c = 200;
+        //       char *p = &c;
+        //       return p[0] == -56;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC107: &[u8] = b"int main() { char c; c = 200; char *p = &c; return p[0] == -56; }";
+        let case107_result = compile_and_run_program_callable(SRC107.as_ptr() as u64, SRC107.len() as u64);
+        w(b"  case107 (p[0] through char* narrows exactly like *p, in-process) returned=");
+        if let Some(r) = case107_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case107_ok = case107_result == Some(1);
+        write_check(b"case107_char_ptr_index_read_narrows_returns_1=", case107_ok);
+
+        w(b"\n");
+
+        // CASE 108: the real, distinguishing proof that a WRITE through
+        // `p[0]` (a `char *`) is genuine aliasing into the pointee's own
+        // real stack slot, combined with proof the write side stays
+        // deliberately un-narrowed (unchanged by this milestone, exactly
+        // matching `*p = expr;`'s own Milestone 112 convention) -- the
+        // same "read back through a DIFFERENT access path than the one
+        // that wrote it" shape Milestone 112's own CASE 101 already
+        // established for `*p = expr;`, now proven for `p[idx] = expr;`
+        // specifically, a genuinely separate codegen arm
+        // (`STMT_ASSIGN_INDEX`, not `STMT_ASSIGN_DEREF`).
+        //   int main() {
+        //       char c; c = 5;
+        //       char *p = &c;
+        //       p[0] = 200;
+        //       return c == -56;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC108: &[u8] = b"int main() { char c; c = 5; char *p = &c; p[0] = 200; return c == -56; }";
+        let case108_result = compile_and_run_program_callable(SRC108.as_ptr() as u64, SRC108.len() as u64);
+        w(b"  case108 (p[0] = 200; through char* aliases the real pointee, write side stays full-width, in-process) returned=");
+        if let Some(r) = case108_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case108_ok = case108_result == Some(1);
+        write_check(b"case108_char_ptr_index_write_aliases_pointee_returns_1=", case108_ok);
+
+        w(b"\n");
+
+        // CASE 109: the real, distinguishing proof that all THREE
+        // `EXPR_INDEX` address-scaling shapes -- a real declared array
+        // (`is_array != 0`, 8-byte-scaled, unnarrowed, Milestone 108), an
+        // `int *` pointer (`is_array == 0, is_char_ptr == 0`, 8-byte-
+        // scaled, unnarrowed, Milestone 110), and a `char *` pointer
+        // (`is_array == 0, is_char_ptr != 0`, BYTE-scaled, narrowed, THIS
+        // milestone) -- coexist correctly in the SAME program with zero
+        // cross-contamination. `ip` is a real `int *` obtained by
+        // decaying `arr` (Milestone 110); a bug that accidentally routed
+        // every pointer index through the NEW byte-scaled/narrowed path
+        // (or left the new path inert, silently falling back to the old
+        // one) would still be individually plausible against CASE 107/108
+        // in isolation but fails here, since `ip[1] == 222` is only true
+        // if `int *` indexing stayed 8-byte-scaled and un-narrowed.
+        //   int main() {
+        //       int arr[2]; arr[0] = 111; arr[1] = 222;
+        //       int *ip = arr;
+        //       char c; c = 200;
+        //       char *cp = &c;
+        //       return (ip[0] == 111) + (ip[1] == 222) * 10 + (cp[0] == -56) * 100;
+        //   }
+        // Hand-computed: 1 + 10 + 100 = 111.
+        // -------------------------------------------------------------
+        const SRC109: &[u8] = b"int main() { int arr[2]; arr[0] = 111; arr[1] = 222; int *ip = arr; char c; c = 200; char *cp = &c; return (ip[0] == 111) + (ip[1] == 222) * 10 + (cp[0] == -56) * 100; }";
+        let case109_result = compile_and_run_program_callable(SRC109.as_ptr() as u64, SRC109.len() as u64);
+        w(b"  case109 (array/int*/char* indexing coexist with zero cross-contamination, in-process) returned=");
+        if let Some(r) = case109_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 111)\n");
+        let case109_ok = case109_result == Some(111);
+        write_check(b"case109_array_intptr_charptr_index_coexist_returns_111=", case109_ok);
+
+        w(b"\n");
+
+        let overall_m114 = case107_ok && case108_ok && case109_ok;
+        w(b"OVERALL_M114=");
+        w(if overall_m114 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 { 0 } else { 1 });
     }
 }
 

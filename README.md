@@ -8612,6 +8612,158 @@ self-test suite, genuinely open for a future pass.
       subscriber (Milestone 106) all remain exactly as Milestone 112 left
       them -- unrelated to this milestone.
 
+- [x] **Milestone 114**: `p[idx]`/`p[idx] = expr;` through a `char *` now
+      genuinely byte-scale (both arms) AND narrow (the read arm)
+      (`tools/cc_src/main.rs`) -- closing the exact asymmetry Milestone
+      112's own closing disclosure named ("`p[idx]` byte-scaled indexing
+      through a `char *` is a real, disclosed, NOT silently-corrected
+      gap") and Milestone 113's own closing disclosure re-named as newly
+      reachable through a parameter too.
+
+      **No grammar change at all**: `p[idx]` already parsed identically
+      regardless of `p`'s own declared pointee type. The real fix lives
+      entirely in what `EXPR_INDEX`/`STMT_ASSIGN_INDEX`'s existing
+      address-scaling codegen does once `find_var()`'s own `is_char_ptr`
+      field -- already threaded to both call sites since Milestone 112,
+      simply never consulted by either arm before now -- comes back true:
+      `EXPR_INDEX` skips `emit_shl_rcx_imm8(3)` (leaving the raw index
+      UNSCALED in RCX -- real C's own "one `char` is one byte" rule,
+      genuinely different from every `int`/`int *`/array index's own
+      "one element is 8 bytes" convention) and loads through the
+      resulting address with `emit_movsx_rax_mem_rax_byte()` instead of
+      the ordinary full-width `emit_mov_rax_mem_rax()` -- the exact same
+      narrowing encoding Milestone 112's own `*p` read already
+      introduced, reused here completely UNCHANGED. `STMT_ASSIGN_INDEX`
+      gets only the unscaled-index half (also skips
+      `emit_shl_rcx_imm8(3)` when `is_char_ptr != 0`) -- the STORE itself
+      stays deliberately full-width regardless, exactly matching
+      `*p = expr;`'s own Milestone 112 write-side convention (narrowing
+      only ever happens on READ). **Zero new x86_64 encodings**: this
+      milestone is pure branching among already hand-verified sequences,
+      the same shape Milestone 110 already achieved for `int *` crossing
+      a call boundary.
+
+      **The real, honest identity this closes**: at `idx == 0`, `p[0]`
+      now computes the byte-identical address and narrowed load `*p`
+      already does -- exactly the guarantee real C makes
+      (`p[0] == *(p+0) == *p`), and the ONLY case this milestone
+      independently hand-verifies (CASE 107/108 below). For a nonzero
+      index, the byte-stride fix is structurally real and correct (this
+      is what "`p[idx] == *(p+idx)`, byte-addressed" genuinely means),
+      but this milestone does NOT fabricate a hand-computed nonzero-index
+      test: no packed multi-char buffer exists anywhere in this language
+      (no `char[]`, no `malloc`-backed byte buffer, the same standing gap
+      Milestone 112 already named), so a real `char *` in this subset's
+      own grammar only ever points at a single scalar `char` variable's
+      own 8-byte `VarSlot` (via `&c`) -- `p[1]` steps one byte into
+      whatever real memory happens to sit adjacent to that slot, the same
+      real, disclosed, undefined-but-not-new "no bounds checking, wild
+      address reads whatever is there" territory an out-of-range array
+      index already occupies (Milestone 108's own disclosure), honestly
+      named rather than papered over with a case that tests nothing real.
+
+      **New self-test cases**, all three run in-process
+      (`CodegenMode::Callable`), the same tier Milestone 107 through 113
+      all already used for their own new cases -- no new real
+      `fork()`/`exec()`/`wait()` cycle is added by this milestone: CASE
+      107 (`p[0] == -56` through a `char *` -- the real, distinguishing
+      proof that `p[0]` now narrows exactly like `*p` already does; a
+      pre-fix build computes the SAME address at `idx == 0` but loads the
+      full un-narrowed 8 bytes, so this is a real regression check against
+      this milestone's own Milestone 113 baseline, not merely a fresh
+      assertion; expected `1`); CASE 108 (`p[0] = 200;` through a
+      `char *`, read back via `c` directly -- the real, distinguishing
+      proof that a write through `p[idx]` is genuine aliasing into the
+      pointee's own real stack slot, combined with proof the write side
+      stays deliberately un-narrowed, the same shape Milestone 112's own
+      CASE 101 already established for `*p = expr;`, now proven for the
+      genuinely separate `STMT_ASSIGN_INDEX` codegen arm; expected `1`);
+      CASE 109 (a real declared array, a decayed `int *`, and a `char *`
+      all indexed in the SAME program -- the real, distinguishing proof
+      that all three of `EXPR_INDEX`'s address-scaling shapes coexist
+      with zero cross-contamination: `ip[1] == 222` is only true if
+      `int *` indexing stayed 8-byte-scaled and un-narrowed while `cp[0]`
+      independently narrowed; expected `111`).
+
+      **No SNN/evidence-gate work this milestone, and correctly so**: this
+      is a pure compiler-frontend milestone -- branching among already
+      hand-verified encodings in two existing codegen arms, no kernel-side
+      subsystem decision anywhere in it for an evidence-gated hysteresis
+      gate to meaningfully subscribe to. The same carve-out Milestone 107
+      through 113 all already established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero warnings). `kernel/assets/cc.elf` rebuilt via the
+      project's own pinned-nightly `rustc` recipe (`tools/cc_src/
+      README.md`, unchanged) -- 99344 bytes, up from Milestone 113's
+      97856; the real `PT_LOAD` `p_memsz` via `readelf -l` is 84448 bytes,
+      still 21 pages (the same page count as Milestone 113, just more
+      bytes within it) -- comfortably under the 64-page per-segment cap
+      and 128-page total cap, no cap change needed. The rebuilt `cc.elf`
+      was independently re-derived from the current `main.rs` via a
+      from-scratch invocation of the exact same recipe and diffed
+      byte-for-byte identical against the committed binary (`cmp`, not
+      eyeballed). **Zero new compiler warnings** -- verified the same way
+      Milestone 109 through 113 verified their own: reproducing the
+      standalone `rustc` invocation against a `git stash` of this
+      milestone's own changes (a real, clean Milestone 113 checkout) and
+      diffing the sorted warning list against this milestone's own build
+      -- byte-for-byte identical 16-warning set.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m114_fresh_boot.log`/`m114_reused_boot.log`), no
+      stray `qemu-system-x86_64.exe` process before or after either boot
+      (checked via `tasklist`). `OVERALL_M114=PASS` on both boots -- CASE
+      107 returns `1`, CASE 108 returns `1`, CASE 109 returns `111`,
+      identically on both boots. Every marker this kernel has ever
+      produced was independently re-confirmed `PASS` on both boots via the
+      same real reconstruction script Milestone 113 introduced (matching
+      this kernel's own real `\r\n` serial line endings) -- 51 total
+      distinct markers across both styles (up from Milestone 113's 50,
+      the one new name being `OVERALL_M114` itself), all `PASS`, fresh and
+      reused in exact agreement, both boots' reconstructed marker sets
+      identical to each other. No regressions: the reused boot's own
+      `fs self-test: permissions`/`symlinks` FAIL-line set was diffed
+      directly (`diff`, not eyeballed) against Milestone 113's own reused
+      boot's FAIL-line set -- byte-for-byte identical, 54 lines, the same
+      pre-existing, already-disclosed Milestone 62-era fixture-cleanup
+      artifact every milestone since 70 has named; the fresh boot's own fs
+      self-test passes both suites cleanly (zero FAIL lines).
+      `run_preemption_demo()` ran to completion on BOTH boots (fresh:
+      `task0=2575 task1=2507 task2=2768`; reused: `task0=2582 task1=2588
+      task2=2890` -- real inter-boot timing jitter, consistent with every
+      prior milestone's own two-boot pairs) -- zero `run_preemption_
+      demo() SKIPPED` lines on either boot. Milestone 104's own
+      heap-pressure evidence-gate state came out BYTE-IDENTICAL to
+      Milestone 108 through 113's own recorded baseline on both boots:
+      `samples_taken=68 gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0` -- zero drift, consistent with this
+      milestone being pure compiler-frontend work with no new kernel
+      allocation path. Zero `panicked at`/`kernel panicked` and zero
+      `DOUBLE FAULT`/`TRIPLE FAULT` in either log (checked directly,
+      `grep -c`, zero matches in both).
+
+      **Still genuinely open**: no `char **`/multi-level pointers; no
+      array-to-pointer decay to a `char *`; no pointer arithmetic (`p + 1`/
+      `p++` remain entirely unimplemented, so `p[idx]`'s own internal
+      address arithmetic is the ONLY byte-scaled `char *` addressing this
+      codegen performs anywhere); no `int name[]`/`char name[]`
+      bracket-array parameter sugar; the newly-reachable `*f()`
+      direct-call-result narrowing gap Milestone 113 disclosed and proved
+      (CASE 106 there) is unrelated to and untouched by this milestone; no
+      `*p += 1;`/`p[idx] += 1;`-style compound assignment through any
+      pointer; no type system of any kind, so a mismatched `char *`/
+      `int *` argument or return is accepted without complaint exactly as
+      every other shape mismatch already silently is; no NULL-pointer
+      concept and no bounds/validity checking on any dereference or index.
+      `MAX_PARAMS` (8), no `sizeof`, `char` as the only non-`int` scalar
+      TYPE, the compiler self-test's own per-compile leak,
+      `heap_guard::admit()` covering only its original two call sites, and
+      `evidence_gate.rs` still having exactly one real subscriber
+      (Milestone 106) all remain exactly as Milestone 113 left them --
+      unrelated to this milestone.
+
 ## Building and running
 
 Requires:

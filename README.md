@@ -7291,6 +7291,120 @@ self-test suite, genuinely open for a future pass.
       covering only its original two call sites) remains open --
       unrelated to this kernel-only milestone.
 
+- [x] **Milestone 107**: real stack-passed-argument codegen, raising
+      `MAX_PARAMS` 4 -> 8 -- the exact `MAX_PARAMS` gap this README has
+      disclosed as "still genuinely open" in every compiler-frontend
+      milestone's own entry since Milestone 83 (`MAX_PARAMS` (4, needs
+      stack-passed arguments)). Before this milestone, `EXPR_CALL`'s own
+      call-site codegen pushed every argument in source order then popped
+      them back off in reverse into the four real SysV integer argument
+      registers (RDI/RSI/RDX/RCX) -- correct only because every argument
+      was always register-destined; a 5th argument had nowhere real to go
+      (there is no 5th argument register in this ABI) and `MAX_PARAMS`'s
+      own doc comment said so plainly. Fixed with two changes working
+      together: a new `MAX_REG_PARAMS: u64 = 4` constant, kept separate
+      from `MAX_PARAMS` so the "register vs. stack" boundary is one named
+      comparison rather than a bare `4` the two real call sites (the
+      call-site codegen and `gen_program()`'s own prologue) could drift
+      out of sync on; and the call-site push loop reversed to run argument
+      index `argc-1` down to `0` (instead of `0` up to `argc-1`), so
+      popping ASCENDING `0..MAX_REG_PARAMS` now lands each argument in its
+      own correct register (pop order equals argument index, not its
+      reverse) while any remaining arguments (index 4 and up) fall out
+      already sitting on the stack in the ascending order a real callee's
+      prologue expects at `[rbp+16]`, `[rbp+24]`, ... -- zero extra
+      push/pop work for the stack-passed tail. A new `emit_add_rsp_imm8()`
+      encoding (REX.W `83 /0`, same ModRM shape `emit_neg_rax()` already
+      uses for the unrelated F7 opcode's own digit field, individually
+      checked against the Intel SDM before being written) lets the caller
+      reclaim those bytes after the call returns, since the caller (not
+      the callee) is the one who pushed them.
+
+      **The one open precondition, actually checked, not assumed**:
+      reversing the push loop flips argument evaluation order from
+      left-to-right to right-to-left, which real C famously leaves
+      unspecified for exactly this reason because it CAN be a visible
+      behavior change when an argument sub-expression has a side effect a
+      sibling argument could observe. This milestone checked, directly
+      against this file's own grammar, whether that is possible in this
+      subset-C at all: no assignment EXPRESSION exists (only `STMT_ASSIGN`,
+      a statement -- `parse_ternary()`'s own production chain never
+      bottoms out at assignment), no `++`/`--` tokens exist in the lexer,
+      no global or static variables exist (every `VarSlot` is a
+      function-local stack slot), and no I/O is reachable from inside an
+      expression (a compiled program's only externally observable effect,
+      ever, is its own final `sys_exit(result)`). With no mutable shared
+      state and no I/O reachable from an expression, no subset-C argument
+      sub-expression can have any effect a sibling argument could observe
+      -- so the reordering is genuinely unobservable here, not merely
+      assumed safe by analogy to real C.
+
+      **Why 8, not something larger**: exactly what CASE 86 (below) needs
+      and exercises, nothing more -- raising it further with no concrete
+      program driving it would be the same "maximal generality over a
+      small real headroom" mistake this file's own `MAX_PENDING_CALLS` doc
+      comment already names as a discipline this codegen avoids.
+
+      **New self-test cases**: CASE 85 (`mix5`, five parameters -- the
+      first call this codegen has ever made with a genuinely stack-passed
+      argument, `e` at index 4) and CASE 86 (`mix8`, all eight of
+      `MAX_PARAMS` -- four register-passed, four stack-passed) each return
+      a base-10-digit-weighted encoding of every argument's own value (the
+      same technique CASE 26's `mix4` already established for the register
+      case), so a single scalar result proves every argument -- register-
+      and stack-passed alike -- landed in its own correct position, not
+      just that some commutative combination came out right. CASE 87
+      proves the cap moved rather than vanished: a 9-parameter function
+      definition (`MAX_PARAMS` + 1) is still a real, disclosed
+      `ParseError::TooManyParams`.
+
+      **Verified**: `cargo build` clean from the repo root (no new
+      warnings; the two pre-existing `dead_code` field-never-read warnings
+      on `CodeGenError::ArgCountMismatch(u64)`/`UndefinedLabel(u64)`
+      predate this milestone, confirmed by checking Milestone 106's own
+      `main.rs` for the same fields). `kernel/assets/cc.elf` rebuilt via
+      the project's own pinned-nightly `rustc` recipe
+      (`tools/cc_src/README.md`, unchanged) -- 84120 bytes, up from
+      Milestone 106's 82480; the checked-in `cc.elf` was independently
+      re-derived from the current `main.rs` this way and diffed
+      byte-for-byte identical against a from-scratch rebuild (`cmp`, not
+      eyeballed), so the committed binary is genuinely reproducible from
+      the committed source, not a stale or hand-edited artifact. Two real
+      QEMU boots against a genuinely fresh disk (`target/persist.img`/
+      `persist2.img` deleted first), `cargo run -- bios`, fresh then
+      reused, both run independently by this session (not merely trusting
+      logs a prior, rate-limit-interrupted session had already produced) --
+      `m107_fresh_boot.log`/`m107_reused_boot.log`. `OVERALL_M107=PASS` on
+      both boots, with CASE 85 returning 12345 (expected 12345), CASE 86
+      returning 12345678 (expected 12345678), and CASE 87 correctly
+      rejecting the 9-parameter definition, byte-identical between the two
+      boots (same heap addresses, same PIDs -- a fully deterministic
+      re-run). No regressions: every `OVERALL=`/`OVERALL_M*=` marker this
+      kernel has ever produced (Milestones 1-66's four aggregate checks
+      through `OVERALL_M103`) independently re-confirmed `PASS` in both
+      boots -- checked directly line-by-line, not sampled. The reused
+      boot's own `fs self-test: permissions`/`symlinks` `FAIL` lines are
+      the same pre-existing, already-disclosed Milestone 62-era
+      fixture-cleanup artifact every milestone since 70 has named --
+      diffed directly (not eyeballed) against Milestone 106's own reused
+      boot's FAIL-line set, byte-for-byte identical; the fresh boot's own
+      fs self-test passes both suites, matching every prior milestone's
+      fresh-boot pattern. Zero `panicked at`/`kernel panicked` and zero
+      `DOUBLE FAULT`/`TRIPLE FAULT` in either log (checked directly; the
+      four hits `grep`-matched in each log are `malloctest.elf`/
+      `stdiotest.elf`/`argvlauncher.elf`/`cc.elf`'s own "ran to completion
+      cleanly (no panic, no double fault)" self-test lines, not real
+      faults).
+
+      **Still genuinely open**: `MAX_PARAMS` still exists as a real cap,
+      now 8 instead of 4 -- not removed, moved (CASE 87 proves this every
+      boot). No arrays/pointers; no `sizeof`; `char` remains the only
+      non-`int` type; the compiler self-test's own per-compile leak
+      (named since Milestone 96); `heap_guard::admit()` covering only its
+      original two call sites; `evidence_gate.rs` still has exactly one
+      real subscriber (Milestone 106) -- all unrelated to this milestone,
+      all still open exactly as previously disclosed.
+
 ## Building and running
 
 Requires:

@@ -1033,6 +1033,57 @@
 // budget's edge -- verified for real against a live boot below (see
 // README.md's own Milestone 105 entry), not merely assumed safe from
 // Milestone 104's own arithmetic.
+//
+// MILESTONE 107 raises MAX_PARAMS 4 -> 8 by adding real stack-passed
+// argument codegen -- the exact landmine a prior session's own disclosed
+// groundwork identified but deliberately did not implement (see this
+// repo's README.md for that prior session's full note): the old call-site
+// codegen pushed every argument LEFT-TO-RIGHT then popped them back off in
+// REVERSE order into the (at most 4) real argument registers, which only
+// worked because every argument was register-destined; with more than 4
+// arguments some are stack-destined instead, and the old scheme buries
+// them under the register-destined ones in a way that cannot be popped out
+// without disturbing the rest. Fixed by reversing the push loop itself
+// (push argument index `argc-1` first, ... `0` last) and popping ASCENDING
+// (`0..min(argc, MAX_REG_PARAMS)`) instead of descending -- the exact fix
+// that prior session's own groundwork proposed, but this milestone
+// actually VERIFIED the one open precondition it flagged rather than
+// trusting it: whether this subset-C language can express any argument
+// sub-expression with an observable side effect, which would make
+// evaluation order (now right-to-left instead of left-to-right) a real,
+// externally visible behavior change. Checked directly against this
+// file's own grammar, not assumed -- this subset-C has (1) no assignment
+// EXPRESSION at all, only STMT_ASSIGN, a statement (`x = e;` is not
+// itself a value anywhere an argument position could use it -- see
+// parse_ternary()'s own production chain, which never bottoms out at
+// assignment), (2) no `++`/`--` tokens in the lexer at all, and (3) no
+// global or static variables of any kind (every VarSlot is a function-
+// local stack slot -- see collect_vars_for_function()'s own doc comment)
+// and no I/O a compiled program can perform (no print/write primitive is
+// exposed to compiled subset-C source; a compiled program's only
+// externally observable effect, ever, is its own single final
+// sys_exit(result)). With no assignment expressions, no increment/
+// decrement, no mutable shared state, and no I/O reachable from inside an
+// expression, no subset-C argument sub-expression can have ANY effect an
+// argument evaluated before or after it could observe -- so flipping
+// evaluation order is genuinely unobservable here, not merely assumed
+// safe by analogy to real C's own well-known unspecified-order allowance.
+// The new stack-argument tail this leaves behind lands exactly where a
+// real callee's own prologue reads it from (`[rbp+16]`, `[rbp+24]`, ...)
+// with zero extra push/pop work -- see the EXPR_CALL codegen's own updated
+// doc comment (gen_expr(), below) for the full derivation, and
+// gen_program()'s own updated prologue parameter-spill loop for the
+// receiving side. CASE 85 (`mix5`, five parameters -- the first call this
+// whole codegen has ever made with a genuinely stack-passed argument) and
+// CASE 86 (`mix8`, all eight of MAX_PARAMS -- four register, four stack)
+// each return a base-10-digit-weighted encoding of every argument's own
+// value (the same technique CASE 26's own `mix4` already established for
+// proving all 4 registers land correctly) so a single scalar return value
+// proves every argument -- register- AND stack-passed alike -- landed in
+// its own correct position, not just that some commutative combination of
+// them came out right. CASE 87 proves the cap itself: a 9-parameter
+// function definition (MAX_PARAMS + 1) is still a real, disclosed
+// ParseError::TooManyParams -- the cap moved, it was not removed.
 #![no_std]
 #![no_main]
 
@@ -1843,7 +1894,41 @@ struct ParamInfo {
 /// stack-passed-argument codegen (the 5th-and-later-argument case real
 /// SysV x86_64 handles via the stack) -- deferred future work, not
 /// attempted here.
-const MAX_PARAMS: u64 = 4;
+///
+/// MILESTONE 107: raised 4 -> 8, the same doubling Milestone 93 already
+/// used for MAX_FUNCS (4 -> 8) and Milestone 70 used for MAX_TOKENS
+/// (64 -> 128) -- and the real stack-passed-argument codegen this
+/// constant's own OLD doc comment (above) explicitly deferred is now
+/// built (see MAX_REG_PARAMS below, the EXPR_CALL call-site codegen, and
+/// gen_program()'s own prologue parameter-spill loop). Only the first
+/// MAX_REG_PARAMS (4) arguments/parameters still use a register --
+/// argument/parameter index 4 and up now genuinely lives on the stack,
+/// real SysV-style, not a further-widened register set (there is no 5th
+/// argument register in this ABI, real or invented). 8, not some larger
+/// number, because that is exactly what this milestone's own CASE 86
+/// (`mix8`, all 8 slots -- 4 register, 4 stack -- individually
+/// distinguished by a base-10-digit-weighted return value so a single
+/// scalar result proves every argument landed in its own correct
+/// position) needs and exercises; raising it further with no concrete
+/// program driving it would be exactly the "maximal generality over a
+/// small real headroom" mistake this file's own MAX_PENDING_CALLS doc
+/// comment below already names as a discipline this codegen avoids.
+const MAX_PARAMS: u64 = 8;
+
+/// MILESTONE 107: the maximum number of arguments/parameters that still
+/// travel through a real register -- kept as its own named constant,
+/// separate from MAX_PARAMS above, specifically so the boundary between
+/// "goes in a register" (index 0..3) and "lives on the stack" (index 4
+/// and up) is one obviously-named comparison at both real call sites
+/// (the EXPR_CALL codegen below, and gen_program()'s own prologue
+/// parameter-spill loop) rather than a bare `4` that could silently
+/// drift out of sync between the two if MAX_PARAMS is ever raised again.
+/// This is a real, physical fact about the ABI (there are only four
+/// argument registers, RDI/RSI/RDX/RCX -- see param_reg()'s own doc
+/// comment for why exactly these four, in this order), not a tunable
+/// knob; it should never need to change independently of the ISA this
+/// codegen targets.
+const MAX_REG_PARAMS: u64 = 4;
 
 /// MILESTONE 72: the maximum number of function definitions a single
 /// program may contain.
@@ -4257,6 +4342,28 @@ impl CodeBuf {
     unsafe fn emit_neg_rax(&mut self) {
         unsafe { self.push_bytes(&[0x48, 0xF7, 0xD8]) };
     }
+
+    /// MILESTONE 107: `add rsp, imm8` (REX.W 83 /0 ib) -- the real
+    /// caller-side stack cleanup a call with more than MAX_REG_PARAMS
+    /// arguments needs after it returns, to reclaim the bytes its own
+    /// EXPR_CALL codegen pushed for the callee's stack-passed argument
+    /// tail and deliberately never popped back off. Same ModRM SHAPE as
+    /// emit_prologue()'s own `sub rsp, imm8` (mod=11, rm=100=rsp, disp8-
+    /// sized immediate follows) -- only the middle 3 ModRM bits differ:
+    /// opcode-extension digit 0 (ADD) instead of digit 5 (SUB), the same
+    /// "middle ModRM bits pick which 83-family sub-opcode" shape
+    /// emit_neg_rax() above already relies on for the unrelated F7
+    /// opcode's own digit field. `0xC4` = mod=11/reg=000/rm=100,
+    /// individually hand-verified against the Intel SDM's own encoding
+    /// table before being written here, the same discipline every other
+    /// CodeBuf method above already used. `bytes` is always a small
+    /// multiple of 8 in practice (`stack_argc * 8`, and MAX_PARAMS -
+    /// MAX_REG_PARAMS is currently only 4 -- max 32), always comfortably
+    /// inside imm8's real signed range, so this never needs a wider
+    /// immediate encoding.
+    unsafe fn emit_add_rsp_imm8(&mut self, bytes: u8) {
+        unsafe { self.push_bytes(&[0x48, 0x83, 0xC4, bytes]) };
+    }
 }
 
 // MILESTONE 72: the real x86_64 register-number encodings
@@ -4281,10 +4388,21 @@ const REG_RDI: u8 = 7;
 
 /// The real argument-register-by-position lookup this milestone's own
 /// calling convention uses, both at a call site (after all arguments are
-/// evaluated and pushed, popped back off in reverse into these) and in a
-/// callee's own prologue (spilling each incoming register to its own
-/// stack slot) -- ONE real mapping, used both directions, rather than two
-/// independently-written tables that could silently drift apart.
+/// evaluated and pushed, popped back off into these) and in a callee's own
+/// prologue (spilling each incoming register to its own stack slot) -- ONE
+/// real mapping, used both directions, rather than two independently-
+/// written tables that could silently drift apart.
+///
+/// MILESTONE 107: callers must only ever pass `idx < MAX_REG_PARAMS` (4)
+/// now that MAX_PARAMS is 8 -- both real call sites (EXPR_CALL's codegen
+/// and gen_program()'s own prologue parameter-spill loop) already gate
+/// every call to this function behind exactly that check, so the `_ =>
+/// REG_RCX` arm below is unreachable in practice, kept only because it
+/// was already the correct, harmless behavior for `idx == 3` before this
+/// milestone and narrowing the match to a hard `panic!`/abort for `idx >=
+/// 4` would pull in the same `core::fmt` machinery this file's own top
+/// doc comment already explains this `#![no_std]`, `panic=abort` binary
+/// cannot afford to link.
 unsafe fn param_reg(idx: u64) -> u8 {
     match idx {
         0 => REG_RDI,
@@ -4383,43 +4501,80 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
             }
         }
         // MILESTONE 72: a call expression's own real codegen -- evaluate
-        // every argument left-to-right into RAX, PUSHing each one
-        // immediately after (the exact same "stack machine" technique
-        // EXPR_BINARY already uses for its own two operands just below,
-        // generalized past two operands to however many this call has),
-        // THEN pop them back off, in REVERSE order, into the real SysV
-        // integer argument registers (RDI, RSI, RDX, RCX, in that order --
-        // see param_reg()'s own doc comment above for why this exact
-        // ordering was chosen). Popping in reverse is not incidental: the
-        // stack is LIFO, so the LAST-pushed (highest-index) argument comes
-        // off FIRST -- this loop counts DOWN from the last argument index
-        // to the first, assigning each just-popped value to the register
-        // matching ITS OWN original argument index (not the pop order),
-        // which exactly undoes the push order above and lands every
-        // argument in the register a real callee's own prologue (see
-        // gen_program() below) expects it in. Finally, a real `call
-        // rel32` to the callee -- MILESTONE 74: no longer necessarily to
-        // an "already-known" code offset. gen_program() below now runs a
-        // real first pass that registers every function's own name/
-        // param_count before any body is compiled, so find_func() finds a
-        // real match here regardless of source order; what it returns as
-        // `code_off` may still be the real UNRESOLVED_CODE_OFF sentinel
-        // (a genuine forward reference -- the callee hasn't been
-        // compiled yet). If so, this emits a real placeholder instead
-        // (emit_call_placeholder()) and records a pending-patch entry
-        // (this field's own offset, the callee's own table index) for
-        // gen_program()'s own final backpatch pass to resolve once every
-        // function's own code_off is final -- otherwise (the callee is
-        // already compiled, backward reference or self), the exact
-        // original single-instruction emit_call() path runs, unchanged.
-        // On return, RAX already holds the callee's own result (its own
-        // RETURN statement's gen_expr() call already left it there before
-        // that function's epilogue ran) -- the same "gen_expr()'s own
-        // postcondition is always value-in-RAX" invariant this whole
-        // function already guarantees for every OTHER node kind, so a
-        // call expression composes with the rest of this codegen (as an
-        // operand of arithmetic, as another call's own argument, etc.)
-        // with zero special-casing anywhere else.
+        // every argument into RAX, PUSHing each one immediately after
+        // (the exact same "stack machine" technique EXPR_BINARY already
+        // uses for its own two operands just below, generalized past two
+        // operands to however many this call has), THEN pop the first
+        // MAX_REG_PARAMS of them back off into the real SysV integer
+        // argument registers (RDI, RSI, RDX, RCX, in that order -- see
+        // param_reg()'s own doc comment above for why this exact ordering
+        // was chosen), finally a real `call rel32` to the callee --
+        // MILESTONE 74: no longer necessarily to an "already-known" code
+        // offset. gen_program() below now runs a real first pass that
+        // registers every function's own name/param_count before any body
+        // is compiled, so find_func() finds a real match here regardless
+        // of source order; what it returns as `code_off` may still be the
+        // real UNRESOLVED_CODE_OFF sentinel (a genuine forward reference --
+        // the callee hasn't been compiled yet). If so, this emits a real
+        // placeholder instead (emit_call_placeholder()) and records a
+        // pending-patch entry (this field's own offset, the callee's own
+        // table index) for gen_program()'s own final backpatch pass to
+        // resolve once every function's own code_off is final --
+        // otherwise (the callee is already compiled, backward reference or
+        // self), the exact original single-instruction emit_call() path
+        // runs, unchanged. On return, RAX already holds the callee's own
+        // result (its own RETURN statement's gen_expr() call already left
+        // it there before that function's epilogue ran) -- the same
+        // "gen_expr()'s own postcondition is always value-in-RAX"
+        // invariant this whole function already guarantees for every
+        // OTHER node kind, so a call expression composes with the rest of
+        // this codegen (as an operand of arithmetic, as another call's
+        // own argument, etc.) with zero special-casing anywhere else.
+        //
+        // MILESTONE 107: the push loop below now runs argument index
+        // DESCENDING (`call_argc-1` downto `0`) instead of ascending --
+        // the real, deliberate fix for the exact landmine a prior
+        // session's own groundwork disclosed (see this file's own top
+        // Milestone 107 doc comment): with MAX_PARAMS now 8 but only
+        // MAX_REG_PARAMS (4) real argument registers, argument indices 4
+        // and up must end up sitting on the stack, in ascending order,
+        // for the callee's own prologue to read (see gen_program()'s own
+        // updated prologue comment for the receiving side) -- and the OLD
+        // ascending-push-then-descending-pop scheme buries them under the
+        // register-destined arguments instead of leaving them accessible.
+        // Pushing DESCENDING (argc-1 first, ... arg0 last) means arg0 ends
+        // up on TOP of the stack once every argument is pushed, with
+        // arg1, arg2, ... below it in ascending order -- so popping
+        // ASCENDING (0..min(call_argc, MAX_REG_PARAMS)) now correctly
+        // drains exactly the register-destined arguments off the top,
+        // lands each in ITS OWN matching register (pop order now equals
+        // argument index, not its reverse), and leaves any REMAINING
+        // arguments (index MAX_REG_PARAMS and up, if this call has more
+        // than 4) already sitting on the stack in exactly the ascending
+        // order the callee's own prologue expects at `[rbp+16]`,
+        // `[rbp+24]`, ... -- zero extra push/pop work needed for the
+        // stack-passed tail, it falls out of the SAME reversed push loop
+        // for free. This flips argument EVALUATION order from the
+        // original left-to-right to right-to-left, which would be a real
+        // observable behavior change in a language with expression side
+        // effects (C itself famously leaves this unspecified for exactly
+        // this reason) -- but this subset-C has neither assignment
+        // EXPRESSIONS (only STMT_ASSIGN, a statement -- see this file's
+        // own grammar; there is no EXPR_ASSIGN at all) nor `++`/`--` (no
+        // such tokens exist in this lexer) nor any global/static variable
+        // a nested call could mutate for a sibling argument to observe
+        // (every variable is a function-local stack slot -- see
+        // collect_vars_for_function()'s own doc comment) nor any I/O a
+        // compiled program can perform (no builtin print/write is exposed
+        // to compiled subset-C source; a program's only externally
+        // visible effect is its own single sys_exit(result) at the very
+        // end) -- so no subset-C argument sub-expression can have an
+        // effect observable by a sibling argument or by anything else,
+        // and this reordering is genuinely, verifiably unobservable, not
+        // merely assumed safe. Because the caller (not the callee) pushed
+        // the stack-passed tail, the caller must also clean it back off
+        // after the call returns -- see the real `emit_add_rsp_imm8()`
+        // call below.
         EXPR_CALL => {
             let target = unsafe { find_func(src_ptr, funcs_ptr, nfuncs, e.ident_off as u64, e.ident_len as u64) };
             let (code_off, callee_param_count, callee_idx) = match target {
@@ -4429,18 +4584,20 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
             if e.call_argc != callee_param_count {
                 return Err(CodeGenError::ArgCountMismatch(e.ident_off as u64));
             }
-            let mut ai: u64 = 0;
-            while ai < e.call_argc as u64 {
-                let arg_node = unsafe { call_arg_read(e.call_args_ptr, ai) };
+            let argc = e.call_argc as u64;
+            let mut ai_push: i64 = argc as i64 - 1;
+            while ai_push >= 0 {
+                let arg_node = unsafe { call_arg_read(e.call_args_ptr, ai_push as u64) };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, arg_node) }?;
                 unsafe { buf.emit_push_rax() };
-                ai += 1;
+                ai_push -= 1;
             }
-            let mut ai_rev: i64 = e.call_argc as i64 - 1;
-            while ai_rev >= 0 {
-                let reg = unsafe { param_reg(ai_rev as u64) };
+            let reg_argc = if argc > MAX_REG_PARAMS { MAX_REG_PARAMS } else { argc };
+            let mut ai_pop: u64 = 0;
+            while ai_pop < reg_argc {
+                let reg = unsafe { param_reg(ai_pop) };
                 unsafe { buf.emit_pop_reg(reg) };
-                ai_rev -= 1;
+                ai_pop += 1;
             }
             if code_off == UNRESOLVED_CODE_OFF {
                 // MILESTONE 74: genuine forward reference -- emit a real
@@ -4454,6 +4611,20 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 unsafe { core::ptr::write(pending_count_ptr as *mut u64, cnt + 1) };
             } else {
                 unsafe { buf.emit_call(code_off) };
+            }
+            // MILESTONE 107: caller-cleans-stack -- any argument past
+            // MAX_REG_PARAMS was left on the stack (deliberately never
+            // popped above) for the callee's own prologue to read
+            // directly; the CALLER is the one who pushed those bytes, so
+            // the caller is the one who must reclaim them now that the
+            // callee has returned (RAX already holds the result; this
+            // adjustment only moves RSP, it never touches RAX). A call
+            // with <= MAX_REG_PARAMS arguments (every call before this
+            // milestone, and the overwhelming majority of calls after it)
+            // takes stack_argc == 0 here and this is a real, cheap no-op.
+            let stack_argc = argc - reg_argc;
+            if stack_argc > 0 {
+                unsafe { buf.emit_add_rsp_imm8((stack_argc * 8) as u8) };
             }
         }
         // MILESTONE 76: unary minus -- evaluate the one operand into RAX
@@ -5313,11 +5484,45 @@ unsafe fn gen_program(src_ptr: u64, prog_head: u64, mode: CodegenMode) -> Result
         // encoding/convention reasoning. Each parameter's own stack slot
         // was already assigned by collect_vars_for_function() above, in
         // the SAME declaration order param_reg() itself indexes by.
+        //
+        // MILESTONE 107: parameter index MAX_REG_PARAMS (4) and up is no
+        // longer spillable from a register at all -- there is no 5th
+        // argument register in this ABI -- so this loop now branches on
+        // exactly the same MAX_REG_PARAMS boundary the EXPR_CALL call-site
+        // codegen above uses. For pi < MAX_REG_PARAMS, completely
+        // UNCHANGED: spill the incoming register to this parameter's own
+        // local slot. For pi >= MAX_REG_PARAMS, this parameter arrives on
+        // the STACK instead, at `[rbp + 16 + 8*(pi - MAX_REG_PARAMS)]` --
+        // `+16` clears the two real 8-byte values this function's own
+        // `emit_prologue()` just pushed below the caller's stack-argument
+        // tail (the `call` instruction's own return address, then this
+        // prologue's `push rbp`), and each further stack-passed parameter
+        // sits 8 bytes higher, in ascending index order -- the exact
+        // layout the EXPR_CALL codegen's own reversed push loop was built
+        // to leave behind (see that codegen's own Milestone 107 doc
+        // comment for the caller-side derivation). Reads that caller-
+        // supplied value into RAX via emit_mov_rax_rbp_off() (an EXISTING
+        // encoding, completely unmodified -- it already supports a
+        // positive disp8, this is simply the first call site that ever
+        // passes it one) and then stores it into this parameter's own
+        // local slot via emit_mov_rbp_off_rax() (also existing, also
+        // unmodified) -- zero new x86_64 encodings needed for the
+        // callee's receiving side, only emit_add_rsp_imm8() (new, see its
+        // own doc comment) on the caller side. RAX is safe to clobber
+        // here: this loop runs once per function, entirely before
+        // gen_stmt_list() emits the function's own body, so no live value
+        // survives across one parameter's copy into the next.
         let mut pi: u64 = 0;
         while pi < f.param_count as u64 {
             let off = -8 * (pi as i32 + 1);
-            let reg = unsafe { param_reg(pi) };
-            unsafe { buf.emit_mov_rbp_off_reg(off, reg) };
+            if pi < MAX_REG_PARAMS {
+                let reg = unsafe { param_reg(pi) };
+                unsafe { buf.emit_mov_rbp_off_reg(off, reg) };
+            } else {
+                let caller_off = 16 + 8 * (pi as i32 - MAX_REG_PARAMS as i32);
+                unsafe { buf.emit_mov_rax_rbp_off(caller_off) };
+                unsafe { buf.emit_mov_rbp_off_rax(off) };
+            }
             pi += 1;
         }
 
@@ -8725,7 +8930,102 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m103 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 107: raises MAX_PARAMS 4 -> 8 via real stack-passed
+        // argument codegen -- the first time this codegen has ever
+        // needed to place an argument/parameter anywhere other than a
+        // register. EXPR_CALL's own call-site codegen now pushes
+        // arguments in REVERSE index order (so ascending pop order lands
+        // the first MAX_REG_PARAMS (4) of them in RDI/RSI/RDX/RCX,
+        // leaving any remainder already correctly positioned on the
+        // stack) and cleans that remainder back off via the new
+        // emit_add_rsp_imm8() after the call returns; gen_program()'s own
+        // prologue now reads a stack-passed parameter from
+        // `[rbp+16+8*(idx-4)]` into its own local slot via two EXISTING
+        // encodings (emit_mov_rax_rbp_off()/emit_mov_rbp_off_rax()), zero
+        // new receiving-side opcodes. See this file's own top Milestone
+        // 107 doc comment for the full derivation, including the real,
+        // checked (not assumed) argument-evaluation-order-is-unobservable
+        // proof this reversal relies on.
+        // -------------------------------------------------------------
+        // CASE 85: five parameters -- the first call this whole codegen
+        // has ever made with a genuinely stack-passed argument (`e`,
+        // index 4). A base-10-digit-weighted return value, the same
+        // technique CASE 26's own `mix4` established for proving all 4
+        // registers land correctly, extended one slot past the register
+        // boundary: any mixup between the four register-passed arguments
+        // and the one stack-passed argument -- wrong value, wrong slot,
+        // register argument accidentally clobbered by the stack-cleanup
+        // add rsp -- changes this single scalar result.
+        //   int mix5(int a,int b,int c,int d,int e){
+        //       return a*10000+b*1000+c*100+d*10+e; }
+        //   int main() { return mix5(1, 2, 3, 4, 5); }
+        // Hand-computed: 1*10000+2*1000+3*100+4*10+5 = 12345.
+        const SRC85: &[u8] = b"int mix5(int a, int b, int c, int d, int e) { return a * 10000 + b * 1000 + c * 100 + d * 10 + e; } int main() { return mix5(1, 2, 3, 4, 5); }";
+        let case85_result = compile_and_run_program_callable(SRC85.as_ptr() as u64, SRC85.len() as u64);
+        w(b"  case85 (mix5(1,2,3,4,5), real 5-param call -- first stack-passed argument, in-process) returned=");
+        if let Some(r) = case85_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12345)\n");
+        let case85_ok = case85_result == Some(12345);
+        write_check(b"case85_five_param_call_returns_12345=", case85_ok);
+
+        w(b"\n");
+
+        // CASE 86: all 8 of MAX_PARAMS -- 4 register-passed, 4 stack-
+        // passed -- the full-width stress case. Same digit-weighted
+        // technique, now across the whole parameter list, so a single
+        // scalar return value proves every one of the 8 arguments landed
+        // in its own correct position, register- and stack-passed alike.
+        //   int mix8(int a,int b,int c,int d,int e,int f,int g,int h){
+        //       return a*10000000+b*1000000+c*100000+d*10000
+        //            + e*1000+f*100+g*10+h; }
+        //   int main() { return mix8(1,2,3,4,5,6,7,8); }
+        // Hand-computed: 12345678.
+        const SRC86: &[u8] = b"int mix8(int a, int b, int c, int d, int e, int f, int g, int h) { return a * 10000000 + b * 1000000 + c * 100000 + d * 10000 + e * 1000 + f * 100 + g * 10 + h; } int main() { return mix8(1, 2, 3, 4, 5, 6, 7, 8); }";
+        let case86_result = compile_and_run_program_callable(SRC86.as_ptr() as u64, SRC86.len() as u64);
+        w(b"  case86 (mix8(1..8), real 8-param call -- full MAX_PARAMS width, 4 register + 4 stack, in-process) returned=");
+        if let Some(r) = case86_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12345678)\n");
+        let case86_ok = case86_result == Some(12345678);
+        write_check(b"case86_eight_param_call_returns_12345678=", case86_ok);
+
+        w(b"\n");
+
+        // CASE 87: the cap itself -- a 9-parameter function definition
+        // (MAX_PARAMS + 1) is still a real, disclosed
+        // ParseError::TooManyParams. Proves the cap MOVED (4 -> 8), not
+        // that it was quietly removed.
+        //   int nine(int a,int b,int c,int d,int e,int f,int g,int h,int i)
+        //   { return a; }
+        const SRC87: &[u8] = b"int nine(int a, int b, int c, int d, int e, int f, int g, int h, int i) { return a; }";
+        let case87_ok = match lex_and_parse_program(SRC87.as_ptr() as u64, SRC87.len() as u64) {
+            Err(_) => {
+                w(b"  case87 9-parameter function definition rejected (TooManyParams), as expected\n");
+                true
+            }
+            Ok(_) => {
+                w(b"  case87 expected a ParseError::TooManyParams for a 9th parameter, got Ok\n");
+                false
+            }
+        };
+        write_check(b"case87_ninth_parameter_is_too_many_params=", case87_ok);
+
+        w(b"\n");
+
+        let overall_m107 = case85_ok && case86_ok && case87_ok;
+        w(b"OVERALL_M107=");
+        w(if overall_m107 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 { 0 } else { 1 });
     }
 }
 

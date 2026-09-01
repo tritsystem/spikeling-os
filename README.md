@@ -6614,6 +6614,43 @@ self-test suite, genuinely open for a future pass.
       separate tokens); the compiler self-test still leaks per-compile
       (bounded, not eliminated); one 4 KiB stack page per process.
 
+- [x] **Milestone 99**: `do { ... } while (cond);` in the self-hosted
+      subset-C compiler -- the **third and last loop form**, with real
+      code generation. A distinct `STMT_DOWHILE` AST kind (not a flag on
+      `STMT_WHILE`, so the existing `while`/`for` codegen is untouched).
+      Lowering: body first, then the condition and a backward jump at
+      the bottom, so the body always runs at least once:
+      `body_top: <body>; <cond>; test; jz exit; jmp body_top; exit:`.
+      `break` and `continue` bind to the `do`-loop through the same
+      `LOOP_BRK`/`LOOP_CONT` static-arena save/restore that
+      `STMT_WHILE` uses; `continue` targets the **bottom** condition
+      re-check, reached by the same forward-patched-placeholder path a
+      `for` loop's `continue` uses for its step clause (the body is
+      recursed with `loop_is_for = 1`). **Zero new `CodeBuf`
+      encodings.** New keyword token `TOK_DO`; `collect_vars_rec` walks
+      the `do`-body for declarations exactly like the other loops.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`, 76752
+      bytes). Two QEMU boots, fresh then reused. CASE 70 (in-process --
+      `do { sum += i; i += 1; } while (i < 5)`, iterates and
+      accumulates) returns `10`; CASE 71 (in-process -- `break` +
+      `continue` inside a `do`-loop, `continue` proven to hit the
+      bottom guard) returns `12`; CASE 72 (on-disk ELF64 + real
+      `exec()`/`wait()` -- a `do`-while factorial) exits `120`. All
+      three, both boots. `OVERALL_M99=PASS`, `OVERALL_M68`..`M98` all
+      still PASS and byte-identical fresh vs. reused. `milestone 64`/`65`
+      PASS both boots. No regressions.
+
+      This subset's C control flow is now complete across all three
+      loop forms: **if/else, while, for, do-while, break/continue,
+      switch/case/default, goto/labels**, plus calls and direct +
+      mutual recursion.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; the `char` *type* and all width
+      tracking; the compiler self-test still leaks per-compile (bounded,
+      not eliminated); one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

@@ -899,7 +899,22 @@
 // unsigned/narrower types exist here). CASE 68 (`+x + +3 * +2` -> 11)
 // and CASE 69 (`-+-x` with x=10 -> 10).
 //
-// Still genuinely open after Milestone 98: `MAX_PARAMS` (4, needs
+// MILESTONE 99 adds `do { body } while (cond);` -- the third and last
+// loop form, with real codegen (a distinct STMT_DOWHILE kind, NOT a
+// flag on STMT_WHILE). Body-first, condition and its backward jump at
+// the bottom, so the body always runs at least once. `break` and
+// `continue` bind to it through the exact LOOP_BRK/LOOP_CONT arena
+// save/restore STMT_WHILE uses; `continue` targets the bottom
+// condition re-check via the same forward-patched-placeholder path a
+// `for` loop's `continue` uses to reach its step clause (the body is
+// recursed with loop_is_for = 1). Zero new CodeBuf encodings. CASE 70
+// (in-process, sum 0..4 -> 10), CASE 71 (in-process, `break` +
+// `continue` -> 12), CASE 72 (on-disk ELF + real exec(), factorial
+// -> 120). This subset's C control flow is now: if/else, while, for,
+// do-while, break/continue, switch/case/default, goto/labels, calls,
+// direct + mutual recursion.
+//
+// Still genuinely open after Milestone 99: `MAX_PARAMS` (4, needs
 // stack-passed arguments); no arrays/pointers; only the `int` type
 // (a `char` literal is just an int, there is still no `char` type or
 // any width tracking); the compiler self-test still leaks per-compile
@@ -1112,6 +1127,12 @@ const TOK_DEFAULT: u8 = 52; // keyword "default"
 // is a real CodeGenError::UndefinedLabel.
 const TOK_GOTO: u8 = 53; // keyword "goto"
 
+// MILESTONE 99: `do { ... } while ( cond ) ;` -- the third and last
+// loop form. Body runs once before the first condition test; `break`
+// and `continue` bind to it exactly like the other two loops
+// (`continue` targeting the bottom-of-body condition re-check).
+const TOK_DO: u8 = 54; // keyword "do"
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Token {
@@ -1253,6 +1274,8 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
                 TOK_DEFAULT // MILESTONE 91
             } else if unsafe { word_is(src_ptr, start, wlen, b"goto") } {
                 TOK_GOTO // MILESTONE 92
+            } else if unsafe { word_is(src_ptr, start, wlen, b"do") } {
+                TOK_DO // MILESTONE 99
             } else {
                 TOK_IDENT
             };
@@ -1650,6 +1673,7 @@ const STMT_SWITCH: u8 = 8; // MILESTONE 91: expr = discriminant, then_body = cha
 const STMT_CASE: u8 = 9; // MILESTONE 91: one `case INTLIT:` -- expr = an EXPR_INTLIT for the label value, then_body = this case's own stmt list, next = the following STMT_CASE
 const STMT_LABEL: u8 = 10; // MILESTONE 92: `LABEL :` -- ident_off/ident_len name the label; no body (the following statement is a separate list node)
 const STMT_GOTO: u8 = 11; // MILESTONE 92: `goto LABEL ;` -- ident_off/ident_len name the target
+const STMT_DOWHILE: u8 = 12; // MILESTONE 99: `do { body } while (cond);` -- expr = cond, then_body = body list; body first, condition at the bottom
 
 #[repr(C)]
 struct StmtNode {
@@ -2711,6 +2735,41 @@ impl Parser {
                 };
                 Ok(node)
             }
+            // MILESTONE 99: `do "{" stmt* "}" while "(" ternary ")" ";"`.
+            // Same `{ ... }` body shape as `while`, but the condition
+            // (and its `)` and the trailing `;`) come AFTER the body.
+            // Lowered to its own STMT_DOWHILE (expr = cond, then_body =
+            // body) -- a distinct kind, not a flag on STMT_WHILE, so
+            // STMT_WHILE's own codegen is untouched.
+            TOK_DO => {
+                unsafe { self.advance() };
+                unsafe { self.expect(TOK_LBRACE) }?;
+                let body = unsafe { self.parse_stmt_list_until_rbrace() }?;
+                unsafe { self.expect(TOK_WHILE) }?;
+                unsafe { self.expect(TOK_LPAREN) }?;
+                let cond = unsafe { self.parse_ternary() }?;
+                unsafe { self.expect(TOK_RPAREN) }?;
+                unsafe { self.expect(TOK_SEMI) }?;
+                let node = unsafe { alloc_stmt() };
+                if node == 0 {
+                    return Err(ParseError::OutOfMemory);
+                }
+                unsafe {
+                    core::ptr::write(
+                        node as *mut StmtNode,
+                        StmtNode {
+                            kind: STMT_DOWHILE,
+                            ident_off: 0,
+                            ident_len: 0,
+                            expr: cond,
+                            next: 0,
+                            then_body: body,
+                            else_body: 0,
+                        },
+                    )
+                };
+                Ok(node)
+            }
             // MILESTONE 87: `break ;` and `continue ;` -- two trivial
             // leaf statements. All the real work is codegen-side (the
             // loop-context stack in gen_stmt_list); the parser just
@@ -3377,6 +3436,10 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // keeping it symmetric with STMT_IF is correct, not lucky.
             unsafe { collect_vars_rec(s.then_body, vars_ptr, n) }?;
             unsafe { collect_vars_rec(s.else_body, vars_ptr, n) }?;
+        } else if s.kind == STMT_DOWHILE {
+            // MILESTONE 99: same recursive-DECL walk into the loop body
+            // as STMT_WHILE (the condition is an expression, no decls).
+            unsafe { collect_vars_rec(s.then_body, vars_ptr, n) }?;
         } else if s.kind == STMT_SWITCH {
             // MILESTONE 91: `then_body` is a chain of STMT_CASE nodes
             // (handled just below), `else_body` is the `default` list.
@@ -4551,6 +4614,53 @@ unsafe fn gen_stmt_list(
 
                 // exit: the `jz` (condition false) and every `break` land here.
                 unsafe { buf.patch_rel32(jz_field) };
+                let bn = unsafe { loop_brk_n() };
+                let mut j = brk_base;
+                while j < bn {
+                    unsafe { buf.patch_rel32(loop_brk_at(j)) };
+                    j += 1;
+                }
+                unsafe { loop_set_brk_n(brk_base) };
+            }
+            // MILESTONE 99: `do { body } while (cond);` -- body FIRST,
+            // condition at the BOTTOM:
+            //   body_top:  <body>                (gen_stmt_list)
+            //   cont_tgt:  <condition>           (gen_expr, into RAX)
+            //              test rax, rax
+            //              jz exit               (forward-patched)
+            //              jmp body_top          (BACKWARD -- repeat)
+            //   exit:
+            // The body runs unconditionally once before the first test.
+            // `continue` inside the body must reach `cont_tgt` (the
+            // condition), which is not emitted until after the body --
+            // exactly the "forward jump into the loop's cont patch list"
+            // situation a `for` loop's `continue` already handles, so the
+            // body is recursed with loop_is_for = 1 and every pending
+            // continue is patched to `cont_tgt` here. `break` uses the
+            // same LOOP_BRK arena + save/restore as STMT_WHILE. Zero new
+            // encodings.
+            STMT_DOWHILE => {
+                let body_top = buf.len;
+                let brk_base = unsafe { loop_brk_n() };
+                let cont_base = unsafe { loop_cont_n() };
+
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, body_top, 1, 1) }?;
+
+                // `continue` target: the condition re-check, right here.
+                let cn = unsafe { loop_cont_n() };
+                let mut i = cont_base;
+                while i < cn {
+                    unsafe { buf.patch_rel32(loop_cont_at(i)) };
+                    i += 1;
+                }
+                unsafe { loop_set_cont_n(cont_base) };
+
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
+                unsafe { buf.emit_test_rax_rax() };
+                let jz_out = unsafe { buf.emit_jz_placeholder() };
+                unsafe { buf.emit_jmp_back(body_top) };
+                unsafe { buf.patch_rel32(jz_out) };
+
                 let bn = unsafe { loop_brk_n() };
                 let mut j = brk_base;
                 while j < bn {
@@ -7878,7 +7988,99 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m98 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 { 0 } else { 1 });
+        // ===============================================================
+        // MILESTONE 99: `do { body } while (cond);` -- the third loop
+        // form. Real codegen (STMT_DOWHILE, body-first, condition at the
+        // bottom, backward jump), reusing STMT_WHILE's LOOP_BRK/LOOP_CONT
+        // arena save/restore and the `for`-style forward-patched
+        // `continue`. Three cases: 70 in-process (loops N times, sums),
+        // 71 in-process (`break` + `continue` bind to the do-while, and
+        // `continue` targets the bottom condition), 72 on-disk ELF +
+        // real exec()/wait() (factorial).
+        // ===============================================================
+
+        // CASE 70: a do-while that iterates and accumulates.
+        //   int main() {
+        //       int i = 0; int sum = 0;
+        //       do { sum = sum + i; i = i + 1; } while (i < 5);
+        //       return sum;
+        //   }
+        // Hand-computed: i runs 0,1,2,3,4 (the guard `i < 5` fails at
+        // i == 5, AFTER the body that made it 5). sum = 0+1+2+3+4 = 10.
+        const SRC70: &[u8] = b"int main() { int i = 0; int sum = 0; do { sum = sum + i; i = i + 1; } while (i < 5); return sum; }";
+        let case70_result = compile_and_run_program_callable(SRC70.as_ptr() as u64, SRC70.len() as u64);
+        w(b"  case70 (do-while sum 0..4, in-process) returned=");
+        if let Some(r) = case70_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 10)\n");
+        let case70_ok = case70_result == Some(10);
+        write_check(b"case70_do_while_sum_returns_10=", case70_ok);
+
+        w(b"\n");
+
+        // CASE 71: `break` and `continue` inside a do-while.
+        //   int main() {
+        //       int i = 0; int sum = 0;
+        //       do {
+        //           i = i + 1;
+        //           if (i == 3) { continue; }
+        //           if (i == 6) { break; }
+        //           sum = sum + i;
+        //       } while (i < 100);
+        //       return sum;
+        //   }
+        // Hand-computed: i=1 -> sum 1; i=2 -> sum 3; i=3 -> continue
+        // (condition still checked, 3 < 100 true); i=4 -> sum 7; i=5 ->
+        // sum 12; i=6 -> break. return 12. A `continue` that jumped to
+        // the top (skipping the guard) would still work here, but one
+        // that skipped the increment would loop forever; a `continue`
+        // that skipped the guard AND a `break` that fell through would
+        // both give the wrong sum.
+        const SRC71: &[u8] = b"int main() { int i = 0; int sum = 0; do { i = i + 1; if (i == 3) { continue; } if (i == 6) { break; } sum = sum + i; } while (i < 100); return sum; }";
+        let case71_result = compile_and_run_program_callable(SRC71.as_ptr() as u64, SRC71.len() as u64);
+        w(b"  case71 (do-while with break + continue, in-process) returned=");
+        if let Some(r) = case71_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12)\n");
+        let case71_ok = case71_result == Some(12);
+        write_check(b"case71_do_while_break_and_continue_returns_12=", case71_ok);
+
+        w(b"\n");
+
+        // CASE 72: a do-while factorial through the on-disk ELF + real
+        // exec()/wait() path.
+        //   int main() {
+        //       int n = 5; int f = 1;
+        //       do { f = f * n; n = n - 1; } while (n > 0);
+        //       return f;
+        //   }
+        // Hand-computed: 5*4*3*2*1 = 120; the guard `n > 0` fails at
+        // n == 0, AFTER the body multiplied by 1. Exit code 120.
+        const SRC72: &[u8] = b"int main() { int n = 5; int f = 1; do { f = f * n; n = n - 1; } while (n > 0); return f; }";
+        const PATH72: &[u8] = PATH8;
+        let (elf72_ptr, elf72_len) = compile_program_standalone_elf(SRC72.as_ptr() as u64, SRC72.len() as u64);
+        let case72_ok = if elf72_ptr == 0 {
+            w(b"  case72 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH72, elf72_ptr, elf72_len, 120)
+        };
+        write_check(b"case72_real_elf_exec_do_while_factorial_returns_120=", case72_ok);
+
+        w(b"\n");
+
+        let overall_m99 = case70_ok && case71_ok && case72_ok;
+        w(b"OVERALL_M99=");
+        w(if overall_m99 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 { 0 } else { 1 });
     }
 }
 

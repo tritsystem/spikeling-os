@@ -6587,6 +6587,33 @@ self-test suite, genuinely open for a future pass.
       tracking; the compiler self-test still leaks per-compile (bounded,
       not eliminated); one 4 KiB stack page per process.
 
+- [x] **Milestone 98**: unary `+` in the self-hosted subset-C compiler
+      -- a **parse-time no-op**. `parse_unary()` consumes a leading `+`
+      and returns the operand's own parse directly: no `EXPR_UNARY`
+      node, no codegen, no new token (`TOK_PLUS` already existed). It
+      sits in the same tightest-precedence slot as unary `-`/`~`/`!`
+      and composes with all of them through the same recursion (`-+-x`,
+      `+!x` parse). **Deliberate**: it does *not* force non-negativity
+      or any conversion -- there are no unsigned or narrower types in
+      this subset for it to convert to, so on `int` it is genuinely
+      identity.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`, 74352
+      bytes). Two QEMU boots, fresh then reused. CASE 68 (in-process --
+      `+x + +3 * +2` with `x = +5`, unary `+` on a literal, on a
+      variable, and adjacent to `*`) returns `11`; CASE 69 (`-+-x` with
+      `x = 10`, proving `+` composes with `-` and is a true no-op)
+      returns `10`. Both boots. `OVERALL_M98=PASS`, `OVERALL_M68`..`M97`
+      all still PASS and byte-identical fresh vs. reused. `milestone
+      64`/`65` PASS both boots. No regressions.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; the `char` *type* and all width
+      tracking; `++`/`--` (this subset has neither and won't get them
+      from unary `+`/`-` alone -- the lexer emits adjacent signs as
+      separate tokens); the compiler self-test still leaks per-compile
+      (bounded, not eliminated); one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

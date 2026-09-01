@@ -891,7 +891,15 @@
 // `'A' + ('a'-'A') + '\n' + '\0'` -> 107) and CASE 67 (the
 // multi-char-constant LexError path).
 //
-// Still genuinely open after Milestone 97: `MAX_PARAMS` (4, needs
+// MILESTONE 98 adds unary `+` -- a parse-time no-op. `parse_unary()`
+// consumes a leading `TOK_PLUS` and returns the operand's own parse
+// directly: no EXPR_UNARY node, no codegen, same tightest-precedence
+// slot as unary `-`/`~`/`!`, composes with all of them (`-+-x`, `+!x`
+// parse). It does not force non-negativity or any conversion (no
+// unsigned/narrower types exist here). CASE 68 (`+x + +3 * +2` -> 11)
+// and CASE 69 (`-+-x` with x=10 -> 10).
+//
+// Still genuinely open after Milestone 98: `MAX_PARAMS` (4, needs
 // stack-passed arguments); no arrays/pointers; only the `int` type
 // (a `char` literal is just an int, there is still no `char` type or
 // any width tracking); the compiler self-test still leaks per-compile
@@ -2009,6 +2017,18 @@ impl Parser {
     /// (`!!x`, `!-x`, `-!x`, `~!x` are all real, legal parses here).
     unsafe fn parse_unary(&mut self) -> Result<u64, ParseError> {
         let k = unsafe { self.peek() }.kind;
+        // MILESTONE 98: unary `+` is a genuine no-op on this subset's
+        // only type (`int`) -- consume the token and return the
+        // operand's own parse directly, with NO EXPR_UNARY node and NO
+        // codegen. Same tightest-precedence slot as unary `-`/`~`/`!`,
+        // and it composes with them through the same recursion (`+-x`,
+        // `-+x`, `+!x`, `-+-x` all parse). Deliberate: it does not force
+        // non-negativity or any conversion -- there are no unsigned or
+        // narrower types here for it to convert to.
+        if k == TOK_PLUS {
+            unsafe { self.advance() };
+            return unsafe { self.parse_unary() };
+        }
         let op = if k == TOK_MINUS {
             OP_NEG
         } else if k == TOK_TILDE {
@@ -7809,7 +7829,56 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m97 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 98: unary `+` (a parse-time no-op -- no AST node, no
+        // codegen). CASE 68 (in-process Callable path): `+` on a
+        // literal, on a variable, and next to `*`.
+        //   int main() {
+        //       int x = +5;
+        //       return +x + +3 * +2;
+        //   }
+        // Hand-computed: x = 5; +3 * +2 = 6; 5 + 6 = 11. If unary `+`
+        // were mis-parsed as a binary `+` (missing left operand) this
+        // would fail to compile.
+        // -------------------------------------------------------------
+        const SRC68: &[u8] = b"int main() { int x = +5; return +x + +3 * +2; }";
+        let case68_result = compile_and_run_program_callable(SRC68.as_ptr() as u64, SRC68.len() as u64);
+        w(b"  case68 (unary + on literal/var/next-to-*) returned=");
+        if let Some(r) = case68_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case68_ok = case68_result == Some(11);
+        write_check(b"case68_unary_plus_is_a_noop_returns_11=", case68_ok);
+
+        w(b"\n");
+
+        // CASE 69: unary `+` composes with unary `-` through the same
+        // recursion, and is a true no-op (does not force sign).
+        //   int main() { int x = 10; return -+-x; }
+        // Hand-computed: -x = -10; +(-10) = -10; -(-10) = 10.
+        const SRC69: &[u8] = b"int main() { int x = 10; return -+-x; }";
+        let case69_result = compile_and_run_program_callable(SRC69.as_ptr() as u64, SRC69.len() as u64);
+        w(b"  case69 (-+-x, unary + composes with unary -) returned=");
+        if let Some(r) = case69_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 10)\n");
+        let case69_ok = case69_result == Some(10);
+        write_check(b"case69_unary_plus_composes_with_unary_minus_returns_10=", case69_ok);
+
+        w(b"\n");
+
+        let overall_m98 = case68_ok && case69_ok;
+        w(b"OVERALL_M98=");
+        w(if overall_m98 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 { 0 } else { 1 });
     }
 }
 

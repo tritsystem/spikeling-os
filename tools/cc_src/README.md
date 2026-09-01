@@ -395,3 +395,35 @@ dereferenced off the call expression's own result directly, returns
 the real `PT_LOAD` segment `p_memsz` is 78264 bytes, 20 pages, up from
 Milestone 109's own 19 -- still comfortably under the 64-page per-
 segment cap and 128-page total cap, no cap change needed.
+
+**Milestone 111 addition**: no new grammar -- resolves the real
+`arr = expr;` read/write asymmetry Milestone 110's own closing
+disclosure named as still open (reading a bare array name decays to its
+address since Milestone 110, but writing to it directly still silently
+overwrote element 0's raw value, unchanged since Milestone 108).
+`STMT_ASSIGN`'s codegen arm now checks the target's `is_array` flag
+(`find_var()`'s own Milestone 110 field, already threaded everywhere)
+BEFORE compiling the RHS and returns a new
+`CodeGenError::ArrayNotAssignable(u64)` instead of ever reaching the
+store -- real C's own "an array is not a modifiable lvalue" answer,
+applied here rather than inventing whole-array-copy semantics. Because
+Milestone 84's compound-assignment operators desugar to an ordinary
+`STMT_ASSIGN` at parse time, this one check also correctly rejects
+`arr += 1;` and every other `op=` form through the same shared codegen
+arm, a real side effect rather than a second check. Zero new x86_64
+encodings -- this milestone is purely subtractive, removing a reachable
+codegen path rather than adding one. Two new self-test cases, both run
+at the `lex_and_parse()` + `gen_function()` tier (no new real
+`fork()`/`exec()`/`wait()` cycle): CASE 98 (`arr = 5;` after
+`arr[0] = 1;`, a direct bare-array assignment, must be
+`Err(CodeGenError::ArrayNotAssignable)`) and CASE 99 (`arr += 5;`, the
+real, distinguishing proof the fix lives in `STMT_ASSIGN`'s one shared
+arm, reached here through Milestone 84's own compound-assignment
+desugaring rather than a second, separate check). See README.md's own
+Milestone 111 entry for the full design reasoning and the real, quoted
+serial-log evidence from both a fresh-disk and a reused-disk boot. File
+size grew from Milestone 110's 92720 bytes to 94032 bytes; the real
+`PT_LOAD` segment `p_memsz` is 79576 bytes, still 20 pages (the same
+page count as Milestone 110, just more bytes within it) -- still
+comfortably under the 64-page per-segment cap and 128-page total cap, no
+cap change needed.

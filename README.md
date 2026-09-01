@@ -8031,6 +8031,184 @@ self-test suite, genuinely open for a future pass.
       having exactly one real subscriber (Milestone 106) all remain
       exactly as Milestone 109 left them -- unrelated to this milestone.
 
+- [x] **Milestone 111**: resolves the exact `arr = expr;` read/write
+      asymmetry Milestone 110's own closing disclosure named as still
+      open (`tools/cc_src/main.rs`) -- the second of the two candidates
+      that milestone's own README entry offered next, `char *` pointers
+      being the other. No grammar change at all: `arr = expr;` already
+      parsed fine (a bare array name is an ordinary IDENT to the
+      grammar), the bug was entirely in what `STMT_ASSIGN`'s codegen did
+      with it -- since Milestone 108 it silently overwrote the array's
+      own element-0 slot with the RHS's raw 8-byte value, even after
+      Milestone 110 made READING that same bare name decay to its own
+      ADDRESS. Real C's own answer to "assign to an array" is "not a
+      modifiable lvalue, reject it" -- this milestone makes the
+      identical call rather than inventing whole-array-copy semantics
+      this subset's flat 8-byte store was never built to perform.
+
+      **The real fix -- one new check in one existing codegen arm**:
+      `STMT_ASSIGN`'s arm in `gen_stmt_list()` now looks up the target's
+      `is_array` flag (`find_var()`'s own Milestone 110 third field,
+      already threaded everywhere -- no new plumbing needed at all)
+      BEFORE compiling the RHS, mirroring `STMT_ASSIGN_INDEX`'s own
+      existing find-slot-first shape immediately below it in the same
+      match. If `is_array != 0`, codegen now returns a new
+      `Err(CodeGenError::ArrayNotAssignable(u64))` (carrying the array
+      name's own source byte offset, the same "real Err path, carries a
+      source offset" convention `UndeclaredVariable`/`UndefinedLabel`
+      already use) instead of ever reaching the store -- and instead of
+      first wastefully compiling the RHS only to throw the whole buffer
+      away, the same real-not-cosmetic reordering benefit
+      `STMT_ASSIGN_INDEX` already had. **Zero new x86_64 encodings**:
+      this milestone doesn't add codegen, it REMOVES a reachable path
+      through existing codegen -- the fifth milestone in a row (107
+      through 111) to touch this file without a new machine-code
+      sequence, though for once not because a new capability reuses old
+      encodings, but because this one is purely subtractive.
+
+      **A real, distinguishing bonus this fix reaches for free**:
+      Milestone 84's nine compound-assignment operators (`+=`, `-=`, ...)
+      desugar to an ordinary `STMT_ASSIGN` at PARSE time
+      (`parse_assign_stmt()`, completely unchanged by this milestone) --
+      so `arr += 1;` was ALSO silently corrupting element 0 before this
+      fix, a second real instance of the same underlying bug this
+      milestone's own top doc comment did not originally name but the
+      fix closes as a genuine side effect of living in the one shared
+      codegen arm, not a second deliberate change requiring its own
+      check.
+
+      **New self-test cases**, both run at the `lex_and_parse()` +
+      `gen_function()` tier (`CodegenMode::Callable`), the same tier
+      CASE 59 (`UndefinedLabel`) already used for its own new error
+      variant -- no new real `fork()`/`exec()`/`wait()` cycle is added
+      by this milestone: CASE 98 (`int arr[3]; arr[0] = 1; arr = 5;
+      return arr[0];` -- a direct bare-array assignment, must be
+      `Err(CodeGenError::ArrayNotAssignable)`, the same "prove the new
+      Err path is real, don't just document it" discipline CASE 7/49/59
+      already established for their own new error variants); CASE 99
+      (`int arr[3]; arr[0] = 1; arr += 5; return arr[0];` -- the real,
+      distinguishing proof the fix lives in `STMT_ASSIGN`'s one SHARED
+      codegen arm rather than a hypothetical direct-assignment-only
+      check this case alone would expose as incomplete: a fix bolted
+      onto some separate, imagined compound-assignment code path -- there
+      isn't one -- could still pass CASE 98 but would fail this one,
+      since compound-assignment reaches codegen through the identical
+      desugared `STMT_ASSIGN` node).
+
+      **Scope, deliberately real and disclosed**: this milestone
+      resolves exactly the one named asymmetry, nothing broader -- every
+      other array/pointer gap Milestone 108/109/110 already disclosed
+      remains open and untouched: no `char *`, no `int **`/multi-level
+      pointers, no pointer arithmetic, no `int name[]` bracket-array
+      parameter sugar, no `*p += 1;`/`arr[i] += 1;`-style compound
+      assignment through a dereference or index (an ELEMENT write, e.g.
+      `arr[0] += 1;`, is unaffected by this milestone -- it never went
+      through `STMT_ASSIGN` at all, only `STMT_ASSIGN_INDEX`, which
+      Milestone 110 already made correctly `is_array`-aware for its own
+      base-address computation), no NULL-pointer concept, no
+      bounds/validity checking on any dereference or index. This
+      milestone also does not attempt to make an array a real assignable
+      value via memberwise/whole-array copy (real C doesn't either) --
+      rejection, not new copy semantics, is the deliberate, disclosed
+      choice, matching the "narrow, honestly scoped slice" discipline
+      every array/pointer milestone since 108 has used.
+
+      **No SNN/evidence-gate work this milestone, and correctly so**:
+      this is a pure compiler-frontend milestone -- one new `CodeGenError`
+      variant, one new check in one existing codegen arm, no kernel-side
+      subsystem decision anywhere in it for an evidence-gated hysteresis
+      gate to meaningfully subscribe to. The same "pure compiler-frontend
+      features legitimately don't need this" carve-out Milestone
+      107/108/109/110 all already established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero warnings). `kernel/assets/cc.elf` rebuilt via the
+      project's own pinned-nightly `rustc` recipe (`tools/cc_src/
+      README.md`, unchanged) -- 94032 bytes, up from Milestone 110's
+      92720; the real `PT_LOAD` `p_memsz` via `readelf -l` is 79576
+      bytes, still 20 pages (the same page count as Milestone 110, just
+      more bytes within it) -- comfortably under the 64-page per-segment
+      cap and 128-page total cap, no cap change needed. The rebuilt
+      `cc.elf` was independently re-derived from the current `main.rs`
+      via a from-scratch invocation of the exact same recipe and diffed
+      byte-for-byte identical against the committed binary (`cmp`, not
+      eyeballed). **One real, honestly-disclosed NEW compiler warning**,
+      verified the same way Milestone 109/110 verified their own zero-new-
+      warning result -- reproducing the standalone `rustc` invocation
+      against a `git stash` of this milestone's own changes (a real,
+      clean Milestone 110 checkout) and diffing the sorted warning list
+      against this milestone's own build: 15 warnings at the Milestone
+      110 baseline, 16 at this milestone's own build, the delta being
+      exactly one new "field `0` is never read" `dead_code` warning on
+      `CodeGenError::ArrayNotAssignable`'s own carried source-offset
+      field -- the SAME warning shape `ArgCountMismatch`/`UndefinedLabel`
+      already carry (both already disclosed as "real but not currently
+      read anywhere," present since before this milestone), now a third
+      instance of the identical, already-established pattern rather than
+      a new kind of warning. Every other line in both sorted warning
+      lists is byte-for-byte identical.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m111_fresh_boot.log`/`m111_reused_boot.log`),
+      no stray `qemu-system-x86_64.exe` process before or after either
+      boot (checked via `tasklist`). `OVERALL_M111=PASS` on both boots --
+      CASE 98 correctly rejects `arr = 5;`, CASE 99 correctly rejects
+      `arr += 5;` through the compound-assignment desugaring path,
+      identically on both boots. Every marker this kernel has ever
+      produced was independently re-confirmed `PASS` on both boots via a
+      real script (not sampled or eyeballed) that reconstructs the
+      actual WRITE-syscall payload stream from each raw serial log
+      (concatenating every `milestone 31: syscall WRITE ... raw bytes
+      >>> ... <<< end of write` block in file order) to recover every
+      `OVERALL`/`OVERALL_M*=` marker cc.elf's own self-test ever prints,
+      plus a separate raw-text scan for the kernel's own older
+      `milestone NN: self-test -- OVERALL: PASS` style that prints
+      directly to the serial port rather than through a ring-3 WRITE
+      syscall -- 48 total distinct markers across both styles (up from
+      Milestone 110's 47, the one new name being `OVERALL_M111` itself),
+      all `PASS`, fresh and reused in exact agreement, both boots'
+      reconstructed marker sets identical to each other. No regressions:
+      the reused boot's own `fs self-test: permissions`/`symlinks`
+      FAIL-line set was diffed directly (`diff`, not eyeballed) against
+      Milestone 110's own reused boot's FAIL-line set -- byte-for-byte
+      identical, 54 lines, the same pre-existing, already-disclosed
+      Milestone 62-era fixture-cleanup artifact every milestone since 70
+      has named; the fresh boot's own fs self-test passes both suites
+      cleanly (zero FAIL lines). `run_preemption_demo()` ran to
+      completion on BOTH boots (fresh: `task0=2651 task1=2576
+      task2=2808`; reused: `task0=2564 task1=2537 task2=2824` -- real
+      inter-boot timing jitter, consistent with every prior milestone's
+      own two-boot pairs) -- zero `run_preemption_demo() SKIPPED` lines
+      on either boot. Milestone 104's own heap-pressure evidence-gate
+      state came out BYTE-IDENTICAL to Milestone 108/109/110's own
+      recorded baseline on both boots: `samples_taken=68
+      gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0` -- zero drift, consistent with this
+      milestone being pure compiler-frontend work with no new kernel
+      allocation path. Zero `panicked at`/`kernel panicked` and zero
+      `DOUBLE FAULT`/`TRIPLE FAULT` in either log (checked directly,
+      `grep -c`, zero matches in both).
+
+      **Still genuinely open**: no `char *` parameters/returns; no
+      `int **`/multi-level pointers anywhere; no pointer arithmetic; no
+      `int name[]` bracket-array parameter sugar (pointer spelling only);
+      no `*p += 1;`/`arr[i] += 1;`-style compound assignment through a
+      dereference or index (element-level compound assignment remains a
+      real, disclosed gap, unaffected by this milestone -- see this
+      entry's own "Scope" paragraph above); no type system of any kind,
+      so no shape-aware rejection of a mismatched argument/return
+      (Milestone 108/109/110's own disclosed limitation, unrelated to
+      this milestone's own new `is_array`-based rejection, which is a
+      narrower, single-purpose check, not a general type system); no
+      NULL-pointer concept; no bounds/validity checking on any
+      dereference or index. `MAX_PARAMS` (8), no `sizeof`, `char` as the
+      only non-`int` scalar type, the compiler self-test's own
+      per-compile leak, `heap_guard::admit()` covering only its original
+      two call sites, and `evidence_gate.rs` still having exactly one
+      real subscriber (Milestone 106) all remain exactly as Milestone 110
+      left them -- unrelated to this milestone.
+
 ## Building and running
 
 Requires:

@@ -1277,6 +1277,33 @@
 // raw VALUE, unchanged from Milestone 108's own original codegen; a
 // real, honest gap for a future milestone to either reject at codegen
 // time or otherwise address, not silently smoothed over here.
+//
+// MILESTONE 111: no grammar change at all -- resolves exactly the
+// `arr = expr;` read/write asymmetry Milestone 110's own closing
+// disclosure named above, the second of the two candidates that
+// milestone's own README.md entry offered next (`char *` being the
+// other). `STMT_ASSIGN`'s codegen arm (`gen_stmt_list()`, below) now
+// looks up the target's `is_array` flag (`find_var()`'s own Milestone
+// 110 third field, already threaded everywhere -- no new plumbing
+// needed) BEFORE compiling the RHS, and returns a new
+// `CodeGenError::ArrayNotAssignable(u64)` (carrying the array name's own
+// source byte offset, the same convention `UndeclaredVariable`/
+// `UndefinedLabel` already use) instead of ever reaching the store. Real
+// C's own answer to "assign to an array" is "not a modifiable lvalue,
+// reject it" -- this milestone makes the identical call rather than
+// inventing whole-array-copy semantics this subset's flat 8-byte
+// STMT_ASSIGN store was never built to perform. Because Milestone 84's
+// compound-assignment operators (`+=`, `-=`, ...) desugar to an ordinary
+// `STMT_ASSIGN` at PARSE time (parse_assign_stmt(), unchanged), this one
+// check also correctly rejects `arr += 1;` and every other `op=` form
+// through the exact same codegen arm -- not a second check, a genuine
+// side effect of fixing the one shared path. Every other array/pointer
+// gap this file's own Milestone 108/109/110 sections already disclosed
+// (no `char *`, no `int **`, no pointer arithmetic, no bounds checking,
+// `int name[]` parameter sugar, no `*p += 1;`/`arr[i] += 1;` compound
+// element assignment) remains open and untouched by this milestone --
+// this is a single, narrow, honestly-scoped fix to one named asymmetry,
+// not a broader array/pointer pass.
 #![no_std]
 #![no_main]
 
@@ -4078,6 +4105,21 @@ enum CodeGenError {
     /// shape UndeclaredVariable/UndeclaredFunction already use --
     /// exercised for real by CASE 59.
     UndefinedLabel(u64),
+    /// MILESTONE 111: a bare array name used as a plain ASSIGN target
+    /// (`arr = expr;`, including a compound-assignment operator like
+    /// `arr += expr;` -- parse_assign_stmt() desugars those into an
+    /// ordinary STMT_ASSIGN before codegen ever sees them, so this one
+    /// check covers both spellings). Carries the array name's own source
+    /// byte offset, the same "real Err path, carries a source offset"
+    /// shape UndeclaredVariable/UndefinedLabel already use. Closes the
+    /// exact read/write asymmetry Milestone 110's own closing disclosure
+    /// named ("reading `arr` now decays to its address ... but writing
+    /// ... still overwrites element 0's raw VALUE unchanged"): real C
+    /// has no answer to "assign to an array" either -- an array is not a
+    /// modifiable lvalue there -- so this milestone makes the same call
+    /// rather than inventing whole-array-copy semantics this subset's
+    /// STMT_ASSIGN codegen was never built to perform.
+    ArrayNotAssignable(u64),
 }
 
 /// MILESTONE 87: fixed cap on live `break`/`continue` jump sites across
@@ -5902,7 +5944,34 @@ unsafe fn gen_stmt_list(
         let s = unsafe { core::ptr::read(cur as *const StmtNode) };
         match s.kind {
             STMT_DECL => {}
+            // MILESTONE 111: the slot lookup (and its new `is_array`
+            // check) now happens BEFORE the RHS is compiled -- the same
+            // find-slot-first shape STMT_ASSIGN_INDEX already uses just
+            // below -- so a rejected `arr = expr;` costs zero wasted
+            // CodeBuf bytes for the RHS rather than emitting it and then
+            // discarding the whole buffer on Err.
             STMT_ASSIGN => {
+                let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
+                // MILESTONE 111: reject a bare array name as an ASSIGN
+                // target at compile time. Before this milestone,
+                // `arr = expr;` silently overwrote element 0's raw
+                // 8-byte VALUE (this store side has always ignored
+                // `is_array`, back to before it even existed) even
+                // though Milestone 110 made READING `arr` decay to its
+                // own ADDRESS -- a real, disclosed asymmetry named in
+                // that milestone's own closing "Scope" paragraph. Real C
+                // has no answer to "assign to an array" either -- an
+                // array is not a modifiable lvalue -- so this is the
+                // same call, not new invented semantics.
+                let store_off = match slot {
+                    Some((o, _is_char, is_array)) => {
+                        if is_array != 0 {
+                            return Err(CodeGenError::ArrayNotAssignable(s.ident_off as u64));
+                        }
+                        o
+                    }
+                    None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
+                };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 // MILESTONE 102: the store side is UNCHANGED by `char`
                 // -- always the same full 8-byte write regardless of
@@ -5910,11 +5979,7 @@ unsafe fn gen_stmt_list(
                 // ignored here). See emit_movsx_rax_rbp_off_byte()'s
                 // own doc comment for why storing full-width and
                 // narrowing only on read is correct, not a shortcut.
-                let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
-                match slot {
-                    Some((o, _is_char, _is_array)) => unsafe { buf.emit_mov_rbp_off_rax(o) },
-                    None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
-                }
+                unsafe { buf.emit_mov_rbp_off_rax(store_off) };
             }
             // MILESTONE 108: `arr[idx] = expr;` -- a real array-element
             // WRITE, `s.then_body` (field-reused, see STMT_ASSIGN_INDEX's
@@ -10413,7 +10478,98 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m110 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 111: `arr = expr;` (and, via the pre-existing
+        // compound-assignment desugaring, `arr op= expr;`) is now a
+        // real, deliberate `CodeGenError::ArrayNotAssignable` compile
+        // error instead of silently overwriting element 0's raw value --
+        // see this file's own top Milestone 111 doc comment and
+        // `CodeGenError::ArrayNotAssignable`'s own doc comment for the
+        // full reasoning. Closes the exact read/write asymmetry
+        // Milestone 110's own closing disclosure named as still open
+        // ("reading `arr` now decays to its address ... but writing ...
+        // still overwrites element 0's raw VALUE unchanged"). Both cases
+        // run at the `lex_and_parse()` + `gen_function()` tier
+        // (`CodegenMode::Callable`), the same tier CASE 59
+        // (`UndefinedLabel`) already used for its own new error variant
+        // -- no new real `fork()`/`exec()`/`wait()` cycle is added by
+        // this milestone.
+        //
+        // CASE 98: a direct `arr = 5;` must be
+        // `Err(CodeGenError::ArrayNotAssignable)`, the same "prove the
+        // new Err path is real, don't just document it" discipline CASE
+        // 7 (`UndeclaredVariable`), CASE 49 (`BreakOutsideLoop`), and
+        // CASE 59 (`UndefinedLabel`) already established for their own
+        // new error variants.
+        //   int main() { int arr[3]; arr[0] = 1; arr = 5; return arr[0]; }
+        // -------------------------------------------------------------
+        const SRC98: &[u8] = b"int main() { int arr[3]; arr[0] = 1; arr = 5; return arr[0]; }";
+        let src98_ptr = SRC98.as_ptr() as u64;
+        let src98_len = SRC98.len() as u64;
+        let case98_ok = match lex_and_parse(src98_ptr, src98_len) {
+            Ok(func98) => match gen_function(src98_ptr, func98, CodegenMode::Callable) {
+                Err(CodeGenError::ArrayNotAssignable(_)) => {
+                    w(b"  case98 real codegen error -- `arr = 5;` rejected, an array is not a modifiable lvalue\n");
+                    true
+                }
+                _ => {
+                    w(b"  case98 expected Err(ArrayNotAssignable), got something else\n");
+                    false
+                }
+            },
+            Err(_) => {
+                w(b"  case98 lex_and_parse() returned Err unexpectedly (source should lex+parse fine)\n");
+                false
+            }
+        };
+        write_check(b"case98_bare_array_assign_is_ArrayNotAssignable=", case98_ok);
+
+        w(b"\n");
+
+        // CASE 99: the same rejection reached through the COMPOUND-
+        // assignment desugaring path instead (`arr += 5;`) --
+        // `parse_assign_stmt()` rewrites every `op=` spelling into an
+        // ordinary `STMT_ASSIGN` before codegen ever runs (Milestone 84's
+        // own desugaring, unchanged here), so this is a real,
+        // distinguishing proof that the fix lives in `STMT_ASSIGN`'s one
+        // shared codegen arm rather than a hypothetical direct-
+        // assignment-only check that this case alone would expose as
+        // incomplete: a fix bolted onto some separate compound-assignment
+        // code path (there isn't one) could still pass CASE 98 above but
+        // would fail this one.
+        //   int main() { int arr[3]; arr[0] = 1; arr += 5; return arr[0]; }
+        // -------------------------------------------------------------
+        const SRC99: &[u8] = b"int main() { int arr[3]; arr[0] = 1; arr += 5; return arr[0]; }";
+        let src99_ptr = SRC99.as_ptr() as u64;
+        let src99_len = SRC99.len() as u64;
+        let case99_ok = match lex_and_parse(src99_ptr, src99_len) {
+            Ok(func99) => match gen_function(src99_ptr, func99, CodegenMode::Callable) {
+                Err(CodeGenError::ArrayNotAssignable(_)) => {
+                    w(b"  case99 real codegen error -- `arr += 5;` rejected too, reached via the same shared STMT_ASSIGN codegen arm through compound-assign desugaring\n");
+                    true
+                }
+                _ => {
+                    w(b"  case99 expected Err(ArrayNotAssignable), got something else\n");
+                    false
+                }
+            },
+            Err(_) => {
+                w(b"  case99 lex_and_parse() returned Err unexpectedly (source should lex+parse fine)\n");
+                false
+            }
+        };
+        write_check(b"case99_compound_array_assign_is_ArrayNotAssignable=", case99_ok);
+
+        w(b"\n");
+
+        let overall_m111 = case98_ok && case99_ok;
+        w(b"OVERALL_M111=");
+        w(if overall_m111 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 { 0 } else { 1 });
     }
 }
 

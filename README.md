@@ -7094,6 +7094,57 @@ self-test suite, genuinely open for a future pass.
       remain exactly as Milestone 103 left them -- this milestone touched
       the kernel side only, not the compiler frontend.
 
+- [x] **Milestone 105**: closes Milestone 102's own disclosed CASE 79 gap
+      -- moves `char`-as-`while`-loop-counter (`tools/cc_src/main.rs`)
+      off the in-process Callable path and onto the real on-disk-ELF +
+      kernel `exec()`/`wait()` path every other case since Milestone 69
+      uses, now that Milestone 104 actually fixed the kernel-heap-margin
+      bug that made Milestone 102 keep it there. No new grammar, no new
+      codegen, no new compiler behavior at all -- CASE 79's own source
+      and hand-computed expected value (55) are byte-for-byte unchanged;
+      only its verification tier moved, from
+      `compile_and_run_program_callable()` to CASE 72's own established
+      `compile_program_standalone_elf()` + `write_exec_and_check!`
+      pattern, reused rather than reinvented. This is a real fifth
+      `fork()`/`exec()`/`wait()` cycle added to this self-test suite, on
+      top of the four Milestone 102 already found sitting right at the
+      OLD 100 KiB heap budget's edge -- exactly the scenario Milestone
+      104's own fix targeted, now actually exercised rather than left as
+      an untested assumption.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`, rebuilt from
+      `tools/cc_src/README.md`'s own recipe -- 82480 bytes, up from
+      Milestone 103's 82224; real `PT_LOAD` `p_memsz` via `readelf -l` is
+      69104 bytes, 17 pages, unchanged in practice from Milestone 103's
+      own 17, comfortably under the 64-page per-segment and 128-page
+      total caps). Two real QEMU boots against a genuinely fresh disk,
+      fresh then reused (`m105_fresh_boot.log` / `m105_reused_boot.log`).
+      CASE 79 now runs on the real exec path and PASSES on both boots,
+      quoted directly from the fresh boot's own serial log: `milestone
+      43: syscall WAIT (process 3) -- hardware-recorded CS=0x1b (CPL=3)
+      -- reaped child pid 14, exited normally with code 55` (matching
+      the reused boot's own identical line), followed by
+      `case79_char_while_loop_counter_returns_55=PASS`. `OVERALL_M102=
+      PASS` (all four of CASE 76-79 now included), `OVERALL_M104=PASS`,
+      `OVERALL_M68`..`OVERALL_M101`/`OVERALL_M103` all still PASS. No
+      regressions: the reused boot's own `fs self-test: permissions`/
+      `symlinks` `FAIL` lines are byte-for-byte identical to Milestone
+      103's own reused boot's FAIL-line set (checked via direct diff),
+      the same pre-existing disk-state artifact; the fresh boot's own fs
+      self-test PASSES both suites. No kernel panic, no
+      `run_preemption_demo() SKIPPED` line on either boot -- the extra
+      real exec cycle this milestone adds did not come close to
+      Milestone 104's own real 256 KiB headroom.
+
+      **Still genuinely open**: everything Milestone 102/103/104 already
+      left open remains open -- `MAX_PARAMS` (4), no arrays/pointers, no
+      `sizeof`, `char` as the only non-`int` type, the compiler
+      self-test's own per-compile leak (bounded, not eliminated),
+      `heap_guard::admit()` covering only the two call sites Milestone
+      104 named. This milestone closes exactly one specific, narrow gap
+      (CASE 79's verification tier) and deliberately does not attempt
+      anything broader.
+
 ## Building and running
 
 Requires:

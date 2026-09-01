@@ -250,3 +250,30 @@ File size grew from Milestone 75's 39664 bytes to 42856 bytes; the real
 `PT_LOAD` segment `p_memsz` is 33110 bytes, 9 pages -- still comfortably
 under the 64-page per-segment cap and 128-page total cap, no cap change
 needed.
+
+**Milestone 105 addition**: no new grammar or codegen -- real
+verification-tier migration only. CASE 79 (`char` as a `while`-loop
+counter, added Milestone 102) originally ran on the in-process Callable
+path, a real, disclosed scope decision made because a fourth real
+`fork()`/`exec()`/`wait()` cycle in this suite reproducibly panicked the
+kernel at the time (a real kernel-heap-margin bug, root-caused and fixed
+by Milestone 104 -- see `kernel/src/heap_guard.rs` and README.md's own
+Milestone 104 entry). Milestone 105 moves CASE 79 onto the real on-disk-
+ELF + kernel `exec()` + `wait()` path (CASE 72's own established
+`compile_program_standalone_elf()` + `write_exec_and_check!` pattern,
+reused rather than reinvented) -- the same source, the same
+hand-computed expected value (55), now checked against a real reaped
+exit code instead of an in-process return value. This is a real fifth
+exec()/wait() cycle added to this suite, on top of the four Milestone
+102 already found sitting right at the OLD 100 KiB budget's edge --
+verified against a real boot (see README.md's own Milestone 105 entry
+for the quoted serial-log evidence: `milestone 43: syscall WAIT
+(process 3) ... reaped child pid 14, exited normally with code 55`),
+not merely assumed safe from Milestone 104's own arithmetic. File size
+grew from Milestone 103's 82224 bytes (see README.md's own Milestone 103
+entry -- this build-recipe file has no per-milestone addendum for every
+kernel milestone, only ones that touch `tools/cc_src` itself) to 82480
+bytes; the real `PT_LOAD` segment `p_memsz` is 69104 bytes, 17 pages --
+unchanged in practice from Milestone 103's own 17 pages, still
+comfortably under the 64-page per-segment cap and 128-page total cap, no
+cap change needed.

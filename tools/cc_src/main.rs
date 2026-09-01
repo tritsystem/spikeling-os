@@ -1017,6 +1017,22 @@
 // documented in tools/stdiotest_src/libc.rs's own fwrite() doc
 // comment). Written this way from the start here rather than re-
 // discovering the same failure independently.
+//
+// MILESTONE 105: closes Milestone 102's own disclosed CASE 79 gap now
+// that Milestone 104 (see kernel/src/heap_guard.rs and README.md's own
+// entry) actually root-caused and fixed the real kernel-heap-margin bug
+// that made CASE 79 stay on the in-process Callable path instead of the
+// real on-disk-ELF + fork()/exec()/wait() tier every other case since
+// Milestone 69 uses. CASE 79 itself is UNCHANGED as a compiler test --
+// same source, same hand-computed expected value (55) -- only its own
+// verification tier moved, from `compile_and_run_program_callable()` to
+// `compile_program_standalone_elf()` + `write_exec_and_check!` (CASE
+// 72's own established pattern, reused rather than reinvented). This is
+// a real fifth exec()/wait() cycle added to this suite, on top of the
+// four Milestone 102 already found sitting right at the OLD 100 KiB
+// budget's edge -- verified for real against a live boot below (see
+// README.md's own Milestone 105 entry), not merely assumed safe from
+// Milestone 104's own arithmetic.
 #![no_std]
 #![no_main]
 
@@ -8535,47 +8551,42 @@ pub extern "C" fn _start() -> ! {
         w(b"\n");
 
         // CASE 79: `char` used as an ordinary `while`-loop counter --
-        // in-process (Callable), deliberately NOT the real on-disk-ELF
-        // + fork()/exec()/wait() path every other milestone since 69
-        // reaches for as its strongest verification tier. This is a
-        // real, disclosed scope decision, not an oversight: while
-        // developing this milestone, adding a FOURTH real fork()/
-        // exec()/wait() self-test cycle here (on top of this suite's
-        // already-large existing count) reproducibly made the KERNEL
-        // itself panic later in the very same boot -- `tasks::
-        // run_preemption_demo()` (kernel/src/tasks.rs)'s first 16 KiB
-        // worker-stack allocation failing against the kernel's own
-        // fixed 100 KiB heap (`kernel/src/allocator.rs::HEAP_SIZE`,
-        // its own doc comment already says "small on purpose for
-        // milestone 3 ... not sized for real workloads yet"). Isolated
-        // by direct experiment (see README.md's own Milestone 102
-        // entry): the ORIGINAL Milestone 101 cc.elf boots fine; THIS
-        // milestone's larger cc.elf with CASE 76-78 added (no new real
-        // process) also boots fine; only adding a fourth real exec()
-        // cycle here reproduces the panic, both with the original and
-        // the grown cc.elf. That points at a genuine, PRE-EXISTING
-        // margin problem (most likely a real, not-yet-found kernel-heap
-        // leak across the many real process fork()/exec()/wait() self-
-        // test cycles this suite already runs each boot, compounded by
-        // that fixed 100 KiB budget never having been revisited since
-        // Milestone 3) -- a real bug, honestly disclosed here and in
-        // README.md's own Milestone 102 entry, NOT fixed in this
-        // milestone (out of scope for a compiler-frontend `char`-type
-        // milestone; a real candidate for a future one).
+        // real on-disk-ELF + fork()/exec()/wait() path, the same
+        // strongest verification tier every milestone since 69 reaches
+        // for. This case ORIGINALLY shipped on the in-process Callable
+        // path instead: while developing Milestone 102, adding a
+        // FOURTH real fork()/exec()/wait() self-test cycle here (on top
+        // of this suite's already-large existing count) reproducibly
+        // made the KERNEL itself panic later in the same boot --
+        // `tasks::run_preemption_demo()`'s first 16 KiB worker-stack
+        // allocation failing against the kernel's own fixed 100 KiB
+        // heap. Milestone 102 disclosed that bug honestly rather than
+        // paper over it, and kept this case on the in-process path as a
+        // real, disclosed scope decision. MILESTONE 105 closes that gap
+        // now that Milestone 104 actually root-caused and fixed it
+        // (real evidence-gated `heap_guard::admit()` + `HEAP_SIZE`
+        // raised 100 KiB -> 256 KiB, see that milestone's own README
+        // entry) -- this case now runs through
+        // `compile_program_standalone_elf()` + `write_exec_and_check!`
+        // exactly like CASE 72 above, a real fifth exec() cycle added to
+        // this suite on top of the four Milestone 102 already found
+        // right at the old budget's edge, verified against a real boot
+        // rather than assumed safe from the fix's own numbers alone.
         //   int main() { char c = 10; int sum = 0;
         //                while (c > 0) { sum = sum + c; c = c - 1; }
         //                return sum; }
-        // Hand-computed: 10+9+...+1 = 55.
+        // Hand-computed: 10+9+...+1 = 55 (fits in a real exit code's
+        // 0-255 range, so truncating the in-process return value down to
+        // wait()'s exit-code convention changes nothing here).
         const SRC79: &[u8] = b"int main() { char c = 10; int sum = 0; while (c > 0) { sum = sum + c; c = c - 1; } return sum; }";
-        let case79_result = compile_and_run_program_callable(SRC79.as_ptr() as u64, SRC79.len() as u64);
-        w(b"  case79 (char as a while-loop counter, in-process) returned=");
-        if let Some(r) = case79_result {
-            write_u64_dec(r);
+        const PATH79: &[u8] = PATH8;
+        let (elf79_ptr, elf79_len) = compile_program_standalone_elf(SRC79.as_ptr() as u64, SRC79.len() as u64);
+        let case79_ok = if elf79_ptr == 0 {
+            w(b"  case79 compile_program_standalone_elf failed\n");
+            false
         } else {
-            w(b"(compile failed)");
-        }
-        w(b" (expected 55)\n");
-        let case79_ok = case79_result == Some(55);
+            write_exec_and_check!(PATH79, elf79_ptr, elf79_len, 55)
+        };
         write_check(b"case79_char_while_loop_counter_returns_55=", case79_ok);
 
         w(b"\n");

@@ -311,3 +311,47 @@ Milestone 106/107 are documented in README.md alone) to 87808 bytes; the
 real `PT_LOAD` segment `p_memsz` is 73792 bytes, 19 pages, up from
 Milestone 107's own 17 -- still comfortably under the 64-page per-
 segment cap and 128-page total cap, no cap change needed.
+
+**Milestone 109 addition**: single-level `int` pointer declaration,
+address-of, and dereference -- both a real rvalue (`*p`) and a real
+lvalue (`*p = expr;`) -- (`parse_pointer_decl()`/`OP_ADDR`/`OP_DEREF`/
+`STMT_ASSIGN_DEREF` in `main.rs`) -- the other half of this file's own
+longest-standing disclosed gap ("no arrays/pointers"), Milestone 108
+having closed the arrays half. Zero new lexer tokens (`*`/`&` both
+already existed for multiplication/bitwise-AND; this milestone only adds
+new grammar POSITIONS for them, resolved unambiguously by the same
+"parse the left operand before ever checking for a following operator"
+structural argument Milestone 76 already used for unary vs. binary `-`)
+and, more notably, **zero new x86_64 encodings at all** -- `&x`, `*p` as
+an rvalue, and `*p = expr;` all reuse Milestone 108's own three
+array-address `CodeBuf` methods (`emit_lea_rax_rbp_off()`/
+`emit_mov_rax_mem_rax()`/`emit_mov_mem_rcx_rax()`) completely unchanged,
+since a single-level pointer read/write is mechanically exactly an
+array-element read/write with the index computation folded away (the
+address comes directly from a variable's own stored value instead of a
+runtime `base - idx*8` computation). `int *p;` itself produces an
+ORDINARY scalar `STMT_DECL` -- a pointer's own runtime value is just
+another 8-byte stack slot holding an address, so `collect_vars_rec()`/
+`find_var()`/`VarSlot` needed no change at all. See README.md's own
+Milestone 109 entry for the full design reasoning (including the real,
+deliberate scope cuts -- single-level `int`-only pointers, no pointer
+arithmetic, no array-to-pointer decay, no pointers as function
+parameters/return values, `&`'s operand restricted to a plain IDENT) and
+the real, quoted serial-log evidence from both a fresh-disk and a
+reused-disk boot. Four new self-test cases, all run in-process (no new
+real `fork()`/`exec()`/`wait()` cycle, the same tier Milestone 107/108
+both already used for their own new cases): CASE 91 (`int *p = &x;
+return *p;`, combined declaration+initializer, address-of + dereference-
+read together, returns `10`), CASE 92 (`*p = 99; return x;` -- the real,
+distinguishing proof that a dereference write mutates the pointee's own
+real stack slot, genuine aliasing rather than an independent copy,
+returns `99`), CASE 93 (a real "swap two variables via two distinct
+pointers" idiom, combining address-of and both dereference directions in
+one program, returns `703`), and CASE 94 (`return &5;`, the real,
+disclosed proof that `&`'s own narrow "plain IDENT only" operand
+restriction is real, a genuine `ParseError`, not just documented). File
+size grew from Milestone 108's 87808 bytes to 91104 bytes; the real
+`PT_LOAD` segment `p_memsz` is 76648 bytes, still 19 pages (the same page
+count as Milestone 108, just more bytes within it) -- still comfortably
+under the 64-page per-segment cap and 128-page total cap, no cap change
+needed.

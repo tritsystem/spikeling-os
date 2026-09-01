@@ -7596,6 +7596,233 @@ self-test suite, genuinely open for a future pass.
       subscriber (Milestone 106) all remain exactly as Milestone 107
       left them -- unrelated to this milestone.
 
+- [x] **Milestone 109**: single-level `int` pointer declaration,
+      address-of, and dereference (both a real rvalue AND a real lvalue)
+      (`tools/cc_src/main.rs`) -- the OTHER half of the "arrays/pointers"
+      gap Milestone 108's own closing disclosure named as still open
+      ("real pointers (declaration, dereference, arithmetic) still do
+      not [exist]"), a real, deliberately narrow first slice, the same
+      "narrow, honestly scoped slice, not the whole feature at once"
+      discipline `char` (Milestone 102-105) and arrays (Milestone 108)
+      both already used.
+
+      **Grammar/AST**: zero new lexer tokens -- `*` and `&` both already
+      existed (`TOK_STAR`, multiplication; `TOK_AMP`, bitwise AND, since
+      Milestone 79), this milestone only adds new grammar POSITIONS for
+      them. `int *p;` (new `parse_pointer_decl()`, its own standalone
+      path off `TOK_INT`'s arm in `parse_stmt()`, checked before the
+      IDENT is consumed since the `*` sits between the type keyword and
+      the name -- the mirror image of the array declarator's own `[`,
+      which comes AFTER the name) supports a single pointer declarator
+      per statement with an optional `"=" <ternary>` initializer (so
+      `int *p = &x;` is real, legal, one statement), reusing
+      `finish_ident_assign()` completely unchanged. `&x` (new `EXPR_UNARY`
+      op `OP_ADDR`) and `*p` as an rvalue (new `EXPR_UNARY` op
+      `OP_DEREF`) both slot into `parse_unary()` at the exact same
+      tightest-precedence unary position `-`/`~`/`!` already occupy;
+      `&` is deliberately NARROWER than every other unary operator here
+      -- its operand must be a single plain IDENT (`self.expect(TOK_IDENT)`
+      directly, no recursion into `parse_unary()`/`parse_factor()` at
+      all), so `&arr[i]`, `&*p`, and `&(expr)` are all real, disclosed
+      non-grammar, not silently-wrong parses. `*` (dereference), by
+      contrast, DOES recurse into `parse_unary()` exactly like
+      `-`/`~`/`!`, so it composes with them and with itself (`-*p`,
+      `!*p`, etc. all parse). Neither `*` nor `&` is ambiguous with
+      their own pre-existing binary meanings (multiplication, bitwise
+      AND): `parse_term()`/`parse_bit_and()` both always parse their
+      LEFT operand (through `parse_unary()`) before ever checking for a
+      following `*`/`&` as an infix operator, so a `*`/`&` reached at
+      the very start of `parse_unary()` has, by construction, no left
+      operand yet -- it can only be the prefix form. This is the exact
+      same "resolved by grammar POSITION, not by the token alone"
+      reasoning this file's own Milestone 76 doc comment already
+      established for unary vs. binary `-`, now reused for two more
+      operators rather than re-derived from scratch. `*p = expr;` (new
+      statement kind `STMT_ASSIGN_DEREF`, the same "new kind over a
+      reused kind with a flag" choice `STMT_ASSIGN_INDEX`/`STMT_DOWHILE`
+      already made) is dispatched at the very START of a statement --
+      unambiguous with `parse_unary()`'s own `*` handling, since
+      `parse_stmt()`'s top-level match only ever sees the first token of
+      a brand-new statement, while `parse_unary()`'s `*` case only ever
+      runs from somewhere already inside expression parsing.
+
+      **The real design choice this milestone hinges on**: `int *p;`
+      produces an ORDINARY scalar `STMT_DECL`, byte-identical in shape to
+      a plain `int p;` -- a pointer's own runtime VALUE is just another
+      8-byte stack slot holding an address, exactly like an ordinary
+      `int` holds a number. `collect_vars_rec()`/`find_var()`/`VarSlot`
+      needed no new field and no new stack-layout logic at all (checked
+      directly: this milestone touches ZERO lines in either function).
+      The only genuinely new codegen lives entirely in `EXPR_UNARY`'s two
+      new op cases and the new `STMT_ASSIGN_DEREF` statement kind, and
+      **all three reuse Milestone 108's own three array-address CodeBuf
+      encodings completely unchanged -- this milestone needed ZERO new
+      x86_64 encodings**: `&x` emits exactly `emit_lea_rax_rbp_off()`
+      (Milestone 108's own array-base-address LEA, an ordinary scalar's
+      `rbp`-relative slot being exactly as valid an LEA operand as an
+      array's element-0 slot already was); `*p` as an rvalue emits
+      exactly `emit_mov_rax_mem_rax()` (Milestone 108's own
+      array-element-load `MOV RAX,[RAX]`) after evaluating `p` for its
+      value; `*p = expr;` emits `emit_mov_rax_rbp_off()` (read `p`'s own
+      value, ordinary and pre-existing since Milestone 68) then
+      `emit_mov_mem_rcx_rax()` (Milestone 108's own array-element-store).
+      This is not a coincidence: a single-level pointer read/write is,
+      mechanically, exactly an array-element read/write with the index
+      computation folded away -- the target address comes directly from
+      a variable's own value instead of a runtime `base - idx*8`
+      computation -- so the exact three encodings Milestone 108 already
+      hand-verified against the Intel SDM cover the complete real
+      machine-code surface this milestone needs.
+
+      **New self-test cases**, all four run in-process
+      (`CodegenMode::Callable`), the same verification tier Milestone
+      107/108 both already used for their own new cases -- no new real
+      `fork()`/`exec()`/`wait()` cycle is added by this milestone: CASE
+      91 (`int *p = &x; return *p;`, the combined declaration+initializer
+      form, exercising address-of AND dereference-read together, expected
+      `10`); CASE 92 (`*p = 99; return x;` -- the real, DISTINGUISHING
+      proof that a dereference write mutates the pointee's own real stack
+      slot, genuine aliasing, not an independent copy `p` happens to hold
+      -- a shallow/buggy implementation could still pass CASE 91 via a
+      fresh read back through the same pointer but would fail this one,
+      since `x` itself would stay `5` if the write did not really land at
+      `x`'s own address, expected `99`); CASE 93 (a real "swap two
+      variables via two separate pointers" idiom -- `pa`/`pb` must each
+      hold their own distinct address, combining address-of AND both
+      dereference-read AND dereference-write in one program, the
+      strongest realistic composition proof this milestone's self-test
+      offers, expected `703`, i.e. `a` becomes 7 and `b` becomes 3); CASE
+      94 (`return &5;` -- the real, disclosed proof that `&`'s own narrow
+      "plain IDENT only" operand restriction is real, not just
+      documented, a genuine `ParseError` since `parse_unary()`'s `&` arm
+      calls `self.expect(TOK_IDENT)` directly rather than recursing into
+      the general expression grammar -- the same "prove the scope
+      restriction is real" discipline CASE 87/90 already established for
+      `MAX_PARAMS`/`MAX_VARS`).
+
+      **Scope, deliberately real and disclosed**: single-level pointers
+      to `int` only (no `char *`, no `int **`); NO pointer arithmetic
+      (`p + 1` compiles as an ordinary integer addition on a pointer's
+      own raw address VALUE -- adds to it, UNSCALED, exactly the "real
+      integer op, no type-aware scaling" behavior this codegen already
+      gives every other value, since no symbol table anywhere in this
+      file tracks a variable's own declared shape for `+`'s codegen to
+      consult -- not rejected, not silently made "safe"; a real,
+      disclosed gap, the exact same "no shape-tracking, so no
+      shape-aware rejection" precedent Milestone 108's own bare-array-
+      name simplification already established, not new here); NO
+      array-to-pointer decay (so still no arrays as function parameters
+      or return values); NO pointers as function parameters or return
+      values either (a real, deliberate scope cut for THIS milestone --
+      the calling-convention plumbing Milestone 72/107 built has no
+      structural reason it couldn't carry a pointer value exactly like
+      any other `int`-sized value, this just was not exercised or
+      verified here, disclosed future work); `&`'s own operand restricted
+      to a single plain IDENT (no `&arr[i]`, no `&*p`, no `&(expr)`); no
+      `*p += 1;`-style compound assignment through a pointer (the same
+      real gap Milestone 108 already left open for `arr[i] += 1;`, now
+      disclosed again for the pointer case, not newly introduced here);
+      no NULL-pointer concept and no bounds/validity checking of any kind
+      on a dereference (an uninitialized or wild pointer value
+      dereferences to whatever real memory the computed address lands
+      on, the same real undefined behavior an unchecked C pointer
+      dereference already has on genuine hardware -- consistent with
+      this file's own long-standing "no bounds-check panic path, so no
+      `core::fmt` gets pulled into this freestanding `panic=abort`
+      binary" reason for never having any runtime safety check anywhere
+      in this codegen, Milestone 108's own array-bounds disclosure being
+      the most recent precedent, not a new reason invented here).
+
+      **No SNN/evidence-gate work this milestone, and correctly so**:
+      this is a pure compiler-frontend milestone -- new grammar, new AST
+      kinds, new grammar POSITIONS for existing machine-code encodings,
+      no kernel-side subsystem decision anywhere in it for an
+      evidence-gated hysteresis gate to meaningfully subscribe to. The
+      same "pure compiler-frontend features legitimately don't need this"
+      carve-out Milestone 107/108 both already established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero warnings). `kernel/assets/cc.elf` rebuilt via the
+      project's own pinned-nightly `rustc` recipe (`tools/cc_src/
+      README.md`, unchanged) -- 91104 bytes, up from Milestone 108's
+      87808; the real `PT_LOAD` `p_memsz` via `readelf -l` is 76648
+      bytes, still 19 pages (the same page count as Milestone 108, just
+      more bytes within it) -- comfortably under the 64-page per-segment
+      cap and 128-page total cap, no cap change needed. The rebuilt
+      `cc.elf` was independently re-derived from the current `main.rs`
+      via a from-scratch invocation of the exact same recipe and diffed
+      byte-for-byte identical against the committed binary (`cmp`, not
+      eyeballed), so the checked-in artifact is genuinely reproducible,
+      not stale or hand-edited. Zero new compiler warnings: verified by
+      reproducing the standalone `rustc` invocation against a `git stash`
+      of this milestone's own changes (a real, clean Milestone 108
+      checkout) and diffing the sorted warning list against this
+      milestone's own build -- byte-for-byte identical 15-warning set
+      (the two pre-existing `dead_code` field-never-read warnings, 12
+      pre-existing `libc.rs` unused-function warnings including
+      `sys_open` -- confirmed already unused at the Milestone 108
+      baseline too, not a regression this milestone introduced -- and one
+      pre-existing `unnecessary unsafe block` warning, all predating this
+      milestone).
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m109_fresh_boot.log`/`m109_reused_boot.log`),
+      no stray `qemu-system-x86_64.exe` process before or after either
+      boot (checked via `tasklist`). `OVERALL_M109=PASS` on both boots --
+      CASE 91 returns `10`, CASE 92 returns `99`, CASE 93 returns `703`,
+      CASE 94 correctly rejects `&5`, identically on both boots. Every
+      marker this kernel has ever produced was independently
+      re-confirmed `PASS` on both boots via a real script (not sampled or
+      eyeballed) that reconstructs the actual WRITE-syscall payload
+      stream from each raw serial log (`milestone 31: syscall WRITE ...
+      raw bytes >>> ... <<< end of write` blocks, concatenated in order)
+      to recover every `OVERALL`/`OVERALL_M*=` marker cc.elf's own
+      self-test ever prints, AND separately greps the raw log for the
+      kernel's own older `milestone NN: self-test -- OVERALL: PASS`
+      marker style (Milestone 42/43/44/45/53/54/57/59/60/64/65/66) that
+      prints directly to the serial port rather than through a ring-3
+      WRITE syscall -- 46 total distinct markers across both styles, all
+      `PASS`, fresh and reused in exact agreement. No regressions: the
+      reused boot's own `fs self-test: permissions`/`symlinks` FAIL-line
+      set was diffed directly (`diff`, not eyeballed) against Milestone
+      108's own reused boot's FAIL-line set -- byte-for-byte identical,
+      54 lines, the same pre-existing, already-disclosed Milestone
+      62-era fixture-cleanup artifact every milestone since 70 has named;
+      the fresh boot's own fs self-test passes both suites cleanly (zero
+      FAIL lines). `run_preemption_demo()` ran to completion on BOTH
+      boots (fresh: `task0=2578 task1=2555 task2=2851`; reused:
+      `task0=2651 task1=2519 task2=2920` -- real inter-boot timing
+      jitter, consistent with every prior milestone's own two-boot
+      pairs) -- zero `run_preemption_demo() SKIPPED` lines on either
+      boot. Milestone 104's own heap-pressure evidence-gate state came
+      out BYTE-IDENTICAL to Milestone 108's own recorded baseline on both
+      boots: `samples_taken=68 gate_trip_episodes=0
+      naive_instantaneous_hits=0 admissions_denied_so_far=0` -- zero
+      drift, this milestone's own new pointer codegen adds no kernel-heap
+      pressure of any kind (it is pure compiler-frontend work, no new
+      kernel allocation path). Zero `panicked at`/`kernel panicked` and
+      zero `DOUBLE FAULT`/`TRIPLE FAULT` in either log (checked directly,
+      `grep -c`, zero matches in both).
+
+      **Still genuinely open**: the "arrays/pointers" gap is now closed
+      at a first-slice level on BOTH halves (arrays since Milestone 108,
+      single-level `int` pointers since this milestone) but neither is
+      complete real C: no `char *`, no `int **`/multi-level pointers, no
+      pointer arithmetic, no array-to-pointer decay, no pointers (or
+      arrays) as function parameters or return values, no `*p += 1;`-
+      style compound assignment through a pointer, `&`'s own operand
+      restricted to a single plain IDENT, no NULL-pointer concept, and no
+      bounds/validity checking on any dereference (see this entry's own
+      "Scope" paragraph above for the full reasoning on each). Within
+      arrays specifically, everything Milestone 108 already disclosed
+      remains open and untouched by this milestone. `MAX_PARAMS` (8), no
+      `sizeof`, `char` as the only non-`int` scalar type, the compiler
+      self-test's own per-compile leak, `heap_guard::admit()` covering
+      only its original two call sites, and `evidence_gate.rs` still
+      having exactly one real subscriber (Milestone 106) all remain
+      exactly as Milestone 108 left them -- unrelated to this milestone.
+
 ## Building and running
 
 Requires:

@@ -1137,6 +1137,72 @@
 // tracking each name's own declared shape, which this codegen does not
 // build (find_var()'s own linear scan resolves a name to an offset only,
 // with no "is this an array" bit threaded back to either call site).
+//
+// MILESTONE 109: single-level `int` pointer declaration, address-of, and
+// dereference (read AND write) -- the other half of the "arrays/pointers"
+// gap Milestone 108's own disclosure named as still open, a real,
+// deliberately narrow first slice, the same "narrow, honestly scoped
+// slice, not the whole feature at once" discipline `char` (Milestone
+// 102-105) and arrays (Milestone 108) both already used. Grammar delta:
+//   decl_stmt   := "int" "*" IDENT ("=" logic_or)? ";" | ... (unchanged otherwise)
+//   unary       := "&" IDENT | "*" unary | ("-"|"~"|"!") unary | factor
+//   stmt        := "*" IDENT "=" cond_expr ";" | ... (unchanged otherwise)
+// `int *p;` (parse_pointer_decl(), new) produces an ORDINARY scalar
+// STMT_DECL, byte-identical in shape to a plain `int p;` -- a pointer's
+// own runtime VALUE is just another 8-byte stack slot holding an address,
+// exactly like an ordinary `int` holds a number, so collect_vars_rec()/
+// find_var()/VarSlot need no new field and no new stack-layout logic at
+// all (checked directly: this milestone touches ZERO lines in either
+// function). `&x` (OP_ADDR, new EXPR_UNARY op) computes `x`'s own stack
+// address via `emit_lea_rax_rbp_off()` -- Milestone 108's own array-base-
+// address encoding, reused completely UNCHANGED, an ordinary scalar's
+// `rbp`-relative slot being exactly as valid an LEA operand as an array's
+// element-0 slot already was. `*p` as an rvalue (OP_DEREF, new EXPR_UNARY
+// op) evaluates `p` for its VALUE then loads through it via
+// `emit_mov_rax_mem_rax()` -- Milestone 108's own array-element-load
+// encoding, also reused completely unchanged. `*p = expr;`
+// (STMT_ASSIGN_DEREF, new statement kind, the same "new kind over a
+// reused kind with a flag" choice STMT_ASSIGN_INDEX/STMT_DOWHILE already
+// made) reads `p`'s value, evaluates the RHS, stores through
+// `emit_mov_mem_rcx_rax()` -- Milestone 108's own array-element-store
+// encoding, also reused completely unchanged. This milestone needed
+// **zero new CodeBuf encodings**: a single-level pointer read/write is,
+// mechanically, exactly an array-element read/write with the index
+// computation folded away (the address comes directly from a variable's
+// own value instead of a runtime `base - idx*8` computation), so the
+// exact three encodings Milestone 108 already hand-verified against the
+// Intel SDM cover the complete real machine-code surface this milestone
+// needs. Scope, deliberately real and disclosed: single-level pointers to
+// `int` only (no `char *`, no `int **`); NO pointer arithmetic (`p + 1`
+// compiles as ordinary integer addition on a pointer's own raw address
+// value -- ADDS to it, unscaled, exactly the "real integer op, no type-
+// aware scaling" behavior this codegen already gives every other value,
+// since there is no symbol table anywhere in this file tracking a
+// variable's own declared shape for `+`'s codegen to consult -- not
+// rejected, not silently made "safe", a real, disclosed gap, not new
+// here: EXPR_INDEX's own bare-array-name simplification, Milestone 108,
+// already established the same "no shape-tracking, so no shape-aware
+// rejection" precedent this reuses); NO array-to-pointer decay (so still
+// no arrays as function parameters or return values); NO pointers as
+// function parameters or return values either (a real, deliberate scope
+// cut for THIS milestone, disclosed future work, not attempted -- the
+// calling-convention plumbing Milestone 72/107 built has no reason it
+// COULDN'T carry a pointer value exactly like any other `int`-sized
+// value, this just was not exercised or verified here); `&`'s own operand
+// is restricted to a single plain IDENT (no `&arr[i]`, no `&*p`, no
+// `&(expr)` -- parse_unary()'s own Milestone 109 doc comment has the full
+// grammar reasoning); no `*p += 1;`-style compound assignment through a
+// pointer (the same real gap Milestone 108 already left open for
+// `arr[i] += 1;`, now disclosed again for the pointer case, not newly
+// introduced); no NULL-pointer concept and no bounds/validity checking of
+// any kind on a dereference (an uninitialized or wild pointer value
+// dereferences to whatever real memory the computed address lands on,
+// the same real undefined behavior an unchecked C pointer dereference
+// already has on genuine hardware -- consistent with this file's own
+// long-standing "no bounds-check panic path, so no core::fmt gets pulled
+// into this freestanding panic=abort binary" reason for never having any
+// runtime safety check anywhere in this codegen, Milestone 108's own
+// array-bounds disclosure being the most recent precedent).
 #![no_std]
 #![no_main]
 
@@ -1872,6 +1938,19 @@ const OP_BITNOT: u8 = 15;
 // its codegen reuses the same test/setcc/movzx normalize idiom OP_NE
 // and the comparison operators already use, not the F7 in-place family.
 const OP_LOGNOT: u8 = 16;
+// MILESTONE 109: two more EXPR_UNARY op sentinels -- OP_ADDR ("&x",
+// address-of) and OP_DEREF ("*p", dereference), the fourth/fifth
+// siblings to OP_NEG/OP_BITNOT/OP_LOGNOT above, the exact extension
+// point those comments already named. Unlike the other three, OP_ADDR's
+// own operand is deliberately NOT a general recursive-unary parse (see
+// parse_unary()'s own Milestone 109 doc comment below for why) -- its
+// `left` field always points at a plain EXPR_IDENT node naming the
+// variable whose address is taken. OP_DEREF's `left`, by contrast, is
+// an ordinary sub-expression (usually an EXPR_IDENT read of a pointer
+// variable, but the grammar itself does not require that) exactly like
+// every other unary op here.
+const OP_ADDR: u8 = 17;
+const OP_DEREF: u8 = 18;
 
 #[repr(C)]
 struct ExprNode {
@@ -1927,6 +2006,21 @@ const STMT_DOWHILE: u8 = 12; // MILESTONE 99: `do { body } while (cond);` -- exp
 // (Milestone 102's `is_char` tag) already established; `else_body`
 // stays unused (0).
 const STMT_ASSIGN_INDEX: u8 = 13;
+// MILESTONE 109: `"*" IDENT "=" cond_expr ";"` -- a real pointer
+// dereference WRITE, the lvalue form of `*p`. Deliberately its OWN
+// statement kind (the same "new kind, not a flag on an existing one"
+// discipline STMT_ASSIGN_INDEX above already chose over a flag on
+// STMT_ASSIGN) -- STMT_ASSIGN's own codegen and every one of its
+// existing callers stay completely untouched. `ident_off`/`ident_len`
+// name the POINTER variable (`p`, not the pointee) -- same role
+// STMT_ASSIGN's own target-name fields already play, just naming a
+// variable whose VALUE is an address rather than one written directly;
+// `expr` is the RHS (same field, same role as STMT_ASSIGN). `then_body`/
+// `else_body` stay unused (0) -- unlike STMT_ASSIGN_INDEX, this shape
+// needs no extra field: this subset has no pointer arithmetic, so `*p`
+// is the entire real dereference-target grammar (there is no `*(p+1)`
+// this milestone's own narrow scope could even reach).
+const STMT_ASSIGN_DEREF: u8 = 14;
 
 #[repr(C)]
 struct StmtNode {
@@ -2404,12 +2498,65 @@ impl Parser {
             unsafe { self.advance() };
             return unsafe { self.parse_unary() };
         }
+        // MILESTONE 109: real unary `&` (address-of) and `*`
+        // (dereference) -- the two new EXPR_UNARY op sentinels this
+        // milestone adds (OP_ADDR, OP_DEREF), same tightest-precedence
+        // unary slot `-`/`~`/`!` already occupy above. `&` is
+        // deliberately NARROWER than every other unary operator here:
+        // its operand must be a single plain IDENT (this subset's
+        // entire real address-of grammar in this first slice -- no
+        // `&arr[i]`, no `&*p`, no `&(expr)`; see this milestone's own
+        // README entry for the full scope reasoning), so it does NOT
+        // recurse into parse_unary()/parse_factor() the way every other
+        // unary operator here does -- it builds the EXPR_IDENT operand
+        // node directly and expects nothing else. `*` (dereference), by
+        // contrast, DOES recurse into parse_unary() below, exactly like
+        // `-`/`~`/`!` above it, so it composes with them and with
+        // itself through the same recursive-unary call (`-*p`, `!*p`,
+        // `*p` nested inside a ternary/call/index all parse). This `*`
+        // here is unambiguous with `*`'s other, pre-existing meaning
+        // (binary multiplication, parsed by parse_term()'s own loop
+        // just below this function): parse_term() always calls
+        // parse_unary() FIRST for its left operand before ever checking
+        // for a following `*`/`/`/`%`, so a `*` reached here has, by
+        // construction, no left operand yet -- it can only be this
+        // prefix form, the exact same "resolved by grammar POSITION,
+        // not by the token alone" reasoning this function's own
+        // Milestone 76 doc comment above already established for unary
+        // vs. binary `-`.
+        if k == TOK_AMP {
+            unsafe { self.advance() };
+            let name = unsafe { self.expect(TOK_IDENT) }?;
+            let operand = unsafe { alloc_expr() };
+            if operand == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    operand as *mut ExprNode,
+                    ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            let node = unsafe { alloc_expr() };
+            if node == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    node as *mut ExprNode,
+                    ExprNode { kind: EXPR_UNARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_ADDR, left: operand, right: 0, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            return Ok(node);
+        }
         let op = if k == TOK_MINUS {
             OP_NEG
         } else if k == TOK_TILDE {
             OP_BITNOT
         } else if k == TOK_BANG {
             OP_LOGNOT
+        } else if k == TOK_STAR {
+            OP_DEREF
         } else {
             return unsafe { self.parse_factor() };
         };
@@ -2902,6 +3049,58 @@ impl Parser {
         Ok(node)
     }
 
+    /// MILESTONE 109: `"*" IDENT ("=" logic_or)? ";"` -- a real single-
+    /// level `int` pointer declarator, `"int"` and the pointer's own
+    /// leading `"*"` already consumed by the caller (TOK_INT's own arm
+    /// in parse_stmt(), same "already consumed before this helper runs"
+    /// shape parse_array_decl() above already uses -- there `name` is
+    /// consumed before the `[`; here `name` is consumed AFTER the `*`,
+    /// the real grammar difference between the two declarator shapes).
+    /// Deliberately narrow: exactly ONE pointer declarator per
+    /// statement (no `int *p, *q;` list, no mixing a pointer declarator
+    /// into an `int a, *p, b[3];` list) -- the same "own standalone
+    /// path, not folded into make_decl()'s comma-chain" discipline
+    /// parse_array_decl() itself already established for arrays.
+    /// Reuses make_decl()'s own optional `"=" <ternary>` initializer
+    /// support directly (finish_ident_assign(), unchanged), so
+    /// `int *p = &x;` is a real, legal combined declaration+initializer
+    /// in one statement, same as any plain scalar `int i = e;` since
+    /// Milestone 88.
+    ///
+    /// Produces an ORDINARY scalar STMT_DECL (then_body=0, else_body=0)
+    /// -- byte-identical in shape to a plain `int p;` declaration. This
+    /// is a deliberate design choice, not an oversight: a pointer's
+    /// runtime VALUE is just another 8-byte stack slot holding an
+    /// address, exactly like an ordinary `int` holds a number --
+    /// collect_vars_rec()/find_var() need no new VarSlot field and no
+    /// new stack-layout logic, and gen_expr()'s existing EXPR_IDENT read
+    /// of `p` (an ordinary 8-byte load) is already exactly correct for
+    /// reading a pointer's own value. The only genuinely NEW codegen
+    /// this milestone adds lives entirely in EXPR_UNARY's two new op
+    /// cases (OP_ADDR for `&x`, OP_DEREF for `*p` as an rvalue) and the
+    /// new STMT_ASSIGN_DEREF statement kind (for `*p = expr;` as an
+    /// lvalue) -- see their own doc comments for the full derivation,
+    /// and this file's own top Milestone 109 doc comment for why zero
+    /// new CodeBuf encodings were needed anywhere in this milestone.
+    unsafe fn parse_pointer_decl(&mut self, name: Token) -> Result<u64, ParseError> {
+        let head = unsafe { alloc_stmt() };
+        if head == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                head as *mut StmtNode,
+                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+            )
+        };
+        if unsafe { self.peek() }.kind == TOK_ASSIGN {
+            let assign = unsafe { self.finish_ident_assign(name, false) }?;
+            unsafe { (*(head as *mut StmtNode)).next = assign };
+        }
+        unsafe { self.expect(TOK_SEMI) }?;
+        Ok(head)
+    }
+
     /// MILESTONE 84 logic, extracted at MILESTONE 86 so `for`'s init and
     /// step clauses can reuse it. `name` is the already-consumed IDENT;
     /// the next token is `=` or one of the nine compound-assignment
@@ -2986,6 +3185,21 @@ impl Parser {
                 // finish_ident_assign() path a plain `i = e;` already
                 // takes.
                 unsafe { self.advance() };
+                // MILESTONE 109: `int` immediately followed by `*` is a
+                // pointer declarator (`int *p ...;`) -- checked BEFORE
+                // the IDENT is consumed, since the `*` sits between the
+                // type keyword and the name here (unlike the array
+                // declarator's own `[`, which comes AFTER the name, or
+                // the plain scalar case, which has no extra punctuation
+                // at all). One token of lookahead, same "peek before
+                // deciding which declarator shape this is" discipline
+                // Milestone 108 already used for array-vs-scalar just
+                // below.
+                if unsafe { self.peek() }.kind == TOK_STAR {
+                    unsafe { self.advance() }; // consume '*'
+                    let name = unsafe { self.expect(TOK_IDENT) }?;
+                    return unsafe { self.parse_pointer_decl(name) };
+                }
                 let name = unsafe { self.expect(TOK_IDENT) }?;
                 // MILESTONE 108: one token of lookahead after the IDENT
                 // decides between the pre-existing scalar declarator
@@ -3082,6 +3296,50 @@ impl Parser {
                     return Ok(node);
                 }
                 unsafe { self.finish_ident_assign(name, true) }
+            }
+            // MILESTONE 109: `"*" IDENT "=" cond_expr ";"` -- a real
+            // pointer dereference WRITE (the lvalue form of `*p`),
+            // dispatched at the very start of a statement exactly like
+            // Milestone 108's own `IDENT "["` array-write arm above --
+            // a statement STARTING with `*` can only ever be this one
+            // shape in this subset's grammar (there is no bare
+            // expression-statement here at all -- see TOK_IDENT's own
+            // arm above, which requires an `=`/compound-assign or falls
+            // through to a real ParseError -- so an expression-only
+            // dereference like a bare `*p;` is not legal statement
+            // grammar either, consistent with that same restriction).
+            // The pointer operand is deliberately restricted to a plain
+            // IDENT (not a general unary/factor) -- the same narrow
+            // "one real slot, not the whole expression grammar" scope
+            // parse_array_decl()'s own array-name restriction already
+            // established for STMT_ASSIGN_INDEX; since this subset has
+            // no pointer arithmetic, `*p` is the ENTIRE real
+            // dereference-target grammar anyway (there is no `*(p+1)`
+            // this scope could even reach). This dispatch is
+            // unambiguous with parse_unary()'s own `*` (dereference-as-
+            // rvalue) handling below: parse_stmt()'s own top-level match
+            // only ever sees the FIRST token of a brand-new statement,
+            // while parse_unary()'s `*` case only ever runs from
+            // somewhere already inside expression parsing (an
+            // assignment's RHS, a call argument, a `return` expression,
+            // etc.) -- the two can never both fire on the same token.
+            TOK_STAR => {
+                unsafe { self.advance() }; // consume '*'
+                let name = unsafe { self.expect(TOK_IDENT) }?;
+                unsafe { self.expect(TOK_ASSIGN) }?;
+                let rhs = unsafe { self.parse_ternary() }?;
+                unsafe { self.expect(TOK_SEMI) }?;
+                let node = unsafe { alloc_stmt() };
+                if node == 0 {
+                    return Err(ParseError::OutOfMemory);
+                }
+                unsafe {
+                    core::ptr::write(
+                        node as *mut StmtNode,
+                        StmtNode { kind: STMT_ASSIGN_DEREF, ident_off: name.ident_off, ident_len: name.ident_len, expr: rhs, next: 0, then_body: 0, else_body: 0 },
+                    )
+                };
+                Ok(node)
             }
             // MILESTONE 92: `goto LABEL ;`.
             TOK_GOTO => {
@@ -5058,6 +5316,53 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         // `movzx eax,al` normalize idiom OP_NE and every comparison arm
         // already use -- here with `sete` (0x94: AL := 1 iff ZF, i.e.
         // iff the operand was 0), zero new CodeBuf encodings.
+        // MILESTONE 109: `&x` -- real address-of codegen. `e.left`
+        // always points at a plain EXPR_IDENT node (parse_unary()'s own
+        // `&` arm builds nothing else), naming the variable whose
+        // ADDRESS is wanted, not its value -- so this arm deliberately
+        // does NOT recurse into gen_expr(e.left) the way every other
+        // EXPR_UNARY case does (that would emit an ordinary VALUE load,
+        // the wrong thing for `&`). Instead it reads that EXPR_IDENT
+        // node directly, resolves its name via find_var() exactly like
+        // an ordinary EXPR_IDENT read would, and emits ONE instruction
+        // -- `emit_lea_rax_rbp_off()`, Milestone 108's own array-base-
+        // address encoding, reused completely unchanged (an ordinary
+        // scalar's own `rbp`-relative slot is exactly as valid an LEA
+        // operand as an array's element-0 slot already was) -- to
+        // compute `rbp+off` into RAX WITHOUT dereferencing it. Zero new
+        // CodeBuf encodings.
+        EXPR_UNARY if e.op == OP_ADDR => {
+            let operand = unsafe { core::ptr::read(e.left as *const ExprNode) };
+            let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, operand.ident_off as u64, operand.ident_len as u64) };
+            match slot {
+                Some((o, _is_char)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
+                None => return Err(CodeGenError::UndeclaredVariable(operand.ident_off as u64)),
+            }
+        }
+        // MILESTONE 109: `*p` as an RVALUE -- real dereference-read
+        // codegen. `e.left` is evaluated completely ordinarily (the
+        // same gen_expr() recursion every other EXPR_UNARY case already
+        // uses), leaving the pointer's own VALUE (an address) in RAX;
+        // one more instruction -- `emit_mov_rax_mem_rax()`, Milestone
+        // 108's own array-element-load encoding ("MOV RAX,[RAX]"),
+        // reused completely unchanged -- loads the 8 bytes AT that
+        // address. Zero new CodeBuf encodings: this milestone's entire
+        // new codegen surface (this arm, OP_ADDR above, and
+        // STMT_ASSIGN_DEREF below in gen_stmt_list()) is built entirely
+        // out of `emit_lea_rax_rbp_off()`/`emit_mov_rax_mem_rax()`/
+        // `emit_mov_mem_rcx_rax()`, all three already hand-verified
+        // against the Intel SDM by Milestone 108 -- a real, deliberate
+        // "single-level pointer read/write is exactly array-element
+        // read/write with the index folded away" reuse, not a
+        // coincidence: an array-element access already computes
+        // "a runtime address, then load/store through it"; a pointer
+        // dereference is the same operation with the address coming
+        // from a variable's own VALUE instead of a LEA+index
+        // computation.
+        EXPR_UNARY if e.op == OP_DEREF => {
+            unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
+            unsafe { buf.emit_mov_rax_mem_rax() };
+        }
         EXPR_UNARY => {
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
             if e.op == OP_BITNOT {
@@ -5429,6 +5734,37 @@ unsafe fn gen_stmt_list(
                 unsafe { buf.emit_pop_reg(REG_RCX) };
                 unsafe { buf.emit_shl_rcx_imm8(3) };
                 unsafe { buf.emit_sub_rax_rcx() };
+                unsafe { buf.emit_push_rax() };
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
+                unsafe { buf.emit_pop_reg(REG_RCX) };
+                unsafe { buf.emit_mov_mem_rcx_rax() };
+            }
+            // MILESTONE 109: `*p = expr;` -- a real pointer dereference
+            // WRITE. `s.ident_off`/`s.ident_len` name the POINTER
+            // variable `p` (not the pointee) -- its own VALUE (an
+            // address) is read first via the ordinary
+            // `emit_mov_rax_rbp_off()` load every plain EXPR_IDENT read
+            // already uses, then PUSHed to save it across the RHS
+            // evaluation (which may itself use RAX/RCX freely -- e.g.
+            // another dereference, or a call), then the RHS is
+            // evaluated into RAX and stored at the saved address --
+            // the exact same "push the address, evaluate the RHS,
+            // pop the address back into RCX, store" shape
+            // STMT_ASSIGN_INDEX just above already established for
+            // `arr[idx] = expr;`, minus the index-address-computation
+            // steps (a pointer's own value already IS the target
+            // address -- no LEA/SHL/SUB needed at all).
+            //   mov rax, [rbp+o]     (RAX = p's own value, the target address)
+            //   push rax             (save the target address)
+            //   <rhs>                (gen_expr, value into RAX)
+            //   pop rcx              (RCX = the saved target address)
+            //   mov [rcx], rax       (*p = value, the real store)
+            STMT_ASSIGN_DEREF => {
+                let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
+                match slot {
+                    Some((o, _is_char)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
+                    None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
+                }
                 unsafe { buf.emit_push_rax() };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 unsafe { buf.emit_pop_reg(REG_RCX) };
@@ -9593,7 +9929,137 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m108 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 109: single-level `int` pointer declaration,
+        // address-of, and dereference (read AND write) -- see this
+        // file's own top Milestone 109 doc comment for the full grammar
+        // delta and codegen derivation. All four cases run in-process
+        // (CodegenMode::Callable), the same verification tier Milestone
+        // 107/108 both already used for their own new cases -- no new
+        // real fork()/exec()/wait() cycle is added by this milestone.
+        //
+        // CASE 91: the combined declaration+initializer form
+        // (`int *p = &x;`, parse_pointer_decl()'s own optional
+        // initializer branch) exercising address-of AND
+        // dereference-read together in one program.
+        //   int main() {
+        //       int x;
+        //       x = 10;
+        //       int *p = &x;
+        //       return *p;
+        //   }
+        // Hand-computed: 10.
+        // -------------------------------------------------------------
+        const SRC91: &[u8] = b"int main() { int x; x = 10; int *p = &x; return *p; }";
+        let case91_result = compile_and_run_program_callable(SRC91.as_ptr() as u64, SRC91.len() as u64);
+        w(b"  case91 (int *p = &x; return *p;, combined pointer decl+init, address-of + dereference-read, in-process) returned=");
+        if let Some(r) = case91_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 10)\n");
+        let case91_ok = case91_result == Some(10);
+        write_check(b"case91_pointer_addr_and_deref_read_returns_10=", case91_ok);
+
+        w(b"\n");
+
+        // CASE 92: `*p = expr;` -- the real, distinguishing proof that a
+        // dereference WRITE mutates the pointee's own real stack slot
+        // (genuine aliasing), not some independent copy `p` happens to
+        // hold -- a shallow/buggy implementation that treated `p` as an
+        // ordinary variable disconnected from `x`'s own storage would
+        // still pass CASE 91 above (a fresh read right back through the
+        // same pointer) but would fail THIS case, since `x` itself would
+        // stay 5 if the write did not really land at `x`'s own address.
+        //   int main() {
+        //       int x; int *p;
+        //       x = 5; p = &x; *p = 99;
+        //       return x;
+        //   }
+        // Hand-computed: 99.
+        // -------------------------------------------------------------
+        const SRC92: &[u8] = b"int main() { int x; int *p; x = 5; p = &x; *p = 99; return x; }";
+        let case92_result = compile_and_run_program_callable(SRC92.as_ptr() as u64, SRC92.len() as u64);
+        w(b"  case92 (*p = 99; return x; -- real aliasing proof, dereference-write mutates the pointee, in-process) returned=");
+        if let Some(r) = case92_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 99)\n");
+        let case92_ok = case92_result == Some(99);
+        write_check(b"case92_deref_write_mutates_pointee_returns_99=", case92_ok);
+
+        w(b"\n");
+
+        // CASE 93: a real "swap via pointers" idiom -- two SEPARATE
+        // pointer variables (`pa`, `pb`) must each hold their own
+        // distinct address (a bug that aliased both to the same slot
+        // would show up here as the swap silently doing nothing, or
+        // corrupting one of the two values), combined with both
+        // dereference-read and dereference-write in the same program --
+        // the strongest realistic composition proof this milestone's
+        // own self-test offers, the same "distinguishing, not just
+        // commutative-safe" discipline CASE 88/CASE 26 already
+        // established for arrays/register arguments.
+        //   int main() {
+        //       int a; int b; int *pa; int *pb; int tmp;
+        //       a = 3; b = 7;
+        //       pa = &a; pb = &b;
+        //       tmp = *pa; *pa = *pb; *pb = tmp;
+        //       return a * 100 + b;
+        //   }
+        // Hand-computed: a becomes 7, b becomes 3 -> 7*100+3 = 703.
+        // -------------------------------------------------------------
+        const SRC93: &[u8] = b"int main() { int a; int b; int *pa; int *pb; int tmp; a = 3; b = 7; pa = &a; pb = &b; tmp = *pa; *pa = *pb; *pb = tmp; return a * 100 + b; }";
+        let case93_result = compile_and_run_program_callable(SRC93.as_ptr() as u64, SRC93.len() as u64);
+        w(b"  case93 (swap a/b via two distinct pointers pa/pb, in-process) returned=");
+        if let Some(r) = case93_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 703)\n");
+        let case93_ok = case93_result == Some(703);
+        write_check(b"case93_pointer_swap_returns_703=", case93_ok);
+
+        w(b"\n");
+
+        // CASE 94: the real, disclosed narrow-scope proof -- `&`
+        // applied to a non-IDENT operand (a bare INTLIT here) is a real
+        // ParseError, not silently accepted, since parse_unary()'s own
+        // `&` arm calls `self.expect(TOK_IDENT)` directly rather than
+        // recursing into the general expression grammar (see that
+        // function's own Milestone 109 doc comment for the full
+        // reasoning). The same "prove the scope restriction is real,
+        // don't just document it" discipline CASE 87/90 already
+        // established for MAX_PARAMS/MAX_VARS.
+        //   int main() { return &5; }
+        // -------------------------------------------------------------
+        const SRC94: &[u8] = b"int main() { return &5; }";
+        let case94_ok = match lex_and_parse_program(SRC94.as_ptr() as u64, SRC94.len() as u64) {
+            Err(_) => {
+                w(b"  case94 `&5` (address-of a non-IDENT operand) rejected at parse time, as expected\n");
+                true
+            }
+            Ok(_) => {
+                w(b"  case94 expected a ParseError for `&5` (address-of a non-IDENT operand), got Ok\n");
+                false
+            }
+        };
+        write_check(b"case94_address_of_non_ident_is_parse_error=", case94_ok);
+
+        w(b"\n");
+
+        let overall_m109 = case91_ok && case92_ok && case93_ok && case94_ok;
+        w(b"OVERALL_M109=");
+        w(if overall_m109 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 { 0 } else { 1 });
     }
 }
 

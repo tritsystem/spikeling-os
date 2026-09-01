@@ -837,6 +837,23 @@
 // self-test still leaks per-compile (bounded, not fixed); one 4 KiB
 // stack page per process.
 //
+// MILESTONE 94 adds `//` line and `/* */` block comments -- a
+// lexer-only change (the parser and codegen never see a comment).
+// `//` runs to the next newline or end of input; `/* ... */` runs to
+// the first `*/`, no nesting (real C). An unterminated block comment
+// is a real LexError pointing at its opening `/`. The comment check
+// sits right after whitespace-skipping and before the `/=` (Milestone
+// 89) multi-char check, so `a /= 4` still lexes as an operator. Two
+// new self-test cases: CASE 62 (in-process -- a program peppered with
+// both comment styles, a block comment between two tokens, a `/=`
+// right after a `//` -> 30) and CASE 63 (the unterminated-comment
+// LexError path).
+//
+// Still genuinely open after Milestone 94: `MAX_PARAMS` (4, needs
+// stack-passed arguments); no arrays/pointers; only the `int` type;
+// the compiler self-test still leaks per-compile (bounded, not fixed);
+// one 4 KiB stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -1101,6 +1118,42 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
         if b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
             i += 1;
             continue;
+        }
+        // MILESTONE 94: comments -- skipped in the lexer exactly like
+        // whitespace, so the parser/codegen never see them. `//` runs to
+        // (but not past) the next newline or end of input; `/* ... */`
+        // runs to the first `*/` (an unterminated block comment reaching
+        // end of input is a real LexError::UnknownChar at the `/`, the
+        // same "point at the offending byte" convention every other lex
+        // error uses). No nesting (matches real C).
+        if b == b'/' && i + 1 < src_len {
+            let c = unsafe { core::ptr::read((src_ptr + i + 1) as *const u8) };
+            if c == b'/' {
+                i += 2;
+                while i < src_len && unsafe { core::ptr::read((src_ptr + i) as *const u8) } != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == b'*' {
+                let comment_start = i;
+                i += 2;
+                let mut closed = false;
+                while i + 1 < src_len {
+                    let a = unsafe { core::ptr::read((src_ptr + i) as *const u8) };
+                    let d = unsafe { core::ptr::read((src_ptr + i + 1) as *const u8) };
+                    if a == b'*' && d == b'/' {
+                        i += 2;
+                        closed = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !closed {
+                    return Err(LexError::UnknownChar(comment_start));
+                }
+                continue;
+            }
         }
         if n >= max_toks {
             return Err(LexError::TooManyTokens);
@@ -7401,7 +7454,60 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m93 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 94: `//` line and `/* */` block comments (lexer
+        // only). CASE 62 (in-process Callable path): a program peppered
+        // with both comment styles, including a block comment BETWEEN
+        // two tokens, a line comment ending at a real '\n' followed by
+        // more code, and a `/=` right after a `//` (proving the comment
+        // check does not eat the `/=` operator).
+        //   int main() {
+        //       int a = 100; /* set */ a /= 4; // now 25
+        //       int b = a; /* keep */ return b + 5;
+        //   }
+        // Hand-computed: a = 100 / 4 = 25; b = 25; return 30. If any
+        // comment leaked into the token stream the program would fail to
+        // compile or return a different value.
+        // -------------------------------------------------------------
+        const SRC62: &[u8] = b"int main() { int a = 100; /* set */ a /= 4; // now 25\n int b = a; /* keep */ return b + 5; }";
+        let case62_result = compile_and_run_program_callable(SRC62.as_ptr() as u64, SRC62.len() as u64);
+        w(b"  case62 (// and /* */ comments, in-process) returned=");
+        if let Some(r) = case62_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 30)\n");
+        let case62_ok = case62_result == Some(30);
+        write_check(b"case62_line_and_block_comments_returns_30=", case62_ok);
+
+        w(b"\n");
+
+        // CASE 63: an UNTERMINATED block comment is a real
+        // LexError -- the same "prove the Err path is real" discipline
+        // CASE 3 (a bad lex byte) already established.
+        //   int main() { return 1; /* never closed
+        const SRC63: &[u8] = b"int main() { return 1; /* never closed";
+        let case63_ok = match lex_and_parse(SRC63.as_ptr() as u64, SRC63.len() as u64) {
+            Err(_) => {
+                w(b"  case63 unterminated block comment rejected, as expected\n");
+                true
+            }
+            Ok(_) => {
+                w(b"  case63 expected a LexError for the unterminated /* comment, got Ok\n");
+                false
+            }
+        };
+        write_check(b"case63_unterminated_block_comment_is_a_lex_error=", case63_ok);
+
+        w(b"\n");
+
+        let overall_m94 = case62_ok && case63_ok;
+        w(b"OVERALL_M94=");
+        w(if overall_m94 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 { 0 } else { 1 });
     }
 }
 

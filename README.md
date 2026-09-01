@@ -6454,6 +6454,32 @@ self-test suite, genuinely open for a future pass.
       self-test still leaks per-compile (bounded by `heap_reset()`, not
       fixed); one 4 KiB stack page per process.
 
+- [x] **Milestone 94**: `//` line and `/* */` block comments in the
+      self-hosted subset-C compiler -- a **lexer-only** change (the
+      parser and codegen never see a comment). `//` runs to the next
+      newline or end of input; `/* ... */` runs to the first `*/`, no
+      nesting (real C). An unterminated block comment is a real
+      `LexError` pointing at its opening `/`. The comment check sits
+      right after whitespace-skipping and before the `/=` (Milestone
+      89) multi-char check, so `a /= 4` still lexes as an operator, not
+      a comment.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`). Two QEMU
+      boots, fresh then reused. CASE 62 (in-process -- a program
+      peppered with both comment styles: a block comment between two
+      tokens, a line comment ending at a real newline followed by more
+      code, a `/=` right after a `//`) returns `30`; CASE 63 exercises
+      the unterminated-comment `LexError` path. Both boots.
+      `OVERALL_M94=PASS`, `OVERALL_M68`..`M93` all still PASS (including
+      `OVERALL_M89`, the `/`/`%` milestone -- no `//` collision),
+      `milestone 64`/`65`/`stdiotest` all still PASS, fresh vs. reused
+      OVERALL markers byte-identical. No regressions.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; only the `int` type; the compiler
+      self-test still leaks per-compile (bounded, not fixed); one 4 KiB
+      stack page per process.
+
 ## Building and running
 
 Requires:

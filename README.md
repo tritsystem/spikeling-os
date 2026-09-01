@@ -6099,6 +6099,53 @@ self-test suite, genuinely open for a future pass.
       (Milestone 79's open verification gap, untouched); one 4 KiB stack
       page per process (a pure userspace toolchain change).
 
+- [x] **Milestone 85**: no new grammar and no new codegen -- closes the
+      SAR-vs-SHR verification hole Milestone 79's own closing note first
+      disclosed and every milestone since (80/81/83/84) re-confirmed
+      open: *"SAR vs. SHR is genuinely undistinguished by any test case
+      -- both only ever shift a non-negative value, where the two
+      encodings produce identical results."* Weighed against growing the
+      grammar a third time running (`for`, `break`/`continue`) --
+      Milestone 75's own reasoning applies: with a specifically-named,
+      on-the-books verification hole in the compiler's **own output**,
+      closing it beats another operator.
+
+      `gen_expr()`'s `OP_SHR` arm has always emitted `emit_sar_rax_cl()`
+      -- real `SAR` (`48 D3 F8`), the arithmetic sign-preserving shift,
+      not logical `SHR`. A latent bug that emitted `SHR` instead would
+      have passed every prior test, because all of them shift a
+      non-negative value, where `SAR` and `SHR` give an identical bit
+      pattern. Two new cases shift a genuinely **negative** value and
+      then read its sign, so `SAR` (stays negative) and `SHR` (becomes
+      a large positive) give different, distinguishable answers:
+
+      - **CASE 43** (in-process Callable path): `-8 >> 1`. Under `SAR`
+        that is `-4`, so `if (a < 0)` is true and the program returns
+        `0 - a` = `4`. Under `SHR` it is `0x7FFF_FFFF_FFFF_FFFC`, `a <
+        0` is false, and it returns `111`. Result: `4`.
+      - **CASE 44** (real on-disk-ELF + kernel `exec()`+`wait()` path,
+        strongest tier): `-16 >> 2`. Routed through `if (x < 0)` so the
+        sign-bit difference reaches the exit code -- exits `7` under
+        `SAR`, would exit `9` under `SHR`. The low 8 bits of a bare
+        `>>` result are identical either way (only bit 63 differs), so
+        the sign test is what makes it observable. Result: `7`.
+
+      `<<` needs no arithmetic variant -- `SHL` is bit-identical for
+      signed and unsigned operands -- and is not separately re-verified.
+
+      **Verified**: `cargo build` clean, no warnings; `cc.elf` rebuilt
+      (13 expected "never used" warnings). Two QEMU boots, fresh-disk
+      then reused-disk. CASE 43 returns `4`, CASE 44 returns `7`, both
+      boots. `OVERALL_M85=PASS`, `OVERALL_M68`..`M84` all still PASS,
+      `milestone 64`/`65`/`stdiotest` all still PASS, fresh vs. reused
+      OVERALL markers byte-identical, only the disclosed `FAIL` set
+      remains. No regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); `for`
+      loops and `break`/`continue` (the leading grammar candidates now
+      -- `break`/`continue` open since Milestone 71); no arrays/pointers,
+      no additional C types; one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

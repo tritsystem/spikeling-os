@@ -576,6 +576,35 @@
 // 4 KiB stack page per process, untouched (a pure userspace toolchain
 // change).
 //
+// MILESTONE 85 adds NO grammar and NO codegen -- it closes the
+// SAR-vs-SHR verification hole Milestone 79's own closing note first
+// disclosed and every milestone since (80, 81, 83, 84) re-confirmed
+// open: "SAR vs. SHR is genuinely UNDISTINGUISHED by any test case
+// (both only ever shift a non-negative value, where the two encodings
+// produce identical results)". Weighed against growing the grammar a
+// third time running (`for`, `break`/`continue`) -- Milestone 75's own
+// reasoning applies: with a specifically-named, on-the-books
+// verification hole in the compiler's OWN output, closing it is the
+// more valuable move than another operator. `gen_expr()`'s `OP_SHR`
+// arm has always emitted `emit_sar_rax_cl()` (real SAR, the
+// arithmetic sign-preserving shift), so a latent bug that emitted SHR
+// instead would have passed every prior test. Two new cases shift a
+// genuinely NEGATIVE value and then read its sign, so SAR (stays
+// negative) and SHR (becomes a large positive) give different,
+// distinguishable answers: CASE 43 (`-8 >> 1` == -4, in-process
+// Callable path, returns `0 - a` == 4) and CASE 44 (`-16 >> 2` == -4,
+// real on-disk-ELF + kernel exec()+wait() path, routed through an
+// `if (x < 0)` so the sign-bit difference reaches the exit code --
+// exits 7 under SAR, would exit 9 under SHR). `<<` needs no arithmetic
+// variant (SHL is bit-identical signed/unsigned) and is not separately
+// re-verified.
+//
+// Still genuinely open after Milestone 85: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); `for` loops and `break`/`continue` (the leading grammar
+// candidates now, `break`/`continue` open since Milestone 71); no
+// arrays/pointers, no additional C types; one 4 KiB stack page per
+// process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -5643,7 +5672,75 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m84 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 85: no new grammar and no new codegen -- it closes
+        // the one specifically-disclosed verification hole Milestone 79's
+        // own closing note left open and Milestone 84's re-confirmed:
+        // "SAR vs. SHR is genuinely UNDISTINGUISHED by any test case
+        // (both only ever shift a non-negative value, where the two
+        // encodings produce identical results)". `gen_expr()`'s OP_SHR
+        // arm emits `emit_sar_rax_cl()` (SAR, 0x48 0xD3 0xF8 -- the
+        // arithmetic, sign-preserving shift), NOT SHR (logical). Every
+        // prior test shifts a non-negative value, where SAR and SHR give
+        // the identical bit pattern, so a latent bug that emitted SHR
+        // instead would have passed all of them. These two cases shift a
+        // genuinely NEGATIVE value and then read its sign, so SAR
+        // (result stays negative) and SHR (result becomes a large
+        // positive) produce different, distinguishable answers. `<<`
+        // needs no arithmetic variant -- SHL is bit-identical for signed
+        // and unsigned operands -- so it is not separately re-verified.
+        //
+        // CASE 43 (in-process Callable path): -8 >> 1. SAR = -4 (bit 63
+        // set), so `a < 0` is true and the program returns `0 - a` = 4.
+        // If OP_SHR emitted SHR, `-8` (0xFFFFFFFFFFFFFFF8) >> 1 =
+        // 0x7FFFFFFFFFFFFFFC, a large positive, `a < 0` false, return
+        // 111 -- a completely different result.
+        // -------------------------------------------------------------
+        const SRC43: &[u8] = b"int main() { int a; a = -8; a = a >> 1; if (a < 0) { return 0 - a; } return 111; }";
+        let case43_result = compile_and_run_program_callable(SRC43.as_ptr() as u64, SRC43.len() as u64);
+        w(b"  case43 (>> on a negative value is arithmetic (SAR), in-process) returned=");
+        if let Some(r) = case43_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4)\n");
+        let case43_ok = case43_result == Some(4);
+        write_check(b"case43_shift_right_negative_is_arithmetic_returns_4=", case43_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 44 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier, same precedent as every milestone
+        // since 69): -16 >> 2. SAR = -4, so `x < 0` is true and the
+        // program exits 7. With SHR it would be a large positive, `x <
+        // 0` false, exit 9. The `< 0` comparison is what amplifies the
+        // sign-bit difference into an observable exit code (a bare `>>`
+        // result's LOW 8 bits are identical under SAR and SHR -- only
+        // bit 63 differs -- so the exit code must be routed through a
+        // sign test, not returned directly).
+        // -------------------------------------------------------------
+        const SRC44: &[u8] =
+            b"int main() { int x; x = -16; x = x >> 2; if (x < 0) { return 7; } return 9; }";
+        const PATH44: &[u8] = PATH8;
+        let (elf44_ptr, elf44_len) = compile_program_standalone_elf(SRC44.as_ptr() as u64, SRC44.len() as u64);
+        let case44_ok = if elf44_ptr == 0 {
+            w(b"  case44 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH44, elf44_ptr, elf44_len, 7)
+        };
+        write_check(b"case44_real_elf_exec_shift_right_negative_is_arithmetic_returns_7=", case44_ok);
+
+        w(b"\n");
+
+        let overall_m85 = case43_ok && case44_ok;
+        w(b"OVERALL_M85=");
+        w(if overall_m85 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 { 0 } else { 1 });
     }
 }
 

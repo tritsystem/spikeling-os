@@ -6871,6 +6871,84 @@ self-test suite, genuinely open for a future pass.
       Milestone-3 100 KiB, since this self-test suite's own real
       `fork()`/`exec()`/`wait()` cycle count only grows from here).
 
+- [x] **Milestone 103**: `char` as a function PARAMETER type and a
+      function RETURN type (`tools/cc_src/main.rs`) -- closing the gap
+      Milestone 102's own "still genuinely open" note explicitly named.
+      `char` parameters reuse Milestone 102's narrowed-read mechanism
+      with ZERO new codegen: `parse_params()` now accepts either
+      `TOK_INT` or `TOK_CHAR` before each parameter (the exact same
+      choice `make_decl()` already offers at declaration sites), recorded
+      in a new `ParamInfo.is_char` byte that `collect_vars_for_function()`
+      copies straight into that parameter's own `VarSlot` -- the
+      prologue's own register-spill (`emit_mov_rbp_off_reg()`) is
+      completely untouched, still spilling the full incoming register
+      exactly as before; only the parameter's own later narrowed read
+      (Milestone 102's existing `EXPR_IDENT` path) makes it real. A
+      `char` RETURN type is the one genuinely NEW piece of codegen this
+      milestone adds: a new `FuncDef.is_char_return` byte (from a
+      `TOK_INT`/`TOK_CHAR` choice at the top of `parse_function()`, the
+      same pattern) is threaded through a new `is_char_return` parameter
+      on `gen_stmt_list()` -- a real per-function constant, passed
+      completely unchanged through every one of that function's own
+      recursive calls (if/while/for/switch/case bodies), the exact same
+      "threaded but never modified" shape `vars_ptr`/`funcs_ptr`/`mode`
+      already have. `STMT_RETURN` is the only arm that reads it: when
+      set, it emits a new `emit_movsx_rax_al()` (`48 0F BE C0`, a real
+      register-direct `movsx rax, al`, REX.W + the same MOVSX opcode
+      Milestone 102's own `emit_movsx_rax_rbp_off_byte()` uses for its
+      memory-operand form) right before the epilogue, narrowing whatever
+      `gen_expr()` computed in RAX down to the function's own declared
+      8-bit width. This is genuinely new codegen, not free like the
+      parameter side, because a return value lives in a register with no
+      stack slot for the existing narrowed-read trick to work through.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`, 82224 bytes;
+      real `PT_LOAD` `p_memsz` via `readelf -l` is 68848 bytes, 17 pages
+      -- comfortably under the 64-page per-segment and 128-page total
+      caps, no cap change needed). Two QEMU boots, fresh then reused
+      (`m103_fresh_boot.log` / `m103_reused_boot.log`). CASE 80
+      (in-process -- `int use_char_param(char c) { return c + 1; }`
+      called with `65`, a basic `char` parameter read + arithmetic)
+      returns `66`; CASE 81 (in-process -- the same shape called with an
+      out-of-range `321`, the calling-convention analogue of Milestone
+      102's CASE 77) returns `65` (`321 & 0xFF`); CASE 82 (in-process --
+      `char get_truncated() { return 300; }`, the one case that actually
+      exercises `emit_movsx_rax_al()` -- without it this would return the
+      untruncated `300`) returns `44` (`300 & 0xFF`); CASE 83 (in-process
+      -- `char add_one(char c) { return c + 1; }` called from `main`,
+      its `char` result stored into a `char` local and used in further
+      `int` arithmetic, a real two-function integration proof, not two
+      isolated single-function cases) returns `43`; CASE 84 (in-process
+      -- `int check_param_sign(char c) { return c == -56; }` called with
+      `200`, the parameter-side analogue of Milestone 102's CASE 78,
+      proving real signed sign-extension across the calling-convention
+      boundary specifically) returns `1`. `OVERALL_M103=PASS` both boots,
+      byte-identical fresh vs. reused; `OVERALL_M68`..`OVERALL_M99`/
+      `OVERALL_M101`/`OVERALL_M102` all still PASS and byte-identical;
+      `milestone 54/64/65` PASS. No regressions -- the reused boot's own
+      `fs self-test` `FAIL` lines are the exact same pre-existing,
+      already-disclosed disk-state artifact Milestone 100/101/102's own
+      reused boots already showed, byte-for-byte identical FAIL-line set.
+
+      All five new cases deliberately stayed on the in-process Callable
+      path, adding zero new real `fork()`/`exec()`/`wait()` cycles to the
+      boot -- Milestone 102's own still-OPEN, still-UNRESOLVED kernel-
+      heap-margin bug (see that milestone's own CASE 79 doc comment and
+      README entry) makes adding another real one a genuine risk of
+      reproducing that same panic, and this milestone had no reason to
+      re-run that experiment when the in-process path already proves the
+      real codegen correctly.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; there is still no `sizeof` or any
+      other width-introspection, and `char` remains the only non-`int`
+      type (no `short`/`long`/`unsigned`); the compiler self-test still
+      leaks per-compile (bounded by `heap_reset()`, not eliminated); the
+      real, still-UNRESOLVED kernel-heap-margin bug Milestone 102
+      discovered and disclosed -- now blocking two milestones' worth of
+      "add one more real exec() self-test case" in a row, a genuine,
+      concrete candidate for a near-future milestone in its own right.
+
 ## Building and running
 
 Requires:

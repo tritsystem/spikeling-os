@@ -959,19 +959,50 @@
 // disclosed kernel-heap-margin bug this milestone's own development
 // found, not an oversight).
 //
-// Still genuinely open after Milestone 102: `MAX_PARAMS` (4, needs
-// stack-passed arguments); no arrays/pointers; `char` is a local-
-// variable type only -- NOT yet a function parameter or return type
-// (parse_params() and the top-level function-signature parser both
-// still hard-require `TOK_INT`), and there is still no `sizeof` or any
-// other width-introspection; the compiler self-test still leaks
-// per-compile (bounded by `heap_reset()`, not eliminated); a real,
-// newly-DISCOVERED (not fixed) kernel-heap-margin bug -- see CASE 79's
-// own doc comment below -- where this self-test suite's own growing
-// count of real fork()/exec()/wait() cycles per boot appears to already
-// sit right at kernel/src/allocator.rs's fixed 100 KiB HEAP_SIZE
-// ceiling by the time kernel/src/tasks.rs's own later preemption demo
-// needs its own 16 KiB worker-stack allocations.
+// MILESTONE 103 closes one of Milestone 102's own disclosed gaps: `char`
+// as a function PARAMETER type and a function RETURN type, not just a
+// local-variable type. `char` parameters reuse Milestone 102's narrowed-
+// read mechanism with ZERO new codegen -- `parse_params()` now records
+// each parameter's own `is_char` (a new `ParamInfo.is_char` byte,
+// `TOK_INT`/`TOK_CHAR` per parameter, the same choice `make_decl()`
+// already offers at declaration sites), and `collect_vars_for_function()`
+// copies it straight into that parameter's own `VarSlot` -- the
+// prologue's own register-spill (`emit_mov_rbp_off_reg()`) is completely
+// untouched, still spilling the full incoming register exactly as
+// before; only the parameter's own later narrowed READ (Milestone 102's
+// existing `EXPR_IDENT` path) makes it real. A `char` RETURN type is the
+// one genuinely NEW piece of codegen: `emit_movsx_rax_al()` (new -- `48
+// 0F BE C0`, register-direct `movsx rax, al`) narrows RAX in place right
+// before the epilogue, gated by a new `FuncDef.is_char_return` byte
+// threaded through `gen_stmt_list()`'s new `is_char_return` parameter
+// (a real per-function constant, passed unchanged through every one of
+// its recursive calls, exactly like `vars_ptr`/`funcs_ptr`/`mode`
+// already are) -- STMT_RETURN is the only arm that reads it. This one is
+// genuinely new because a return value lives in a register with no
+// stack slot to narrow through, unlike every other `char` use so far.
+// CASE 80 (char parameter, basic -> `66`), CASE 81 (char parameter
+// truncates an out-of-range ARGUMENT -> `65`, the calling-convention
+// analogue of Milestone 102's CASE 77), CASE 82 (char RETURN type
+// truncates -> `44`, the one case that actually exercises
+// `emit_movsx_rax_al()` -- without it this would return the untruncated
+// `300`), CASE 83 (char parameter and char return CHAINED across two
+// real functions -> `43`), CASE 84 (char parameter is signed -> `1`,
+// the parameter-side analogue of Milestone 102's CASE 78). All five
+// stay on the in-process Callable path -- see Milestone 102's own CASE
+// 79 doc comment for the real, disclosed kernel-heap-margin bug that
+// makes adding MORE real fork()/exec()/wait() cycles to this suite
+// risky until a future milestone actually resolves it.
+//
+// Still genuinely open after Milestone 103: `MAX_PARAMS` (4, needs
+// stack-passed arguments); no arrays/pointers; there is still no
+// `sizeof` or any other width-introspection, and `char` remains the
+// only non-`int` type (no `short`/`long`/`unsigned`); the compiler
+// self-test still leaks per-compile (bounded by `heap_reset()`, not
+// eliminated); the real, still-UNRESOLVED kernel-heap-margin bug
+// Milestone 102 discovered and disclosed (see its own CASE 79 doc
+// comment) -- a genuine, concrete candidate for a near-future milestone,
+// now blocking two milestones' worth of "add one more real exec() self-
+// test case" in a row, not just one.
 //
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
@@ -1772,6 +1803,17 @@ struct StmtNode {
 struct ParamInfo {
     name_off: u32,
     name_len: u8,
+    // MILESTONE 103: 1 if this parameter was declared `char`, 0 for
+    // `int` -- the same `is_char` convention `VarSlot` (Milestone 102)
+    // already carries for local variables, now reaching function
+    // parameters too. `collect_vars_for_function()` copies this
+    // straight into the parameter's own `VarSlot`, so a `char`
+    // parameter narrows on read exactly like a `char` local: no new
+    // codegen at the call site OR in the prologue's own register-spill
+    // (`emit_mov_rbp_off_reg()`, unchanged, still spills the full
+    // incoming register) -- only `EXPR_IDENT`'s existing narrowed-read
+    // path (Milestone 102) is what makes this real.
+    is_char: u8,
 }
 
 /// MILESTONE 72: the maximum number of parameters a single function may
@@ -1887,6 +1929,15 @@ struct FuncDef {
     params_ptr: u64,
     param_count: u8,
     next: u64,
+    // MILESTONE 103: 1 if this function's own declared return type is
+    // `char`, 0 for `int`. Threaded through gen_stmt_list()'s new
+    // `is_char_return` parameter into STMT_RETURN's own codegen, where
+    // it's the ONLY thing that makes a `char` return type real rather
+    // than purely syntactic: see emit_movsx_rax_al()'s own doc comment
+    // for why a return statement needs its own narrowing instruction
+    // (unlike a plain variable read, there is no stack slot here to
+    // narrow through).
+    is_char_return: u8,
 }
 
 unsafe fn alloc_expr() -> u64 {
@@ -3092,12 +3143,22 @@ impl Parser {
         }
         let mut count: u8 = 0;
         loop {
-            unsafe { self.expect(TOK_INT) }?;
+            // MILESTONE 103: a parameter's own leading type is now
+            // `TOK_INT` OR `TOK_CHAR` (real symmetry with make_decl()'s
+            // own `int`/`char` choice at declaration sites) -- `expect()`
+            // still real-errors on anything else.
+            let is_char = if unsafe { self.peek() }.kind == TOK_CHAR {
+                unsafe { self.advance() };
+                true
+            } else {
+                unsafe { self.expect(TOK_INT) }?;
+                false
+            };
             let name = unsafe { self.expect(TOK_IDENT) }?;
             if count as u64 >= MAX_PARAMS {
                 return Err(ParseError::TooManyParams);
             }
-            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len }) };
+            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 } }) };
             count += 1;
             if unsafe { self.peek() }.kind == TOK_COMMA {
                 unsafe { self.advance() };
@@ -3123,7 +3184,16 @@ impl Parser {
     /// several into a real program-level list is parse_program()'s job,
     /// below, not this function's).
     unsafe fn parse_function(&mut self) -> Result<u64, ParseError> {
-        unsafe { self.expect(TOK_INT) }?;
+        // MILESTONE 103: the return-type keyword is now `TOK_INT` OR
+        // `TOK_CHAR` -- see ParamInfo/FuncDef's own doc comments above
+        // for how `is_char_return` reaches codegen from here.
+        let is_char_return = if unsafe { self.peek() }.kind == TOK_CHAR {
+            unsafe { self.advance() };
+            true
+        } else {
+            unsafe { self.expect(TOK_INT) }?;
+            false
+        };
         let name = unsafe { self.expect(TOK_IDENT) }?;
         unsafe { self.expect(TOK_LPAREN) }?;
         let (params_ptr, param_count) = unsafe { self.parse_params() }?;
@@ -3154,6 +3224,7 @@ impl Parser {
                     params_ptr,
                     param_count,
                     next: 0,
+                    is_char_return: if is_char_return { 1 } else { 0 },
                 },
             )
         };
@@ -3630,11 +3701,12 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         }
         let p = unsafe { param_read(f.params_ptr, pi) };
         let off = -8 * (n as i32 + 1);
-        // MILESTONE 102: parameters are always `is_char: 0` -- `char`
-        // is not yet a parameter type in this subset (parse_params()
-        // still only accepts `TOK_INT`), a real, disclosed scope cut,
-        // not an oversight.
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: 0 }) };
+        // MILESTONE 103: a parameter's own `is_char` (Milestone 102's
+        // convention, now reaching parse_params() too) carries straight
+        // through into its VarSlot -- a `char` parameter narrows on
+        // read exactly like a `char` local. Before this milestone this
+        // was unconditionally 0 (char wasn't a parameter type yet).
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char }) };
         n += 1;
         pi += 1;
     }
@@ -3962,6 +4034,26 @@ impl CodeBuf {
         // emit_mov_eax_imm32()'s own doc comment above already relies on
         // for TOK_INTLIT, reused here rather than re-derived.
         unsafe { self.push_bytes(&[0x0F, 0xB6, 0xC0]) };
+    }
+    /// MILESTONE 103: `movsx rax, al` -- REX.W + `0F BE` (the SAME
+    /// MOVSX r64, r/m8 opcode `emit_movsx_rax_rbp_off_byte()` (Milestone
+    /// 102) already uses for its own memory-operand form), ModRM 0xC0 =
+    /// 11 000 000 (mod=11 register-direct, reg=RAX, rm=AL) -- the exact
+    /// same register-direct ModRM shape `emit_movzx_eax_al()` just above
+    /// already uses for ITS sibling opcode, this one just sign- instead
+    /// of zero-extending, and needing REX.W since the destination is a
+    /// full 64-bit RAX rather than the implicitly-64-bit-zero-extending
+    /// EAX. This is the ONLY codegen `char` as a function RETURN type
+    /// needs: unlike a `char` local/parameter (Milestone 102/103, which
+    /// narrow via a real STACK SLOT read), a `return` statement's value
+    /// lives in RAX with no slot to narrow through, so a `char`-
+    /// returning function's own STMT_RETURN emits this real
+    /// register-to-register narrow BEFORE the epilogue, truncating and
+    /// sign-extending whatever gen_expr() computed down to its own
+    /// declared 8-bit width -- e.g. `char f() { return 300; }` genuinely
+    /// returns `44` (`300 & 0xFF`), not `300`.
+    unsafe fn emit_movsx_rax_al(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x0F, 0xBE, 0xC0]) };
     }
     unsafe fn emit_test_rax_rax(&mut self) {
         // TEST r/m64, r64 (0x85 /r), ModRM 0xC0 = 11 000 000 (reg=RAX,
@@ -4674,6 +4766,16 @@ unsafe fn gen_stmt_list(
     // `continue` still checks `loop_top` (loops only). Threaded through
     // STMT_IF like the loop fields; set by STMT_WHILE and STMT_SWITCH.
     break_ok: u64,
+    // MILESTONE 103: 1 if the ENCLOSING FUNCTION's own declared return
+    // type is `char` -- a real per-function constant, not a per-block
+    // one, so (unlike loop_top/break_ok) every recursive call below
+    // passes it through completely UNCHANGED, the same "threaded but
+    // never modified" shape vars_ptr/funcs_ptr/mode already have.
+    // STMT_RETURN is the only arm that reads it (see its own doc
+    // comment). gen_function() passes `f.is_char_return` for the
+    // original single-function path; gen_program()'s per-function loop
+    // passes each FuncDef's own field.
+    is_char_return: u64,
 ) -> Result<(), CodeGenError> {
     let mut cur = head;
     while cur != 0 {
@@ -4696,6 +4798,16 @@ unsafe fn gen_stmt_list(
             }
             STMT_RETURN => {
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
+                // MILESTONE 103: a real narrowing instruction, ONLY when
+                // the enclosing function's own declared return type is
+                // `char` -- see emit_movsx_rax_al()'s own doc comment
+                // for why this is the one case that needs a register-
+                // to-register narrow rather than the slot-read narrow
+                // every other `char` use (Milestone 102 locals,
+                // Milestone 103 parameters) already gets for free.
+                if is_char_return != 0 {
+                    unsafe { buf.emit_movsx_rax_al() };
+                }
                 unsafe { emit_epilogue(buf, mode) };
             }
             // MILESTONE 87: `break` -- an unconditional forward jump to
@@ -4745,11 +4857,11 @@ unsafe fn gen_stmt_list(
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 unsafe { buf.emit_test_rax_rax() };
                 let jz_field = unsafe { buf.emit_jz_placeholder() };
-                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, loop_top, loop_is_for, break_ok) }?;
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, loop_top, loop_is_for, break_ok, is_char_return) }?;
                 if s.else_body != 0 {
                     let jmp_field = unsafe { buf.emit_jmp_placeholder() };
                     unsafe { buf.patch_rel32(jz_field) };
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for, break_ok) }?;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for, break_ok, is_char_return) }?;
                     unsafe { buf.patch_rel32(jmp_field) };
                 } else {
                     unsafe { buf.patch_rel32(jz_field) };
@@ -4794,7 +4906,7 @@ unsafe fn gen_stmt_list(
                 let brk_base = unsafe { loop_brk_n() };
                 let cont_base = unsafe { loop_cont_n() };
 
-                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, my_top, my_is_for, 1) }?;
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, my_top, my_is_for, 1, is_char_return) }?;
 
                 if my_is_for != 0 {
                     // `continue`'s forward-jump target is HERE, right
@@ -4806,7 +4918,7 @@ unsafe fn gen_stmt_list(
                         i += 1;
                     }
                     unsafe { loop_set_cont_n(cont_base) };
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, NOT_IN_LOOP, 0, 0) }?;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, NOT_IN_LOOP, 0, 0, is_char_return) }?;
                 }
 
                 unsafe { buf.emit_jmp_back(my_top) };
@@ -4843,7 +4955,7 @@ unsafe fn gen_stmt_list(
                 let brk_base = unsafe { loop_brk_n() };
                 let cont_base = unsafe { loop_cont_n() };
 
-                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, body_top, 1, 1) }?;
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, body_top, 1, 1, is_char_return) }?;
 
                 // `continue` target: the condition re-check, right here.
                 let cn = unsafe { loop_cont_n() };
@@ -4925,7 +5037,7 @@ unsafe fn gen_stmt_list(
                     let cn = unsafe { core::ptr::read(c2 as *const StmtNode) };
                     unsafe { buf.patch_rel32(loop_cont_at(idx)) };
                     idx += 1;
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, cn.then_body, loop_top, loop_is_for, 1) }?;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, cn.then_body, loop_top, loop_is_for, 1, is_char_return) }?;
                     c2 = cn.next;
                 }
                 unsafe { loop_set_cont_n(cont_base) };
@@ -4934,7 +5046,7 @@ unsafe fn gen_stmt_list(
                 // its start; otherwise it lands at `end` below.
                 if s.else_body != 0 {
                     unsafe { buf.patch_rel32(miss_jmp) };
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for, 1) }?;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for, 1, is_char_return) }?;
                 } else {
                     unsafe { buf.patch_rel32(miss_jmp) };
                 }
@@ -4986,7 +5098,7 @@ unsafe fn gen_function(src_ptr: u64, func: u64, mode: CodegenMode) -> Result<Cod
     // dereference them.
     unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
     unsafe { goto_reset() };  // MILESTONE 92: fresh label/goto arena per function
-    unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, 0, 0, 0, 0, mode, f.body, NOT_IN_LOOP, 0, 0) }?;
+    unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, 0, 0, 0, 0, mode, f.body, NOT_IN_LOOP, 0, 0, f.is_char_return as u64) }?;
     if unsafe { goto_pend_n() } > 0 {
         let off = unsafe { core::ptr::read(core::ptr::addr_of!(GOTO_PEND_OFF) as *const u32) };
         return Err(CodeGenError::UndefinedLabel(off as u64));
@@ -5195,7 +5307,7 @@ unsafe fn gen_program(src_ptr: u64, prog_head: u64, mode: CodegenMode) -> Result
 
         unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
         unsafe { goto_reset() };  // MILESTONE 92: fresh label/goto arena per function
-        unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs_total, pending_ptr, pending_count_ptr, this_fn_mode, f.body, NOT_IN_LOOP, 0, 0) }?;
+        unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs_total, pending_ptr, pending_count_ptr, this_fn_mode, f.body, NOT_IN_LOOP, 0, 0, f.is_char_return as u64) }?;
         if unsafe { goto_pend_n() } > 0 {
             let off = unsafe { core::ptr::read(core::ptr::addr_of!(GOTO_PEND_OFF) as *const u32) };
             return Err(CodeGenError::UndefinedLabel(off as u64));
@@ -8473,7 +8585,136 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m102 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 103: `char` as a function PARAMETER type and a
+        // function RETURN type -- closing the gap Milestone 102's own
+        // "still genuinely open" note named. `char` parameters reuse
+        // Milestone 102's narrowed-read mechanism with ZERO new codegen
+        // (a parameter's own `is_char`, now recorded by parse_params(),
+        // flows straight into its VarSlot via collect_vars_for_function()
+        // -- the prologue's own register-spill, emit_mov_rbp_off_reg(),
+        // is completely untouched, still spilling the full incoming
+        // register). A `char` RETURN type is the one genuinely new piece
+        // of codegen: emit_movsx_rax_al(), new, narrows RAX in place
+        // right before the epilogue -- see that method's own doc
+        // comment for why a return value (which lives in a register, not
+        // a stack slot) needs this and a local/parameter doesn't.
+        // -------------------------------------------------------------
+        // CASE 80 (in-process): a basic `char` parameter, read and used
+        // in arithmetic.
+        //   int use_char_param(char c) { return c + 1; }
+        //   int main() { return use_char_param(65); }
+        // Hand-computed: 65 + 1 = 66.
+        const SRC80: &[u8] = b"int use_char_param(char c) { return c + 1; } int main() { return use_char_param(65); }";
+        let case80_result = compile_and_run_program_callable(SRC80.as_ptr() as u64, SRC80.len() as u64);
+        w(b"  case80 (char parameter, basic read + arithmetic, in-process) returned=");
+        if let Some(r) = case80_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 66)\n");
+        let case80_ok = case80_result == Some(66);
+        write_check(b"case80_char_parameter_basic_returns_66=", case80_ok);
+
+        w(b"\n");
+
+        // CASE 81: an out-of-range ARGUMENT truncates to a real 8-bit
+        // value on the callee's own first read of its `char` parameter
+        // -- the exact same free truncation CASE 77 already proved for
+        // a local, now proven across the real calling-convention
+        // boundary (the caller passes the full, untruncated 321 in a
+        // register; the callee's own prologue spills that full value
+        // unchanged; only the parameter's own narrowed READ inside the
+        // callee's body truncates it).
+        //   int trunc_param(char c) { return c; }
+        //   int main() { return trunc_param(321); }
+        // Hand-computed: 321 & 0xFF = 65.
+        const SRC81: &[u8] = b"int trunc_param(char c) { return c; } int main() { return trunc_param(321); }";
+        let case81_result = compile_and_run_program_callable(SRC81.as_ptr() as u64, SRC81.len() as u64);
+        w(b"  case81 (char parameter truncates an out-of-range argument, in-process) returned=");
+        if let Some(r) = case81_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 65)\n");
+        let case81_ok = case81_result == Some(65);
+        write_check(b"case81_char_parameter_truncates_out_of_range_argument_returns_65=", case81_ok);
+
+        w(b"\n");
+
+        // CASE 82: a real `char` RETURN type actually narrows the
+        // returned value -- the one genuinely new codegen this
+        // milestone adds (emit_movsx_rax_al()). Without it this case
+        // would return the untruncated `300`; with it, `300 & 0xFF`.
+        //   char get_truncated() { return 300; }
+        //   int main() { return get_truncated(); }
+        // Hand-computed: 300 & 0xFF = 44.
+        const SRC82: &[u8] = b"char get_truncated() { return 300; } int main() { return get_truncated(); }";
+        let case82_result = compile_and_run_program_callable(SRC82.as_ptr() as u64, SRC82.len() as u64);
+        w(b"  case82 (char return type truncates an out-of-range value, in-process) returned=");
+        if let Some(r) = case82_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 44)\n");
+        let case82_ok = case82_result == Some(44);
+        write_check(b"case82_char_return_type_truncates_returns_44=", case82_ok);
+
+        w(b"\n");
+
+        // CASE 83: `char` parameter and `char` return type CHAINED --
+        // a real multi-function integration proof, not just two
+        // isolated single-function cases.
+        //   char add_one(char c) { return c + 1; }
+        //   int main() { char x = 40; char y = add_one(x);
+        //                return y + 2; }
+        // Hand-computed: x=40, add_one(40)=41, y=41, y+2=43.
+        const SRC83: &[u8] = b"char add_one(char c) { return c + 1; } int main() { char x = 40; char y = add_one(x); return y + 2; }";
+        let case83_result = compile_and_run_program_callable(SRC83.as_ptr() as u64, SRC83.len() as u64);
+        w(b"  case83 (char parameter + char return chained, in-process) returned=");
+        if let Some(r) = case83_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 43)\n");
+        let case83_ok = case83_result == Some(43);
+        write_check(b"case83_char_param_and_return_chained_returns_43=", case83_ok);
+
+        w(b"\n");
+
+        // CASE 84: real SIGNED sign-extension across the parameter
+        // boundary specifically -- the direct parameter-side analogue
+        // of CASE 78 (which proved this for a local). Proven via a
+        // comparison, same convention as CASE 78, since this suite's
+        // own `int main()` return-code convention stays non-negative.
+        //   int check_param_sign(char c) { return c == -56; }
+        //   int main() { return check_param_sign(200); }
+        // Hand-computed: 200 passed in full; the callee's own read of
+        // its `char` parameter sign-extends 200's low byte to -56.
+        const SRC84: &[u8] = b"int check_param_sign(char c) { return c == -56; } int main() { return check_param_sign(200); }";
+        let case84_result = compile_and_run_program_callable(SRC84.as_ptr() as u64, SRC84.len() as u64);
+        w(b"  case84 (char parameter is signed -- 200 sign-extends to -56, in-process) returned=");
+        if let Some(r) = case84_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case84_ok = case84_result == Some(1);
+        write_check(b"case84_char_parameter_is_signed_returns_1=", case84_ok);
+
+        w(b"\n");
+
+        let overall_m103 = case80_ok && case81_ok && case82_ok && case83_ok && case84_ok;
+        w(b"OVERALL_M103=");
+        w(if overall_m103 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 { 0 } else { 1 });
     }
 }
 

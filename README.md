@@ -6384,6 +6384,47 @@ self-test suite, genuinely open for a future pass.
       self-test still leaks per-compile (bounded, not fixed); one 4 KiB
       stack page per process.
 
+- [x] **Milestone 92**: `goto LABEL ;` and `LABEL :` in the
+      self-hosted subset-C compiler -- completing this subset's C
+      control flow.
+
+      A label is an ordinary identifier followed by `:` in statement
+      position; one token of lookahead disambiguates it from an
+      assignment. Codegen keeps a per-function label table (name -> buf
+      offset) and a pending-goto list (name -> jump placeholder), both
+      in module `static mut` arenas reset per function (same pattern as
+      Milestone 87's `LOOP_BRK`). A `goto` to an already-seen label is a
+      real backward `jmp`; to a not-yet-seen label it is a placeholder
+      resolved when that label is emitted (forward-patched to land
+      exactly there) or, if the label is never defined in the function,
+      reported as `CodeGenError::UndefinedLabel`. **Zero new CodeBuf
+      encodings** -- reuses `emit_jmp_back`/`emit_jmp_placeholder`/
+      `patch_rel32`. Disclosed: no variable/label same-name diagnostic
+      (harmless -- separate tables); a bare `L:` right before `}` is
+      accepted.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`), one new
+      benign "field never read" warning on `UndefinedLabel`'s payload,
+      the same status `ArgCountMismatch` already carries. Two QEMU
+      boots, fresh then reused. CASE 58 (in-process -- a backward goto
+      forming a loop and a forward goto skipping a statement) returns
+      `10`; CASE 59 exercises the `UndefinedLabel` error path; CASE 60
+      (real on-disk-ELF + kernel `exec()`+`wait()` -- `goto` as an
+      early-exit clear out of a `for` loop, skipping the post-loop
+      statement) returns `7`. All three, both boots.
+      `OVERALL_M92=PASS`, `OVERALL_M68`..`M91` all still PASS,
+      `milestone 64`/`65`/`stdiotest` all still PASS, fresh vs. reused
+      OVERALL markers byte-identical. No regressions.
+
+      **The subset's C control flow is now complete**: `if`/`else`,
+      `while`, `for`, `break`/`continue`, `switch`, `goto`/labels,
+      function calls, direct and mutual recursion.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); no
+      arrays/pointers; only the `int` type; the compiler self-test
+      still leaks per-compile (bounded, not fixed); one 4 KiB stack
+      page per process.
+
 ## Building and running
 
 Requires:

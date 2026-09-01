@@ -788,6 +788,37 @@
 // compiler self-test still leaks per-compile (bounded, not fixed); one
 // 4 KiB stack page per process.
 //
+// MILESTONE 92 adds `goto LABEL ;` and `LABEL :` -- completing this
+// subset's C control flow. A label is an ordinary IDENT followed by
+// `:` in statement position (one token of lookahead disambiguates it
+// from an assignment; `L:` is a standalone STMT_LABEL, whatever follows
+// is the next list node). Codegen keeps a per-function label table
+// (name -> buf offset) and a pending-goto list (name -> jmp
+// placeholder), both in module `static mut` arenas reset per function
+// (`goto_reset()`, same pattern as Milestone 87). A `goto` to an
+// already-seen label is a real backward `jmp`; to a not-yet-seen label
+// it is a placeholder resolved either when that label is emitted
+// (forward-patched to land exactly there) or, if the label is never
+// defined anywhere in the function, reported as
+// `CodeGenError::UndefinedLabel`. ZERO new CodeBuf encodings -- reuses
+// `emit_jmp_back`/`emit_jmp_placeholder`/`patch_rel32`. Disclosed:
+// labels share the ordinary identifier namespace (a variable and a
+// label with the same name is not diagnosed, though it is harmless --
+// they live in different tables); a bare `L:` immediately before `}` is
+// accepted (C requires a following statement pre-C23). Three new
+// self-test cases: CASE 58 (in-process -- a backward goto forming a
+// loop and a forward goto skipping a statement -> 10), CASE 59 (the
+// UndefinedLabel error path), CASE 60 (real on-disk-ELF -- goto as an
+// early-exit clear out of a `for` loop, skipping the post-loop
+// statement -> 7).
+//
+// Still genuinely open after Milestone 92: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); no arrays/pointers, no additional C types (only `int`);
+// the compiler self-test still leaks per-compile (bounded, not fixed);
+// one 4 KiB stack page per process. This subset's C control flow is
+// now COMPLETE (if/else, while, for, break/continue, switch,
+// goto/labels, function calls, recursion).
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -987,6 +1018,12 @@ const TOK_COLON: u8 = 49;    // ":"
 const TOK_SWITCH: u8 = 50;  // keyword "switch"
 const TOK_CASE: u8 = 51;    // keyword "case"
 const TOK_DEFAULT: u8 = 52; // keyword "default"
+// MILESTONE 92: `goto LABEL ;` and `LABEL :` -- completes this subset's
+// C control flow. A label is an ordinary IDENT followed by `:` in
+// statement position (disambiguated from an assignment by one token of
+// lookahead). Forward and backward gotos both work; an undefined label
+// is a real CodeGenError::UndefinedLabel.
+const TOK_GOTO: u8 = 53; // keyword "goto"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1087,6 +1124,8 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
                 TOK_CASE // MILESTONE 91
             } else if unsafe { word_is(src_ptr, start, wlen, b"default") } {
                 TOK_DEFAULT // MILESTONE 91
+            } else if unsafe { word_is(src_ptr, start, wlen, b"goto") } {
+                TOK_GOTO // MILESTONE 92
             } else {
                 TOK_IDENT
             };
@@ -1368,6 +1407,8 @@ const STMT_BREAK: u8 = 6; // MILESTONE 87
 const STMT_CONTINUE: u8 = 7; // MILESTONE 87
 const STMT_SWITCH: u8 = 8; // MILESTONE 91: expr = discriminant, then_body = chain of STMT_CASE, else_body = the `default` body list (0 if none)
 const STMT_CASE: u8 = 9; // MILESTONE 91: one `case INTLIT:` -- expr = an EXPR_INTLIT for the label value, then_body = this case's own stmt list, next = the following STMT_CASE
+const STMT_LABEL: u8 = 10; // MILESTONE 92: `LABEL :` -- ident_off/ident_len name the label; no body (the following statement is a separate list node)
+const STMT_GOTO: u8 = 11; // MILESTONE 92: `goto LABEL ;` -- ident_off/ident_len name the target
 
 #[repr(C)]
 struct StmtNode {
@@ -2225,7 +2266,42 @@ impl Parser {
             }
             TOK_IDENT => {
                 let name = unsafe { self.advance() };
+                // MILESTONE 92: `IDENT :` in statement position is a
+                // label, not an assignment -- one token of lookahead
+                // disambiguates. `L:` is a standalone STMT_LABEL node;
+                // whatever follows is the next list element.
+                if unsafe { self.peek() }.kind == TOK_COLON {
+                    unsafe { self.advance() }; // consume ':'
+                    let node = unsafe { alloc_stmt() };
+                    if node == 0 {
+                        return Err(ParseError::OutOfMemory);
+                    }
+                    unsafe {
+                        core::ptr::write(
+                            node as *mut StmtNode,
+                            StmtNode { kind: STMT_LABEL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+                        )
+                    };
+                    return Ok(node);
+                }
                 unsafe { self.finish_ident_assign(name, true) }
+            }
+            // MILESTONE 92: `goto LABEL ;`.
+            TOK_GOTO => {
+                unsafe { self.advance() };
+                let target = unsafe { self.expect(TOK_IDENT) }?;
+                unsafe { self.expect(TOK_SEMI) }?;
+                let node = unsafe { alloc_stmt() };
+                if node == 0 {
+                    return Err(ParseError::OutOfMemory);
+                }
+                unsafe {
+                    core::ptr::write(
+                        node as *mut StmtNode,
+                        StmtNode { kind: STMT_GOTO, ident_off: target.ident_off, ident_len: target.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+                    )
+                };
+                Ok(node)
             }
             // MILESTONE 86: `for (init; cond; step) { body }` -- desugared
             // to `init; while (cond) { body step; }`. Reuses Milestone
@@ -2774,6 +2850,12 @@ enum CodeGenError {
     /// Real but NOT exercised (every test loop below stays well under
     /// the cap).
     TooManyLoopJumps,
+    /// MILESTONE 92: a `goto` whose target label is never defined
+    /// anywhere in the same function. Carries the label name's source
+    /// byte offset, the same "real Err path, carries a source offset"
+    /// shape UndeclaredVariable/UndeclaredFunction already use --
+    /// exercised for real by CASE 59.
+    UndefinedLabel(u64),
 }
 
 /// MILESTONE 87: fixed cap on live `break`/`continue` jump sites across
@@ -2834,6 +2916,119 @@ unsafe fn loop_push_cont(field: u64) -> Result<(), CodeGenError> {
     }
     unsafe { core::ptr::write((core::ptr::addr_of_mut!(LOOP_CONT) as u64 + n * 8) as *mut u64, field) };
     unsafe { loop_set_cont_n(n + 1) };
+    Ok(())
+}
+
+/// MILESTONE 92: `goto`/label bookkeeping, per function, in module
+/// `static mut` arenas (same reasoning as Milestone 87's LOOP_BRK --
+/// cc.elf's heap is small and codegen is single-pass, non-reentrant).
+/// `LBL_*` records every label seen so far (name -> the buf offset it
+/// sits at). `PEND_*` records every `goto` whose target label has not
+/// been seen yet (name -> the jmp-placeholder field to patch once it
+/// is). `goto_reset()` clears both before each function; an entry left
+/// in `PEND_*` after the function body is an undefined label.
+const MAX_GOTO: usize = 32;
+static mut GOTO_LBL_OFF: [u32; MAX_GOTO] = [0; MAX_GOTO];
+static mut GOTO_LBL_LEN: [u8; MAX_GOTO] = [0; MAX_GOTO];
+static mut GOTO_LBL_POS: [u64; MAX_GOTO] = [0; MAX_GOTO];
+static mut GOTO_LBL_N: u64 = 0;
+static mut GOTO_PEND_OFF: [u32; MAX_GOTO] = [0; MAX_GOTO];
+static mut GOTO_PEND_LEN: [u8; MAX_GOTO] = [0; MAX_GOTO];
+static mut GOTO_PEND_FIELD: [u64; MAX_GOTO] = [0; MAX_GOTO];
+static mut GOTO_PEND_N: u64 = 0;
+
+unsafe fn goto_reset() {
+    unsafe {
+        core::ptr::write(core::ptr::addr_of_mut!(GOTO_LBL_N), 0);
+        core::ptr::write(core::ptr::addr_of_mut!(GOTO_PEND_N), 0);
+    }
+}
+unsafe fn goto_lbl_n() -> u64 { unsafe { core::ptr::read(core::ptr::addr_of!(GOTO_LBL_N)) } }
+unsafe fn goto_pend_n() -> u64 { unsafe { core::ptr::read(core::ptr::addr_of!(GOTO_PEND_N)) } }
+
+/// Compare two label-name spans, both `(offset, len)` into the same
+/// source buffer.
+unsafe fn label_eq(src_ptr: u64, a_off: u32, a_len: u8, b_off: u32, b_len: u8) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    let mut i: u64 = 0;
+    while i < a_len as u64 {
+        let ca = unsafe { core::ptr::read((src_ptr + a_off as u64 + i) as *const u8) };
+        let cb = unsafe { core::ptr::read((src_ptr + b_off as u64 + i) as *const u8) };
+        if ca != cb {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// A `STMT_LABEL` reached at buffer offset `pos`: record it, then
+/// resolve (and drop) every pending `goto` that names it -- a forward
+/// jump patched to land exactly here.
+unsafe fn goto_define_label(buf: &mut CodeBuf, src_ptr: u64, off: u32, len: u8, pos: u64) -> Result<(), CodeGenError> {
+    let n = unsafe { goto_lbl_n() };
+    if n >= MAX_GOTO as u64 {
+        return Err(CodeGenError::TooManyLoopJumps);
+    }
+    unsafe {
+        core::ptr::write((core::ptr::addr_of_mut!(GOTO_LBL_OFF) as u64 + n * 4) as *mut u32, off);
+        core::ptr::write((core::ptr::addr_of_mut!(GOTO_LBL_LEN) as u64 + n) as *mut u8, len);
+        core::ptr::write((core::ptr::addr_of_mut!(GOTO_LBL_POS) as u64 + n * 8) as *mut u64, pos);
+        core::ptr::write(core::ptr::addr_of_mut!(GOTO_LBL_N), n + 1);
+    }
+    // resolve pending forward gotos for this name, compacting the list.
+    let mut i: u64 = 0;
+    let mut keep: u64 = 0;
+    let pn = unsafe { goto_pend_n() };
+    while i < pn {
+        let poff = unsafe { core::ptr::read((core::ptr::addr_of!(GOTO_PEND_OFF) as u64 + i * 4) as *const u32) };
+        let plen = unsafe { core::ptr::read((core::ptr::addr_of!(GOTO_PEND_LEN) as u64 + i) as *const u8) };
+        let pfield = unsafe { core::ptr::read((core::ptr::addr_of!(GOTO_PEND_FIELD) as u64 + i * 8) as *const u64) };
+        if unsafe { label_eq(src_ptr, poff, plen, off, len) } {
+            unsafe { buf.patch_rel32(pfield) }; // patches to current buf.len == pos
+        } else {
+            unsafe {
+                core::ptr::write((core::ptr::addr_of_mut!(GOTO_PEND_OFF) as u64 + keep * 4) as *mut u32, poff);
+                core::ptr::write((core::ptr::addr_of_mut!(GOTO_PEND_LEN) as u64 + keep) as *mut u8, plen);
+                core::ptr::write((core::ptr::addr_of_mut!(GOTO_PEND_FIELD) as u64 + keep * 8) as *mut u64, pfield);
+            }
+            keep += 1;
+        }
+        i += 1;
+    }
+    unsafe { core::ptr::write(core::ptr::addr_of_mut!(GOTO_PEND_N), keep) };
+    Ok(())
+}
+
+/// A `STMT_GOTO`: if the target label is already defined, a real
+/// backward `jmp`; otherwise a placeholder recorded in `PEND_*` for
+/// `goto_define_label` (or the end-of-function check) to resolve.
+unsafe fn goto_emit(buf: &mut CodeBuf, src_ptr: u64, off: u32, len: u8) -> Result<(), CodeGenError> {
+    let ln = unsafe { goto_lbl_n() };
+    let mut i: u64 = 0;
+    while i < ln {
+        let loff = unsafe { core::ptr::read((core::ptr::addr_of!(GOTO_LBL_OFF) as u64 + i * 4) as *const u32) };
+        let llen = unsafe { core::ptr::read((core::ptr::addr_of!(GOTO_LBL_LEN) as u64 + i) as *const u8) };
+        if unsafe { label_eq(src_ptr, off, len, loff, llen) } {
+            let target = unsafe { core::ptr::read((core::ptr::addr_of!(GOTO_LBL_POS) as u64 + i * 8) as *const u64) };
+            unsafe { buf.emit_jmp_back(target) };
+            return Ok(());
+        }
+        i += 1;
+    }
+    let pn = unsafe { goto_pend_n() };
+    if pn >= MAX_GOTO as u64 {
+        return Err(CodeGenError::TooManyLoopJumps);
+    }
+    let field = unsafe { buf.emit_jmp_placeholder() };
+    unsafe {
+        core::ptr::write((core::ptr::addr_of_mut!(GOTO_PEND_OFF) as u64 + pn * 4) as *mut u32, off);
+        core::ptr::write((core::ptr::addr_of_mut!(GOTO_PEND_LEN) as u64 + pn) as *mut u8, len);
+        core::ptr::write((core::ptr::addr_of_mut!(GOTO_PEND_FIELD) as u64 + pn * 8) as *mut u64, field);
+        core::ptr::write(core::ptr::addr_of_mut!(GOTO_PEND_N), pn + 1);
+    }
     Ok(())
 }
 
@@ -3993,6 +4188,17 @@ unsafe fn gen_stmt_list(
                 let field = unsafe { buf.emit_jmp_placeholder() };
                 unsafe { loop_push_brk(field) }?;
             }
+            // MILESTONE 92: a label just marks the current buf position
+            // and resolves any pending forward `goto`s to it.
+            STMT_LABEL => {
+                let pos = buf.len;
+                unsafe { goto_define_label(buf, src_ptr, s.ident_off, s.ident_len, pos) }?;
+            }
+            // MILESTONE 92: `goto` -- a backward jmp if the label is
+            // already defined, otherwise a placeholder for later.
+            STMT_GOTO => {
+                unsafe { goto_emit(buf, src_ptr, s.ident_off, s.ident_len) }?;
+            }
             // MILESTONE 87: `continue` -- for a plain `while` this is a
             // BACKWARD jump straight to the condition re-check (target
             // already known). For a `for` loop the next iteration must
@@ -4210,7 +4416,12 @@ unsafe fn gen_function(src_ptr: u64, func: u64, mode: CodegenMode) -> Result<Cod
     // empty function table can never reach the EXPR_CALL arm that would
     // dereference them.
     unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
+    unsafe { goto_reset() };  // MILESTONE 92: fresh label/goto arena per function
     unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, 0, 0, 0, 0, mode, f.body, NOT_IN_LOOP, 0, 0) }?;
+    if unsafe { goto_pend_n() } > 0 {
+        let off = unsafe { core::ptr::read(core::ptr::addr_of!(GOTO_PEND_OFF) as *const u32) };
+        return Err(CodeGenError::UndefinedLabel(off as u64));
+    }
 
     // Safety backstop -- see this function's own doc comment above.
     unsafe { emit_epilogue(&mut buf, mode) };
@@ -4414,7 +4625,12 @@ unsafe fn gen_program(src_ptr: u64, prog_head: u64, mode: CodegenMode) -> Result
         }
 
         unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
+        unsafe { goto_reset() };  // MILESTONE 92: fresh label/goto arena per function
         unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs_total, pending_ptr, pending_count_ptr, this_fn_mode, f.body, NOT_IN_LOOP, 0, 0) }?;
+        if unsafe { goto_pend_n() } > 0 {
+            let off = unsafe { core::ptr::read(core::ptr::addr_of!(GOTO_PEND_OFF) as *const u32) };
+            return Err(CodeGenError::UndefinedLabel(off as u64));
+        }
 
         // Safety backstop -- same real reasoning as gen_function()'s own
         // trailing epilogue above, per-function here.
@@ -7018,7 +7234,110 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m91 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 92: `goto` and labels.
+        //
+        // CASE 58 (in-process Callable path): a BACKWARD goto forming a
+        // loop, and a FORWARD goto skipping a statement.
+        //   int main() {
+        //       int i = 0;
+        //       int s = 0;
+        //   loop:
+        //       s += i;
+        //       i += 1;
+        //       if (i < 5) { goto loop; }
+        //       goto done;
+        //       s = 999;          // unreachable -- skipped by `goto done`
+        //   done:
+        //       return s;
+        //   }
+        // Hand-computed: s = 0+1+2+3+4 = 10; the `goto done` skips
+        // `s = 999`. return 10.
+        // -------------------------------------------------------------
+        const SRC58: &[u8] = b"int main() { int i = 0; int s = 0; loop: s += i; i += 1; if (i < 5) { goto loop; } goto done; s = 999; done: return s; }";
+        let case58_result = compile_and_run_program_callable(SRC58.as_ptr() as u64, SRC58.len() as u64);
+        w(b"  case58 (backward + forward goto, in-process) returned=");
+        if let Some(r) = case58_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 10)\n");
+        let case58_ok = case58_result == Some(10);
+        write_check(b"case58_goto_backward_and_forward_returns_10=", case58_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 59: a deliberate SEMANTIC error -- `goto` to a label that
+        // is never defined must be Err(CodeGenError::UndefinedLabel),
+        // the same "prove the new Err path is real" discipline CASE 7
+        // (UndeclaredVariable) and CASE 49 (BreakOutsideLoop) established.
+        //   int main() { goto nowhere; return 1; }
+        // -------------------------------------------------------------
+        const SRC59: &[u8] = b"int main() { goto nowhere; return 1; }";
+        let src59_ptr = SRC59.as_ptr() as u64;
+        let src59_len = SRC59.len() as u64;
+        let case59_ok = match lex_and_parse(src59_ptr, src59_len) {
+            Ok(func59) => match gen_function(src59_ptr, func59, CodegenMode::Callable) {
+                Err(CodeGenError::UndefinedLabel(_)) => {
+                    w(b"  case59 real codegen error -- goto to an undefined label\n");
+                    true
+                }
+                _ => {
+                    w(b"  case59 expected Err(UndefinedLabel), got something else\n");
+                    false
+                }
+            },
+            Err(_) => {
+                w(b"  case59 lex_and_parse() returned Err unexpectedly (source should lex+parse fine)\n");
+                false
+            }
+        };
+        write_check(b"case59_goto_undefined_label_is_UndefinedLabel=", case59_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 60 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier): `goto` as an early-exit that
+        // jumps clear OUT of a `for` loop (something `break` alone
+        // cannot do -- it also skips the post-loop statement).
+        //   int main() {
+        //       int r = 0;
+        //       int i = 0;
+        //       for (i = 0; i < 10; i += 1) {
+        //           if (i == 7) { goto found; }
+        //           r += 1;
+        //       }
+        //       r = 100;         // skipped once the goto fires
+        //   found:
+        //       return r;
+        //   }
+        // Hand-computed: i=0..6 -> r += 1 (=7); i == 7 -> goto found,
+        // skipping `r = 100`. return 7. If the goto did nothing the
+        // loop would finish and r would be 100.
+        // -------------------------------------------------------------
+        const SRC60: &[u8] =
+            b"int main() { int r = 0; int i = 0; for (i = 0; i < 10; i += 1) { if (i == 7) { goto found; } r += 1; } r = 100; found: return r; }";
+        const PATH60: &[u8] = PATH8;
+        let (elf60_ptr, elf60_len) = compile_program_standalone_elf(SRC60.as_ptr() as u64, SRC60.len() as u64);
+        let case60_ok = if elf60_ptr == 0 {
+            w(b"  case60 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH60, elf60_ptr, elf60_len, 7)
+        };
+        write_check(b"case60_real_elf_exec_goto_out_of_for_returns_7=", case60_ok);
+
+        w(b"\n");
+
+        let overall_m92 = case58_ok && case59_ok && case60_ok;
+        w(b"OVERALL_M92=");
+        w(if overall_m92 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 { 0 } else { 1 });
     }
 }
 

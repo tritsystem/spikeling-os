@@ -1952,6 +1952,36 @@ extern "C" fn syscall_dispatch(regs: *mut SyscallRegs) {
                 },
             }
         }
+        25 => {
+            // MILESTONE 87: sbrk_reset() -- rewind the calling process's
+            // heap break all the way to HEAP_START in one call (logically
+            // free the whole heap; already-mapped frames stay mapped and
+            // get reused). No arguments. Returns the new break in rax, or
+            // u64::MAX with no active process. Used by the tools/cc_src
+            // compiler self-test between compilations -- see
+            // process::sbrk_reset()'s own doc comment.
+            if active == 0 {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 87: syscall SBRK_RESET called with no active process -- ignoring, returning u64::MAX"
+                );
+                regs.rax = u64::MAX;
+            } else {
+                match crate::process::sbrk_reset(active) {
+                    Some(brk) => {
+                        let _ = writeln!(
+                            serial(),
+                            "milestone 87: syscall SBRK_RESET (process {active}) -- hardware-recorded CS={:#x} (CPL={hardware_cpl}) -- heap break rewound to {:#x}",
+                            regs.cs, brk
+                        );
+                        regs.rax = brk;
+                    }
+                    None => {
+                        regs.rax = u64::MAX;
+                    }
+                }
+            }
+        }
         other => {
             let _ = writeln!(
                 serial(),

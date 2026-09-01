@@ -6185,6 +6185,73 @@ self-test suite, genuinely open for a future pass.
       combined decl-init; no arrays/pointers, no additional C types; one
       4 KiB stack page per process.
 
+- [x] **Milestone 87**: `break` and `continue` in the self-hosted
+      subset-C compiler -- open since Milestone 71's own disclosure.
+      Grammar: two trivial leaf statements (`break ;`, `continue ;`);
+      all the real work is codegen-side.
+
+      `gen_stmt_list()` gains two value parameters -- `loop_top` (the
+      innermost enclosing loop's condition-re-check offset, or a
+      `NOT_IN_LOOP` sentinel) and `loop_is_for` -- threaded **unchanged**
+      through `STMT_IF`'s branch recursion (a `break` inside an `if`
+      inside a `while` binds to that `while`) and replaced by
+      `STMT_WHILE` for its own body, so nesting is a natural stack and
+      break/continue always bind innermost.
+      - **`break`** is an unconditional forward `jmp` recorded as a
+        placeholder; `STMT_WHILE` resolves every entry from this loop's
+        base index to the loop exit, then truncates the list -- the same
+        emit-placeholder-then-`patch_rel32()` machinery if/else and
+        `&&`/`||` already use.
+      - **`continue`** for a plain `while` is a backward `jmp` straight
+        to the condition (`emit_jmp_back`, target known). For a `for` it
+        must run the `step` clause first (real C semantics), so it is a
+        forward `jmp` into a second list, resolved to the point right
+        before the step. This is why Milestone 86's `for` desugar now
+        carries the step in the `STMT_WHILE`'s `else_body` slot rather
+        than appending it to the body.
+      - **`break`/`continue` outside any loop** are real semantic errors
+        (`CodeGenError::BreakOutsideLoop`/`ContinueOutsideLoop`).
+
+      The break/continue placeholder lists are module `static mut`
+      arenas with a save/restore-of-count discipline per loop -- **not**
+      per-loop stack arrays behind a pointer that escapes the recursive
+      `gen_stmt_list`; a first cut did that and the optimizer read stale
+      values, producing a wild `jmp` that null-faulted cc.elf mid-boot.
+
+      **Real limit hit, and a new syscall.** With Milestone 87's cases
+      the `tools/cc_src` self-test now compiles ~50 subset-C programs per
+      boot and (per its own Milestone 67 scope) never frees the
+      tokens/AST/CodeBuf each compile allocates. Its cumulative heap use
+      crossed Milestone 57's 64-page (256 KiB) per-process reservation
+      right at CASE 47 -- `sbrk` failed, `lex()` wrote through a null
+      buffer, cc.elf null-faulted (caught by a boot). Fix: a real new
+      syscall, **25 = `sbrk_reset`** -- rewind the calling process's heap
+      break to `HEAP_START` in one call (already-mapped frames stay
+      mapped and get reused; only the accounting resets). cc.elf's libc
+      wraps it as `heap_reset()` (also clears its own free list), and the
+      three compile helpers call it on entry, bounding heap use to the
+      single largest compilation. A process that needs its heap simply
+      never calls it. Raising `HEAP_PAGE_COUNT` instead was tried and
+      rejected -- per-process heap-tracking state scales with it and the
+      bump exhausted the kernel's own 100 KiB heap during `fork()`.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`), no warnings.
+      Two QEMU boots, fresh then reused. CASE 47 (in-process --
+      `break`+`continue` in a `while`, each from inside a nested `if`)
+      returns `52`; CASE 48 (real on-disk-ELF + kernel `exec()`+`wait()`
+      -- both in a `for`, built so a `continue` that skipped the step
+      would *hang* rather than exit `8`) returns `8`; CASE 49 exercises
+      the `BreakOutsideLoop` error path. All three, both boots.
+      `OVERALL_M87=PASS`, `OVERALL_M68`..`M86` all still PASS,
+      `milestone 64`/`65`/`stdiotest` all still PASS, fresh vs. reused
+      OVERALL markers byte-identical. No regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); no
+      combined `int i = 0` decl-init; no arrays/pointers, no additional
+      C types; no `switch`/`goto`; the compiler self-test still leaks
+      per-compile (bounded now by `heap_reset()`, not fixed); one 4 KiB
+      stack page per process.
+
 ## Building and running
 
 Requires:

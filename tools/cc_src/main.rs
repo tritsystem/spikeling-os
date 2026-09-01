@@ -641,6 +641,54 @@
 // combined decl-init; no arrays/pointers, no additional C types; one
 // 4 KiB stack page per process.
 //
+// MILESTONE 87 adds `break` and `continue`, open since Milestone 71's
+// own disclosure ("the only way out of a while-loop is its own
+// condition going false, or an early return"). Grammar: two new leaf
+// statements, `break ;` and `continue ;` -- all the real work is
+// codegen-side. `gen_stmt_list()` gains two value parameters: `loop_top`
+// (the innermost enclosing loop's condition-re-check offset, or
+// `NOT_IN_LOOP` outside any loop) and `loop_is_for` (1 if that loop is a
+// `for`). Both are threaded UNCHANGED through `STMT_IF`'s branch
+// recursion (a `break` inside an `if` inside a `while` binds to that
+// `while`) and replaced by `STMT_WHILE` for its own body (so nesting is
+// a natural stack -- break/continue always bind innermost). The
+// break/continue jump-placeholder lists themselves are module `static
+// mut` arenas (`LOOP_BRK`/`LOOP_CONT`) with a save/restore-of-count
+// discipline per loop -- NOT per-loop stack arrays behind an escaped
+// pointer, which the optimizer read stale through the recursion,
+// producing a wild `jmp` that null-faulted cc.elf (a real bug caught by
+// a boot during this milestone).
+//   - `break` is an unconditional forward `jmp` recorded as a
+//     placeholder in the arena; `STMT_WHILE` resolves every entry from
+//     this loop's base index to the loop exit once that address is
+//     known, then truncates the arena back -- the
+//     exact same emit-placeholder-then-`patch_rel32()` machinery
+//     if/else/`&&`/`||` already use.
+//   - `continue` for a plain `while` is a backward `jmp` straight to
+//     the condition re-check (`emit_jmp_back(loop_top)`, target already
+//     known). For a `for` loop the next iteration must run the `step`
+//     clause first (real C semantics), so `continue` is instead a
+//     forward `jmp` into a second per-loop patch list, resolved to the
+//     point right before the step's own codegen. This is why Milestone
+//     86's `for` desugar now carries the step in the `STMT_WHILE`'s
+//     `else_body` slot (unused for a plain `while`) rather than
+//     appending it to the body -- behaviourally identical without
+//     break/continue, but keeping the step distinct is what lets
+//     `continue` target it.
+//   - `break`/`continue` outside any loop are real semantic errors
+//     (`CodeGenError::BreakOutsideLoop`/`ContinueOutsideLoop`),
+//     exercised by CASE 49.
+// Three new self-test cases: CASE 47 (in-process -- both, in a `while`,
+// each from inside a nested `if` -> 52), CASE 48 (real on-disk-ELF +
+// kernel exec()+wait() -- both in a `for`, built so `continue` skipping
+// the step would HANG the program instead of exiting 8), CASE 49 (the
+// BreakOutsideLoop error path).
+//
+// Still genuinely open after Milestone 87: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); no combined `int i = 0` decl-init; no arrays/pointers, no
+// additional C types; no `switch`/`goto`; one 4 KiB stack page per
+// process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -809,6 +857,15 @@ const TOK_SHREQ: u8 = 42;   // ">>="
 // (`int i = 0` combined decl-init is not in this subset's grammar
 // anywhere -- a real, disclosed scope cut, not new here).
 const TOK_FOR: u8 = 43; // keyword "for"
+// MILESTONE 87: `break` and `continue`, open since Milestone 71's own
+// disclosure ("the only way out of a while-loop is its own condition
+// going false, or an early return"). `break` jumps forward past the
+// loop; `continue` jumps to the next iteration -- to the loop-top
+// condition for a plain `while`, and to the `step` clause for a `for`
+// (real C semantics, which is why Milestone 86's `for` desugar now
+// carries the step in `else_body` instead of appending it to the body).
+const TOK_BREAK: u8 = 44;    // keyword "break"
+const TOK_CONTINUE: u8 = 45; // keyword "continue"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -897,6 +954,12 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             } else if unsafe { word_is(src_ptr, start, wlen, b"for") } {
                 // MILESTONE 86
                 TOK_FOR
+            } else if unsafe { word_is(src_ptr, start, wlen, b"break") } {
+                // MILESTONE 87
+                TOK_BREAK
+            } else if unsafe { word_is(src_ptr, start, wlen, b"continue") } {
+                // MILESTONE 87
+                TOK_CONTINUE
             } else {
                 TOK_IDENT
             };
@@ -1169,6 +1232,8 @@ const STMT_ASSIGN: u8 = 2;
 const STMT_RETURN: u8 = 3;
 const STMT_IF: u8 = 4; // MILESTONE 70
 const STMT_WHILE: u8 = 5; // MILESTONE 71
+const STMT_BREAK: u8 = 6; // MILESTONE 87
+const STMT_CONTINUE: u8 = 7; // MILESTONE 87
 
 #[repr(C)]
 struct StmtNode {
@@ -2025,19 +2090,15 @@ impl Parser {
                 unsafe { self.expect(TOK_RPAREN) }?;
                 unsafe { self.expect(TOK_LBRACE) }?;
                 let body = unsafe { self.parse_stmt_list_until_rbrace() }?;
-                // while_body = body ++ [step]
-                let while_body: u64 = if step == 0 {
-                    body
-                } else if body == 0 {
-                    step
-                } else {
-                    let mut t = body;
-                    while unsafe { (*(t as *const StmtNode)).next } != 0 {
-                        t = unsafe { (*(t as *const StmtNode)).next };
-                    }
-                    unsafe { (*(t as *mut StmtNode)).next = step };
-                    body
-                };
+                // MILESTONE 87: the `step` clause now rides in the
+                // STMT_WHILE's `else_body` slot (unused for a plain
+                // `while`), NOT appended to `then_body`. Behaviourally
+                // identical for a `for` with no `break`/`continue` -- the
+                // codegen still runs `body` then `step` then re-checks
+                // `cond` -- but keeping `step` distinct is what lets
+                // `continue` jump to it (real C `for`-continue semantics)
+                // instead of skipping it. `step == 0` (a stepless `for`)
+                // leaves `else_body` at 0, i.e. a plain `while`.
                 let while_node = unsafe { alloc_stmt() };
                 if while_node == 0 {
                     return Err(ParseError::OutOfMemory);
@@ -2045,7 +2106,7 @@ impl Parser {
                 unsafe {
                     core::ptr::write(
                         while_node as *mut StmtNode,
-                        StmtNode { kind: STMT_WHILE, ident_off: 0, ident_len: 0, expr: cond, next: 0, then_body: while_body, else_body: 0 },
+                        StmtNode { kind: STMT_WHILE, ident_off: 0, ident_len: 0, expr: cond, next: 0, then_body: body, else_body: step },
                     )
                 };
                 if init == 0 {
@@ -2108,6 +2169,28 @@ impl Parser {
                             then_body: body,
                             else_body: 0,
                         },
+                    )
+                };
+                Ok(node)
+            }
+            // MILESTONE 87: `break ;` and `continue ;` -- two trivial
+            // leaf statements. All the real work is codegen-side (the
+            // loop-context stack in gen_stmt_list); the parser just
+            // records which one it is. A `break`/`continue` outside any
+            // loop parses fine here and is caught at codegen as
+            // CodeGenError::BreakOutsideLoop/ContinueOutsideLoop.
+            TOK_BREAK | TOK_CONTINUE => {
+                let kind = if unsafe { self.peek() }.kind == TOK_BREAK { STMT_BREAK } else { STMT_CONTINUE };
+                unsafe { self.advance() };
+                unsafe { self.expect(TOK_SEMI) }?;
+                let node = unsafe { alloc_stmt() };
+                if node == 0 {
+                    return Err(ParseError::OutOfMemory);
+                }
+                unsafe {
+                    core::ptr::write(
+                        node as *mut StmtNode,
+                        StmtNode { kind, ident_off: 0, ident_len: 0, expr: 0, next: 0, then_body: 0, else_body: 0 },
                     )
                 };
                 Ok(node)
@@ -2367,6 +2450,86 @@ enum CodeGenError {
     /// than silently left untested, the same status ArgCountMismatch
     /// above already carries.
     TooManyForwardCalls,
+    /// MILESTONE 87: a `break` statement outside any loop body. Real
+    /// semantic-error path, the same "prove the Err path is real" shape
+    /// UndeclaredVariable/UndeclaredFunction already carry -- exercised
+    /// for real by CASE 49 in the self-test below.
+    BreakOutsideLoop,
+    /// MILESTONE 87: a `continue` statement outside any loop body. Same
+    /// shape as BreakOutsideLoop; real but NOT separately exercised
+    /// (CASE 49 covers the `break` variant -- the enclosing-loop check
+    /// is the identical code path), disclosed honestly rather than left
+    /// silently untested, the same status ArgCountMismatch already
+    /// carries.
+    ContinueOutsideLoop,
+    /// MILESTONE 87: more `break`/`continue` jumps in one loop body than
+    /// the fixed-size per-loop patch list (MAX_LOOP_JUMPS) can hold --
+    /// the same real, disclosed, deliberately-small-cap shape
+    /// TooManyForwardCalls already established for its own patch list.
+    /// Real but NOT exercised (every test loop below stays well under
+    /// the cap).
+    TooManyLoopJumps,
+}
+
+/// MILESTONE 87: fixed cap on live `break`/`continue` jump sites across
+/// all currently-nested loops, same "small real headroom" discipline
+/// MAX_FUNCS/MAX_PARAMS/MAX_PENDING_CALLS already established.
+const MAX_LOOP_JUMPS: usize = 32;
+
+/// MILESTONE 87: sentinel for `gen_stmt_list`'s `loop_top` argument
+/// meaning "not inside any loop" (0 is a valid CodeBuf offset, so it
+/// can't be the sentinel).
+const NOT_IN_LOOP: u64 = u64::MAX;
+
+/// MILESTONE 87: `break`/`continue` patch lists as module `static mut`
+/// arenas rather than per-loop malloc (cc.elf's per-process heap is
+/// small and the compiler self-test compiles dozens of loop-bearing
+/// programs) or per-loop stack arrays (escaped-pointer aliasing through
+/// the recursive `gen_stmt_list` made the optimizer read stale values,
+/// producing a wild `jmp` that null-faulted cc.elf -- caught by a real
+/// boot). Codegen is single-pass and non-reentrant per compile, and
+/// nested loops use a save/restore of the counts (each `STMT_WHILE`
+/// records the count on entry and truncates back to it on exit), so one
+/// shared arena is correct. `gen_function`/`gen_program` reset the
+/// counts to 0 before each function.
+static mut LOOP_BRK: [u64; MAX_LOOP_JUMPS] = [0; MAX_LOOP_JUMPS];
+static mut LOOP_CONT: [u64; MAX_LOOP_JUMPS] = [0; MAX_LOOP_JUMPS];
+static mut LOOP_BRK_N: u64 = 0;
+static mut LOOP_CONT_N: u64 = 0;
+
+unsafe fn loop_reset() {
+    unsafe {
+        core::ptr::write(core::ptr::addr_of_mut!(LOOP_BRK_N), 0);
+        core::ptr::write(core::ptr::addr_of_mut!(LOOP_CONT_N), 0);
+    }
+}
+unsafe fn loop_brk_n() -> u64 { unsafe { core::ptr::read(core::ptr::addr_of!(LOOP_BRK_N)) } }
+unsafe fn loop_cont_n() -> u64 { unsafe { core::ptr::read(core::ptr::addr_of!(LOOP_CONT_N)) } }
+unsafe fn loop_set_brk_n(v: u64) { unsafe { core::ptr::write(core::ptr::addr_of_mut!(LOOP_BRK_N), v) } }
+unsafe fn loop_set_cont_n(v: u64) { unsafe { core::ptr::write(core::ptr::addr_of_mut!(LOOP_CONT_N), v) } }
+unsafe fn loop_brk_at(i: u64) -> u64 {
+    unsafe { core::ptr::read((core::ptr::addr_of!(LOOP_BRK) as u64 + i * 8) as *const u64) }
+}
+unsafe fn loop_cont_at(i: u64) -> u64 {
+    unsafe { core::ptr::read((core::ptr::addr_of!(LOOP_CONT) as u64 + i * 8) as *const u64) }
+}
+unsafe fn loop_push_brk(field: u64) -> Result<(), CodeGenError> {
+    let n = unsafe { loop_brk_n() };
+    if n >= MAX_LOOP_JUMPS as u64 {
+        return Err(CodeGenError::TooManyLoopJumps);
+    }
+    unsafe { core::ptr::write((core::ptr::addr_of_mut!(LOOP_BRK) as u64 + n * 8) as *mut u64, field) };
+    unsafe { loop_set_brk_n(n + 1) };
+    Ok(())
+}
+unsafe fn loop_push_cont(field: u64) -> Result<(), CodeGenError> {
+    let n = unsafe { loop_cont_n() };
+    if n >= MAX_LOOP_JUMPS as u64 {
+        return Err(CodeGenError::TooManyLoopJumps);
+    }
+    unsafe { core::ptr::write((core::ptr::addr_of_mut!(LOOP_CONT) as u64 + n * 8) as *mut u64, field) };
+    unsafe { loop_set_cont_n(n + 1) };
+    Ok(())
 }
 
 const MAX_VARS: u64 = 8;
@@ -2447,11 +2610,13 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             unsafe { collect_vars_rec(s.else_body, vars_ptr, n) }?;
         } else if s.kind == STMT_WHILE {
             // MILESTONE 71: same recursive-DECL-collection reasoning as
-            // STMT_IF above, into the loop body's own then_body list (the
-            // one real per-statement field STMT_WHILE's parse arm
-            // populates -- else_body is always 0 for a while-loop, no
-            // second walk needed).
+            // STMT_IF above, into the loop body (`then_body`).
+            // MILESTONE 87: also walk `else_body` -- for a `for` loop it
+            // now holds the `step` clause. That clause is an assignment
+            // (no `int` decl), so this walk finds nothing today, but
+            // keeping it symmetric with STMT_IF is correct, not lucky.
             unsafe { collect_vars_rec(s.then_body, vars_ptr, n) }?;
+            unsafe { collect_vars_rec(s.else_body, vars_ptr, n) }?;
         }
         cur = s.next;
     }
@@ -3414,6 +3579,19 @@ unsafe fn gen_stmt_list(
     pending_count_ptr: u64,
     mode: CodegenMode,
     head: u64,
+    // MILESTONE 87: the INNERMOST enclosing loop's condition-re-check
+    // offset (== NOT_IN_LOOP when this list is not inside any loop body),
+    // and 1 if that loop is a `for` (whose `continue` must run the step
+    // clause). Threaded UNCHANGED through STMT_IF's branch recursion (a
+    // `break` inside an `if` inside a `while` still binds to that
+    // `while`); replaced by STMT_WHILE for its own body; passed as
+    // (NOT_IN_LOOP, 0) for the `for` step clause. The break/continue
+    // patch lists themselves live in module `static mut` arenas
+    // (LOOP_BRK/LOOP_CONT) with a save/restore-of-count discipline in
+    // STMT_WHILE -- see their own doc comment for why not per-loop
+    // stack/heap.
+    loop_top: u64,
+    loop_is_for: u64,
 ) -> Result<(), CodeGenError> {
     let mut cur = head;
     while cur != 0 {
@@ -3432,15 +3610,47 @@ unsafe fn gen_stmt_list(
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 unsafe { emit_epilogue(buf, mode) };
             }
+            // MILESTONE 87: `break` -- an unconditional forward jump to
+            // the innermost loop's exit, recorded as a placeholder in
+            // that loop's own patch list (resolved by STMT_WHILE once the
+            // exit address is known). Outside any loop -> a real semantic
+            // error, the same shape as UndeclaredVariable.
+            STMT_BREAK => {
+                if loop_top == NOT_IN_LOOP {
+                    return Err(CodeGenError::BreakOutsideLoop);
+                }
+                let field = unsafe { buf.emit_jmp_placeholder() };
+                unsafe { loop_push_brk(field) }?;
+            }
+            // MILESTONE 87: `continue` -- for a plain `while` this is a
+            // BACKWARD jump straight to the condition re-check (target
+            // already known). For a `for` loop the next iteration must
+            // run the `step` clause first, so it is a FORWARD jump into
+            // that loop's `cont` patch list, resolved by STMT_WHILE to
+            // the point right before the step's own codegen.
+            STMT_CONTINUE => {
+                if loop_top == NOT_IN_LOOP {
+                    return Err(CodeGenError::ContinueOutsideLoop);
+                }
+                if loop_is_for == 0 {
+                    // plain `while` -- straight back to the condition.
+                    unsafe { buf.emit_jmp_back(loop_top) };
+                } else {
+                    // `for` -- forward jump to just before the step clause,
+                    // resolved by STMT_WHILE below.
+                    let field = unsafe { buf.emit_jmp_placeholder() };
+                    unsafe { loop_push_cont(field) }?;
+                }
+            }
             STMT_IF => {
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 unsafe { buf.emit_test_rax_rax() };
                 let jz_field = unsafe { buf.emit_jz_placeholder() };
-                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body) }?;
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, loop_top, loop_is_for) }?;
                 if s.else_body != 0 {
                     let jmp_field = unsafe { buf.emit_jmp_placeholder() };
                     unsafe { buf.patch_rel32(jz_field) };
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body) }?;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for) }?;
                     unsafe { buf.patch_rel32(jmp_field) };
                 } else {
                     unsafe { buf.patch_rel32(jz_field) };
@@ -3469,13 +3679,48 @@ unsafe fn gen_stmt_list(
             // semantics, condition checked every time including the
             // first, zero iterations when it starts false.
             STMT_WHILE => {
-                let loop_top = buf.len;
+                let my_top = buf.len;
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 unsafe { buf.emit_test_rax_rax() };
                 let jz_field = unsafe { buf.emit_jz_placeholder() };
-                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body) }?;
-                unsafe { buf.emit_jmp_back(loop_top) };
+
+                // MILESTONE 87: `s.else_body` carries a `for` loop's step
+                // clause (0 for a plain `while`); its presence is what
+                // makes this loop's `continue` a forward jump.
+                let my_is_for: u64 = if s.else_body != 0 { 1 } else { 0 };
+                // Save the shared arena counts on entry; every break /
+                // continue this loop's body records goes at index
+                // >= these bases; on exit we patch [base .. now] and
+                // truncate back so an enclosing loop is unaffected.
+                let brk_base = unsafe { loop_brk_n() };
+                let cont_base = unsafe { loop_cont_n() };
+
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, my_top, my_is_for) }?;
+
+                if my_is_for != 0 {
+                    // `continue`'s forward-jump target is HERE, right
+                    // before the step clause's own codegen.
+                    let cn = unsafe { loop_cont_n() };
+                    let mut i = cont_base;
+                    while i < cn {
+                        unsafe { buf.patch_rel32(loop_cont_at(i)) };
+                        i += 1;
+                    }
+                    unsafe { loop_set_cont_n(cont_base) };
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, NOT_IN_LOOP, 0) }?;
+                }
+
+                unsafe { buf.emit_jmp_back(my_top) };
+
+                // exit: the `jz` (condition false) and every `break` land here.
                 unsafe { buf.patch_rel32(jz_field) };
+                let bn = unsafe { loop_brk_n() };
+                let mut j = brk_base;
+                while j < bn {
+                    unsafe { buf.patch_rel32(loop_brk_at(j)) };
+                    j += 1;
+                }
+                unsafe { loop_set_brk_n(brk_base) };
             }
             _ => {}
         }
@@ -3510,7 +3755,8 @@ unsafe fn gen_function(src_ptr: u64, func: u64, mode: CodegenMode) -> Result<Cod
     // the exact same real inert-no-op reasoning -- a program with an
     // empty function table can never reach the EXPR_CALL arm that would
     // dereference them.
-    unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, 0, 0, 0, 0, mode, f.body) }?;
+    unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
+    unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, 0, 0, 0, 0, mode, f.body, NOT_IN_LOOP, 0) }?;
 
     // Safety backstop -- see this function's own doc comment above.
     unsafe { emit_epilogue(&mut buf, mode) };
@@ -3710,7 +3956,8 @@ unsafe fn gen_program(src_ptr: u64, prog_head: u64, mode: CodegenMode) -> Result
             pi += 1;
         }
 
-        unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs_total, pending_ptr, pending_count_ptr, this_fn_mode, f.body) }?;
+        unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
+        unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs_total, pending_ptr, pending_count_ptr, this_fn_mode, f.body, NOT_IN_LOOP, 0) }?;
 
         // Safety backstop -- same real reasoning as gen_function()'s own
         // trailing epilogue above, per-function here.
@@ -4082,6 +4329,12 @@ type GenFn = unsafe extern "C" fn() -> u64;
 /// deliberately lexically/semantically valid, so only the success path
 /// needs to be real.
 unsafe fn compile_and_run_callable(src_ptr: u64, src_len: u64) -> Option<u64> {
+    // MILESTONE 87: throw away everything the PREVIOUS compilation left
+    // on the heap (its result is already a plain value the caller has;
+    // its tokens/AST/CodeBuf are dead). Keeps the ~50-compile self-test
+    // inside the fixed per-process heap. `src` itself is a `&[u8]`
+    // static, never on the heap, so it survives this.
+    unsafe { heap_reset() };
     let func = match unsafe { lex_and_parse(src_ptr, src_len) } {
         Ok(f) => f,
         Err(_) => return None,
@@ -4148,6 +4401,7 @@ unsafe fn lex_and_parse_program(src_ptr: u64, src_len: u64) -> Result<u64, ()> {
 /// existing zero-argument `GenFn` type Milestone 68 already established
 /// is still the right shape to call through here, unchanged.
 unsafe fn compile_and_run_program_callable(src_ptr: u64, src_len: u64) -> Option<u64> {
+    unsafe { heap_reset() }; // MILESTONE 87 -- see compile_and_run_callable()
     let prog = match unsafe { lex_and_parse_program(src_ptr, src_len) } {
         Ok(p) => p,
         Err(_) => return None,
@@ -4168,6 +4422,11 @@ unsafe fn compile_and_run_program_callable(src_ptr: u64, src_len: u64) -> Option
 /// points at "main"'s real first byte even when main isn't the first
 /// function in the buffer.
 unsafe fn compile_program_standalone_elf(src_ptr: u64, src_len: u64) -> (u64, u64) {
+    // MILESTONE 87: reset the heap first. The RETURNED (elf_ptr, elf_len)
+    // stays valid until the NEXT compile helper runs -- every caller
+    // writes the ELF to disk via `write_exec_and_check!` immediately, so
+    // that window is always long enough.
+    unsafe { heap_reset() };
     let prog = match unsafe { lex_and_parse_program(src_ptr, src_len) } {
         Ok(p) => p,
         Err(_) => return (0, 0),
@@ -5940,7 +6199,115 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m86 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 87: `break` and `continue`.
+        //
+        // CASE 47 (in-process Callable path): both, inside a `while`.
+        //   int main() {
+        //       int s; s = 0;
+        //       int i; i = 0;
+        //       while (i < 100) {
+        //           i += 1;
+        //           if (i > 10) { break; }
+        //           if (i == 3) { continue; }
+        //           s += i;
+        //       }
+        //       return s;
+        //   }
+        // Trace: i runs 1..10 (break at i == 11); i == 3 skips its own
+        // `s += i`. s = (1+2+..+10) - 3 = 55 - 3 = 52. `break` from
+        // inside a nested `if`, and `continue` re-checking the `while`
+        // condition, are both exercised.
+        // -------------------------------------------------------------
+        const SRC47: &[u8] = b"int main() { int s; s = 0; int i; i = 0; while (i < 100) { i += 1; if (i > 10) { break; } if (i == 3) { continue; } s += i; } return s; }";
+        let case47_result = compile_and_run_program_callable(SRC47.as_ptr() as u64, SRC47.len() as u64);
+        w(b"  case47 (break + continue in a while, in-process) returned=");
+        if let Some(r) = case47_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 52)\n");
+        let case47_ok = case47_result == Some(52);
+        write_check(b"case47_break_and_continue_in_while_returns_52=", case47_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 48 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier): `break` and `continue` inside a
+        // `for` loop. This is the case that proves `continue` in a
+        // `for` RUNS THE STEP CLAUSE (real C semantics) rather than
+        // jumping straight to the condition:
+        //   int main() {
+        //       int s; s = 0;
+        //       int i;
+        //       for (i = 0; i < 20; i += 1) {
+        //           if (i == 5) { break; }
+        //           if (i == 2) { continue; }
+        //           s += i;
+        //       }
+        //       return s;
+        //   }
+        // Trace: i runs 0..4 (break at i == 5); i == 2 skips its own
+        // `s += i` but STILL runs `i += 1`. s = 0+1+3+4 = 8.
+        // If `continue` skipped the step, i would stay 2 forever -- the
+        // program would hang and `wait()` would never return an exit
+        // code at all, let alone 8. If `break` were a no-op, the loop
+        // would run to i == 19 and s would be 190 - 2 = 188. Exit code
+        // 8 is reachable only with both working correctly.
+        // -------------------------------------------------------------
+        const SRC48: &[u8] =
+            b"int main() { int s; s = 0; int i; for (i = 0; i < 20; i += 1) { if (i == 5) { break; } if (i == 2) { continue; } s += i; } return s; }";
+        const PATH48: &[u8] = PATH8;
+        let (elf48_ptr, elf48_len) = compile_program_standalone_elf(SRC48.as_ptr() as u64, SRC48.len() as u64);
+        let case48_ok = if elf48_ptr == 0 {
+            w(b"  case48 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH48, elf48_ptr, elf48_len, 8)
+        };
+        write_check(b"case48_real_elf_exec_break_continue_in_for_runs_step_returns_8=", case48_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 49: a deliberate SEMANTIC error -- `break` with no
+        // enclosing loop must be Err(CodeGenError::BreakOutsideLoop),
+        // the same "prove the new Err path is real, not an unexercised
+        // variant" discipline CASE 7 (UndeclaredVariable) and CASE 29
+        // (UndeclaredFunction) already established.
+        //   int main() { break; return 1; }
+        // -------------------------------------------------------------
+        const SRC49: &[u8] = b"int main() { break; return 1; }";
+        let src49_ptr = SRC49.as_ptr() as u64;
+        let src49_len = SRC49.len() as u64;
+        let case49_ok = match lex_and_parse(src49_ptr, src49_len) {
+            Ok(func49) => match gen_function(src49_ptr, func49, CodegenMode::Callable) {
+                Err(CodeGenError::BreakOutsideLoop) => {
+                    w(b"  case49 real codegen error -- break outside any loop\n");
+                    true
+                }
+                _ => {
+                    w(b"  case49 expected Err(BreakOutsideLoop), got something else\n");
+                    false
+                }
+            },
+            Err(_) => {
+                w(b"  case49 lex_and_parse() returned Err unexpectedly (source should lex+parse fine)\n");
+                false
+            }
+        };
+        write_check(b"case49_break_outside_loop_is_BreakOutsideLoop=", case49_ok);
+
+        w(b"\n");
+
+        let overall_m87 = case47_ok && case48_ok && case49_ok;
+        w(b"OVERALL_M87=");
+        w(if overall_m87 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 { 0 } else { 1 });
     }
 }
 

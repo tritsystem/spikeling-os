@@ -97,6 +97,39 @@ pub unsafe fn sys_sbrk(size: u64) -> u64 {
     ret
 }
 
+/// MILESTONE 87: syscall 25 -- rewind this process's heap break to
+/// HEAP_START (logically free the whole heap in one call). No args.
+/// Returns the new break. Paired with `heap_reset()` below, which also
+/// clears this allocator's own free list so the two views agree.
+#[inline(always)]
+pub unsafe fn sys_sbrk_reset() -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inout("rax") 25u64 => ret,
+            out("rcx") _, out("r11") _,
+            options(nostack)
+        );
+    }
+    ret
+}
+
+/// MILESTONE 87: throw away the ENTIRE heap -- reset the kernel-side
+/// `sbrk` break AND this allocator's free list, so the next `malloc()`
+/// starts over from a clean heap. Every pointer previously returned by
+/// `malloc()` is invalid after this. The `tools/cc_src` compiler
+/// self-test calls this between compilations (its per-compile
+/// tokens/AST/CodeBuf are deliberately never individually freed), which
+/// keeps ~50 back-to-back compiles inside the fixed per-process heap
+/// reservation instead of leaking past it (a real limit hit at
+/// Milestone 87's own CASE 47, caught by a boot).
+pub unsafe fn heap_reset() {
+    use core::sync::atomic::Ordering;
+    unsafe { sys_sbrk_reset() };
+    FREE_LIST_HEAD.store(0, Ordering::Relaxed);
+}
+
 #[inline(always)]
 pub unsafe fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
     let ret: u64;

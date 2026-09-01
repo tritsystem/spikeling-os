@@ -1854,6 +1854,29 @@ pub(crate) fn sbrk(id: u8, size: u64) -> Option<u64> {
     })?
 }
 
+/// MILESTONE 87: rewind this process's `sbrk` bump pointer all the way
+/// back to `HEAP_START` -- i.e. logically free its entire heap in one
+/// call, so the next `sbrk()` re-hands the very same virtual range.
+/// Any physical frames Milestone 57's demand paging already mapped for
+/// that range STAY mapped (they are PRESENT|WRITABLE|USER, so a later
+/// write just overwrites them -- no fault, no leak, no re-map cost);
+/// only the `heap_used` accounting is reset. Returns `Some(HEAP_START)`
+/// on success (the new break), `None` if `id` doesn't name a live
+/// process. The `tools/cc_src` compiler self-test calls this between
+/// compilations (its per-compile tokens/AST/CodeBuf are deliberately
+/// never individually freed -- see its own Milestone 67 scope), which
+/// is what keeps ~50 back-to-back compiles inside the 64-page
+/// reservation instead of leaking past it. A real userspace program
+/// that genuinely needs its heap contents would simply never call this;
+/// it is an explicit "throw the whole heap away now" request, not
+/// automatic.
+pub(crate) fn sbrk_reset(id: u8) -> Option<u64> {
+    with_process_mut(id, |proc| {
+        proc.heap_used = 0;
+        HEAP_START
+    })
+}
+
 /// MILESTONE 57: real page-fault-driven demand paging for the per-process
 /// heap. Called from interrupts.rs's page_fault_handler, BEFORE that
 /// handler's own unconditional SIGSEGV-termination path, for exactly one

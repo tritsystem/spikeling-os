@@ -8764,6 +8764,237 @@ self-test suite, genuinely open for a future pass.
       (Milestone 106) all remain exactly as Milestone 113 left them --
       unrelated to this milestone.
 
+- [x] **Milestone 115**: real pointer arithmetic -- `p + n`, `n + p`, and
+      `p - n` (`EXPR_BINARY`'s own `+`/`-` codegen, `tools/cc_src/main.rs`)
+      now genuinely scale the integer operand by the pointer's own pointee
+      size instead of doing a plain, meaningless raw-address-plus-raw-
+      integer add -- closing the exact gap Milestone 109's own original
+      closing disclosure first named ("no pointer arithmetic") and every
+      pointer/array milestone since (110 through 114) re-confirmed still
+      open, and the first of this milestone's own two listed candidates
+      actually taken.
+
+      **Zero grammar change**: `p + 1`/`1 + p`/`p - 1` already parsed as an
+      ordinary `EXPR_BINARY` with no pointer awareness at all -- the entire
+      real fix lives in what that arm's existing codegen does BEFORE the
+      pre-existing add/sub instruction runs.
+
+      **The one genuinely new piece of plumbing, and the real surprise
+      found while scoping it**: unlike `char *` (unambiguously
+      identifiable since Milestone 112 via `STMT_DECL.expr`), an `int *`
+      variable had NO signal distinguishing it from a plain `int`
+      ANYWHERE in this AST before this milestone. Milestone 109's own
+      deliberate "a pointer's runtime value is just another 8-byte stack
+      slot, no new `VarSlot` field needed" design choice was correct for
+      every pointer/array milestone since -- reading a pointer's own value,
+      or dereferencing it, works identically whether the compiler can tell
+      it apart from a plain `int` or not -- but it meant `int *p;` and
+      `int p;` produced a BYTE-IDENTICAL `StmtNode` (`then_body: 0, expr:
+      0` either way). Real, TYPE-AWARE arithmetic scaling is the first
+      feature that actually needs to tell them apart. The fix: a new
+      sentinel (`then_body: 2`, written only by `parse_pointer_decl()`'s
+      own pre-existing `int *` branch -- its `char *` branch is
+      deliberately left alone, since `expr == 1` already identifies it
+      unambiguously) plus a new `VarSlot` field, `is_int_ptr`, threaded
+      through `find_var()`'s now-five-element return tuple (`(stack_off,
+      is_char, is_array, is_char_ptr, is_int_ptr)`, all seven pre-existing
+      call sites updated to ignore the new field) to a new classifier
+      helper, `ptr_operand_scale()`: `Some(1)` for a `char *` IDENT,
+      `Some(8)` for an `int *` IDENT or a decayed array base (`is_array`),
+      `None` otherwise (a plain scalar, an undeclared name, or any
+      non-`EXPR_IDENT` shape -- the same "resolved by operand SHAPE, not
+      attempted for every expression" restriction `OP_ADDR`/`OP_DEREF`
+      already established for `&`/`*`, Milestone 109/112, applied here to
+      `+`/`-`).
+
+      **One genuinely new x86_64 encoding**: `emit_shl_rax_imm8()`
+      (`SHL RAX, imm8`, REX.W `C1` `/4` `E0`), the RAX-targeted sibling of
+      the pre-existing `emit_shl_rcx_imm8()` -- needed because `n + p` (the
+      pointer on the RIGHT, real C's own commutative spelling for `p + n`)
+      leaves the integer operand in RAX rather than RCX after the
+      existing left-push/right-pop preamble (unchanged, still evaluates
+      left into RAX, pushes, evaluates right into RAX, moves it to RCX,
+      pops left back into RAX -- real evaluation order is completely
+      untouched by this milestone). Not a genuinely new encoding FAMILY:
+      both halves were independently hand-verified by an earlier
+      milestone already -- the `C1` immediate-shift opcode by
+      `emit_shl_rcx_imm8()` itself (Milestone 108), the `0xE0` ModRM byte
+      (RAX, SHL's own opcode-extension digit) by `emit_shl_rax_cl()`
+      (Milestone 79) -- the same "combine two independently-verified
+      halves" real new instruction Milestone 112's own
+      `emit_movsx_rax_mem_rax_byte()` doc comment already described. For
+      `p + n` (pointer on the left, the common case), scaling instead
+      reuses `emit_shl_rcx_imm8()` completely UNCHANGED, the identical
+      encoding `EXPR_INDEX`'s own address computation already uses for
+      "scale an index by 8" (Milestone 108/114). When both operands
+      classify as pointers (real C defines no meaning for `pointer +
+      pointer`) or neither does (an ordinary `int + int`), no scaling is
+      applied at all -- the plain, unscaled `add`/`sub` runs exactly as it
+      always has, a real, disclosed restriction, not a silently
+      fabricated meaning for an operator real C itself leaves undefined.
+
+      **A real, honestly-derived, genuinely surprising consequence, NOT
+      papered over**: this codegen's own stack frame grows toward LOWER
+      addresses as MORE variables are declared, and its own array-element
+      layout ALSO grows toward lower addresses as the index grows
+      (Milestone 108's own `off - 8*idx` rule) -- so real, hardware-
+      correct, address-INCREASING `p + n` reaches a DIFFERENT real stack
+      slot than `p[n]` does for a declared array's own decayed base:
+      `arr[n]` is reached by `arr - n`, NOT `arr + n`, in THIS compiler
+      specifically. This milestone does not "fix" that disagreement by
+      secretly making `+` subtract to restore the identity real C
+      guarantees between `p[n]` and `*(p+n)` -- that would make pointer
+      arithmetic itself backwards relative to real address semantics, a
+      strictly worse bug than the disclosed inconsistency. CASE 112 (below)
+      hand-verifies this exact, real, honest behavior rather than
+      asserting a "morally correct" identity that does not actually hold
+      for this compiler's own array layout.
+
+      **New self-test cases**, all four run in-process
+      (`CodegenMode::Callable`), the same tier Milestone 107 through 114
+      all already used for their own new cases -- no new real
+      `fork()`/`exec()`/`wait()` cycle is added by this milestone: CASE 110
+      (`*(p + 1) == 111` through an `int *` -- the real, distinguishing
+      proof `p + n` scales by 8 with the pointer on the LEFT, the common
+      spelling, scaling RCX via the pre-existing `emit_shl_rcx_imm8()`; a
+      pre-fix build would compute an unaligned address one byte off,
+      reading garbage instead of a clean `111`; expected `1`); CASE 111
+      (`*(1 + p) == 111`, the same real address, reached via the
+      COMMUTATIVE spelling -- the real, distinguishing proof for the
+      genuinely separate RAX-scaling code path CASE 110 alone does not
+      exercise, catching a bug that scaled only the pointer-on-the-left
+      shape; expected `1`); CASE 112 (`(*(arr - 1) == 2) + (*(arr - 2) ==
+      3) * 10` -- the real, distinguishing proof a decayed ARRAY base
+      (`is_array`, a genuinely separate `ptr_operand_scale()` branch from
+      CASE 110/111's `int *` variable) also scales by 8, through `-`
+      specifically, reaching `arr[1]`/`arr[2]` via this compiler's own
+      real, disclosed downward-growing array-address convention; expected
+      `11`); CASE 113 (`*(cp + 8) == 200` through a `char *` -- the real,
+      decisive regression tripwire that `char *` arithmetic scales by 1,
+      NOT 8 (a wrongly-8-scaled build would compute `rbp+48`, real memory
+      belonging to neither operand variable at all, not merely a
+      differently-wrong number reachable by coincidence), combined with a
+      second real, disclosed observation this same case proves with an
+      actual measured number rather than mere prose: `*(cp + 8)` does NOT
+      narrow to a signed byte (reads back the un-narrowed `200`, not
+      `-56`) because `cp + 8` is a real `EXPR_BINARY`, not the plain
+      `EXPR_IDENT` shape `OP_DEREF`'s own Milestone 112 narrowing check
+      requires -- the same "resolved by operand SHAPE" restriction
+      Milestone 113's own CASE 106 already proved for a `char *`-returning
+      call result, newly reachable here through pointer arithmetic too,
+      and not attempted to be closed by this milestone; expected `1`).
+
+      **No SNN/evidence-gate work this milestone, and correctly so**: this
+      is a pure compiler-frontend milestone -- one new `VarSlot` field, one
+      new parse-time sentinel, one new classifier helper, one new
+      immediate-shift encoding combining two already-verified halves, no
+      kernel-side subsystem decision anywhere in it for an evidence-gated
+      hysteresis gate to meaningfully subscribe to. The same carve-out
+      Milestone 107 through 114 all already established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero warnings). `kernel/assets/cc.elf` rebuilt via the
+      project's own pinned-nightly `rustc` recipe (`tools/cc_src/
+      README.md`, unchanged) -- 101800 bytes, up from Milestone 114's
+      99344; the real `PT_LOAD` `p_memsz` via `readelf -l` is 86720 bytes,
+      22 pages, up from Milestone 114's own 21 -- comfortably under the
+      64-page per-segment cap and 128-page total cap, no cap change
+      needed. The rebuilt `cc.elf` was independently re-derived from the
+      current `main.rs` via a from-scratch invocation of the exact same
+      recipe and diffed byte-for-byte identical against the committed
+      binary (`cmp`, not eyeballed). **Zero new compiler warnings** --
+      verified the same way Milestone 109 through 114 verified their own:
+      reproducing the standalone `rustc` invocation against a `git stash`
+      of this milestone's own changes (a real, clean Milestone 114
+      checkout) and diffing the sorted warning list against this
+      milestone's own build -- byte-for-byte identical 16-warning set.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m115_fresh_boot.log`/`m115_reused_boot.log`), no
+      stray `qemu-system-x86_64.exe` process before or after either boot
+      (checked via `tasklist`). `OVERALL_M115=PASS` on both boots -- CASE
+      110 returns `1`, CASE 111 returns `1`, CASE 112 returns `11`, CASE
+      113 returns `1`, identically on both boots. Every marker this kernel
+      has ever produced was independently re-confirmed `PASS` on both
+      boots via a real reconstruction script (not sampled or eyeballed,
+      written fresh this session per this project's own standing note that
+      the prior session's equivalent script lives only in ITS OWN
+      scratchpad, never committed) that concatenates every real
+      `milestone 31: syscall WRITE ... raw bytes >>> ... <<< end of write`
+      payload in file order to recover cc.elf's own fragmented
+      `OVERALL`/`OVERALL_M*`/`caseNNN_..._returns_*` text (each is written
+      one syscall per `w()`/digit call, so a naive `grep` on the raw log
+      only ever sees fragments), PLUS a separate scan of the kernel's own
+      unfragmented direct-to-serial markers (`ata.rs`/`loader.rs`/
+      `process.rs`'s own colon-style `milestone NN: self-test -- OVERALL:
+      PASS`, disambiguated by their own milestone-number prefix since that
+      literal text has no unique suffix of its own; `heap_guard.rs`/
+      `hetero_ensemble.rs`/`hetero_stdp.rs`/`spiking_logic.rs`'s own
+      named `OVERALL_M104`/`M77`/`M78`/`M80`/`M81`; `fs.rs`'s own
+      "permissions"/"symlinks"-named `OVERALL=` lines) -- 59 total
+      distinct OVERALL-family markers and 121 total distinct per-case
+      checks (180 markers overall), every one `PASS` on the fresh boot,
+      and identical in both marker SET and VALUE on the reused boot with
+      exactly one real, already-expected exception: `permissions
+      OVERALL`/`symlinks OVERALL` read `FAIL` on the reused boot only --
+      the same pre-existing, already-disclosed Milestone 62-era fixture-
+      cleanup artifact every milestone since 70 has named, confirmed here
+      by diffing the real 54-line `fs self-test: ... FAIL` line set
+      directly against Milestone 114's own committed `m114_reused_boot.log`
+      -- byte-for-byte identical (`diff`, not eyeballed). The fresh boot's
+      own fs self-test passes both suites cleanly (zero FAIL lines beyond
+      five unrelated, pre-existing, deliberately-negative-path syscall
+      tests this kernel has always logged as "FAILED" outside the fs
+      self-test entirely). `run_preemption_demo()` ran to completion on
+      BOTH boots (fresh: `task0=2564 task1=2434 task2=2681`; reused:
+      `task0=2521 task1=2451 task2=2786` -- real inter-boot timing jitter,
+      consistent with every prior milestone's own two-boot pairs) -- zero
+      `run_preemption_demo() SKIPPED` lines on either boot. Milestone 104's
+      own heap-pressure evidence-gate state came out BYTE-IDENTICAL to
+      Milestone 108 through 114's own recorded baseline on both boots:
+      `samples_taken=68 gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0` -- zero drift, consistent with this
+      milestone being pure compiler-frontend work with no new kernel
+      allocation path. Zero `panicked at`/`kernel panicked` and zero
+      `DOUBLE FAULT`/`TRIPLE FAULT` in either log (checked directly,
+      `grep -c`, zero matches in both).
+
+      **Still genuinely open**: no `char **`/`int **`/multi-level pointers
+      of any kind (Milestone 115's own second listed candidate,
+      untouched); no `p++`/`p--` -- this lexer has no `++`/`--` tokens AT
+      ALL, a real, larger, separate feature, not merely this milestone's
+      own narrower scope cut; pointer arithmetic does NOT cross a
+      function-call boundary -- `ParamInfo` has no `is_int_ptr` equivalent,
+      the same real scope cut `is_char_ptr` itself carried for exactly one
+      milestone (112) before 113 closed it, so `p + 1` inside a function
+      taking `int *p`/`char *p` silently falls through to the ordinary
+      UNSCALED add, exactly as it always has, with zero compile-time
+      warning; pointer-pointer subtraction (real C: an element-count
+      difference) is not implemented, falling through to a plain,
+      meaningless raw-address subtract; `int - pointer` (not legal C to
+      begin with) is given no special meaning either; when BOTH operands
+      of `+` classify as pointers, no scaling is applied to either (falls
+      through to the same plain, meaningless add); pointer-arithmetic
+      scaling is recognized only when the pointer-like operand is
+      syntactically a plain `EXPR_IDENT`, the same restriction `OP_ADDR`/
+      `OP_DEREF`/`p[idx]` already carry; no `*p += 1;`/`p[idx] += 1;`-style
+      compound assignment through any pointer (unrelated to and untouched
+      by this milestone); `arr +/- n` reaching a DIFFERENT real address
+      than `arr[n]` for a nonzero-vs-zero-index-style identity (this
+      compiler's own downward-growing layout, disclosed above, not a bug
+      this milestone could or should silently correct); no type system of
+      any kind, so a mismatched `char *`/`int *` argument or return, or a
+      nonsensical `pointer + pointer` expression, is accepted without
+      complaint exactly as every other shape mismatch already silently is;
+      no NULL-pointer concept and no bounds/validity checking on any
+      dereference, index, or arithmetic result. `MAX_PARAMS` (8), no
+      `sizeof`, `char` as the only non-`int` scalar TYPE, the compiler
+      self-test's own per-compile leak, `heap_guard::admit()` covering
+      only its original two call sites, and `evidence_gate.rs` still
+      having exactly one real subscriber (Milestone 106) all remain
+      exactly as Milestone 114 left them -- unrelated to this milestone.
+
 ## Building and running
 
 Requires:

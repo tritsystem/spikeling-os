@@ -1546,6 +1546,76 @@
 // compound assignment through any pointer; still no type system of any
 // kind; still no NULL-pointer concept and no bounds/validity checking on
 // any dereference or index.
+//
+// MILESTONE 115: real pointer arithmetic -- `p + n`, `n + p`, and `p - n`
+// (`EXPR_BINARY`'s own `+`/`-` codegen) -- closing the exact gap Milestone
+// 109's own original closing disclosure first named ("no pointer
+// arithmetic") and every pointer/array milestone since (110 through 114)
+// re-confirmed still open. Zero grammar change: `p + 1`/`1 + p`/
+// `p - 1` already parsed as an ordinary `EXPR_BINARY` with no pointer
+// awareness at all; the entire real fix lives in what that arm's codegen
+// does BEFORE the existing add/sub runs.
+//
+// The one genuinely new piece of plumbing this milestone needs -- and the
+// one real, honest surprise found while scoping it: unlike `char *`
+// (unambiguously identifiable since Milestone 112 via `STMT_DECL.expr`),
+// an `int *` variable had NO signal distinguishing it from a plain `int`
+// ANYWHERE in this AST before this milestone -- Milestone 109's own
+// deliberate "a pointer's runtime value is just another 8-byte stack
+// slot, no new VarSlot field needed" design choice (correct for every
+// pointer/array milestone since, which only ever needed to READ or
+// DEREFERENCE a pointer's value, an operation that does not care whether
+// the compiler can tell it apart from an `int`) meant `int *p;` and
+// `int p;` produced a BYTE-IDENTICAL `StmtNode`. Real, TYPE-AWARE
+// scaling is the first feature that actually needs to know. The fix: a
+// new sentinel value (`then_body: 2`, `parse_pointer_decl()`'s own `int
+// *` branch specifically) plus a new `VarSlot`/`ParamInfo`-adjacent field,
+// `is_int_ptr` (`VarSlot` only -- see its own doc comment for why a
+// parameter stays a real, disclosed scope cut), threaded through
+// `find_var()`'s now-five-element return tuple to a new classifier
+// helper, `ptr_operand_scale()`. One genuinely new x86_64 encoding,
+// `emit_shl_rax_imm8()` (the RAX-targeted sibling of the pre-existing
+// `emit_shl_rcx_imm8()`, needed because `n + p` -- the pointer on the
+// RIGHT -- ends up with the integer operand in RAX rather than RCX after
+// the existing left-push/right-pop preamble), itself a real combination
+// of two already-independently-verified halves, the same "combine, don't
+// invent" discipline Milestone 112's own `emit_movsx_rax_mem_rax_byte()`
+// already established.
+//
+// A real, honestly-derived, genuinely surprising consequence, NOT
+// papered over: this codegen's own stack frame grows toward LOWER
+// addresses as MORE variables are declared, and its own array-element
+// layout ALSO grows toward lower addresses as the index grows
+// (Milestone 108's own `off - 8*idx` rule) -- so real, hardware-correct,
+// address-INCREASING `p + n` reaches a DIFFERENT real stack slot than
+// `p[n]` does for a declared array's own decayed base (`arr[n]` is
+// reached by `arr - n`, not `arr + n`, in THIS compiler). This milestone
+// does not "fix" that disagreement by secretly making `+` subtract --
+// that would make pointer arithmetic itself backwards relative to real
+// address semantics, a strictly worse bug than the disclosed
+// inconsistency between `p +/- n` and `p[n]` for a declared array. See
+// this file's own CASE 110-113 doc comments (below) for the full,
+// hand-verified derivation of exactly which real address each new case
+// reaches and why.
+//
+// Scope, deliberately real and disclosed: local `int *`/`char *`
+// variables and decayed array bases ONLY -- an `int *` PARAMETER is NOT
+// recognized (`ParamInfo` has no `is_int_ptr` equivalent, the same real
+// scope cut `is_char_ptr` itself carried for exactly one milestone, 112,
+// before 113 closed it; `p + 1` inside a function taking `int *p` falls
+// through to the ordinary unscaled add, silently, exactly as it always
+// has); `p++`/`p--` remain entirely unimplemented (this lexer has no
+// `++`/`--` tokens AT ALL, a real, larger, separate feature, not merely
+// this milestone's own narrower scope cut); pointer-pointer subtraction
+// (real C: an element-count difference) is not implemented, falling
+// through to a plain, meaningless raw-address subtract; `int - pointer`
+// (not legal C to begin with) is not given any special meaning either;
+// scaling is recognized only when the pointer-like operand is
+// syntactically a plain `EXPR_IDENT`, the same "resolved by operand
+// SHAPE" restriction `OP_ADDR`/`OP_DEREF` already established; no type
+// system of any kind, so nothing here rejects nonsensical pointer
+// arithmetic at compile time, only computes a real (if sometimes
+// meaningless) address for it.
 #![no_std]
 #![no_main]
 
@@ -3451,6 +3521,25 @@ impl Parser {
     // OTHER STMT_DECL producer in this file still always writes `expr:
     // 0`, so this new meaning never collides with anything declared
     // before this milestone).
+    // MILESTONE 115: `then_body` now carries a new sentinel, `2`, for
+    // this function's own pre-existing `int *` branch specifically
+    // (`is_char_pointee == false`) -- every OTHER `STMT_DECL` producer in
+    // this file (`make_decl()`'s two scalar-declarator call sites,
+    // `parse_array_decl()`) only ever writes `then_body` as 0 or 1 (the
+    // scalar `is_char` type-tag Milestone 102 established), so `2` is a
+    // real, collision-free "this declarator is a pointer" signal
+    // `collect_vars_rec()` below can recognize unambiguously. The
+    // `is_char_pointee == true` branch deliberately does NOT also get
+    // this sentinel (stays `then_body: 0`, unchanged) -- a `char *`
+    // declarator was ALREADY unambiguously identifiable before this
+    // milestone via `expr == 1` (no other `STMT_DECL` producer ever
+    // writes a nonzero `expr`, Milestone 112's own reasoning above,
+    // still true), so marking it too would be a real, needless second
+    // source of truth for the exact same fact, not a genuine improvement.
+    // See `VarSlot::is_int_ptr`'s own doc comment for why an `int *`
+    // declarator specifically -- unlike `char *` -- had NO distinguishing
+    // signal at all before this change: it produced a `StmtNode`
+    // byte-identical to a plain `int` scalar declarator.
     unsafe fn parse_pointer_decl(&mut self, name: Token, is_char_pointee: bool) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
@@ -3459,7 +3548,7 @@ impl Parser {
         unsafe {
             core::ptr::write(
                 head as *mut StmtNode,
-                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: if is_char_pointee { 1 } else { 0 }, next: 0, then_body: 0, else_body: 0 },
+                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: if is_char_pointee { 1 } else { 0 }, next: 0, then_body: if is_char_pointee { 0 } else { 2 }, else_body: 0 },
             )
         };
         if unsafe { self.peek() }.kind == TOK_ASSIGN {
@@ -4676,6 +4765,31 @@ struct VarSlot {
     // the real, disclosed restriction on which `*expr` shapes this
     // milestone can actually resolve it for.
     is_char_ptr: u8,
+    // MILESTONE 115: 1 exactly for a local `int *p;` pointer DECLARATOR's
+    // own named slot, 0 for everything else (an ordinary `int`, a `char`
+    // scalar, an array, a `char *` pointer, and every parameter -- see
+    // this milestone's own closing "Still genuinely open" disclosure for
+    // why parameters stay 0 here). A genuinely NEW field, not a reuse of
+    // `is_char_ptr` above: before this milestone, an `int *p;` pointer
+    // declarator and a plain `int p;` scalar declarator produced a
+    // BYTE-IDENTICAL `StmtNode` (both `then_body: 0, expr: 0`) --
+    // Milestone 109's own deliberate "a pointer's runtime VALUE is just
+    // another 8-byte stack slot, needing no new VarSlot field" design
+    // choice, which was correct for everything Milestone 109 through 114
+    // actually needed (reading a pointer's own value, or dereferencing
+    // it, works identically whether the compiler can tell it apart from
+    // a plain `int` or not). Real, TYPE-AWARE pointer arithmetic (`p + 1`
+    // must step by 8 bytes for an `int *` but by 1 for a `char *`, and
+    // must NOT scale at all for a plain `int`) is the first feature that
+    // genuinely needs to tell an `int *` apart from a plain `int` --
+    // `is_char_ptr` already did this job for `char *` (via
+    // `parse_pointer_decl()`'s own `is_char_pointee` parameter, threaded
+    // through `STMT_DECL.expr`), but an `int *` had no equivalent signal
+    // at all. `parse_pointer_decl()` now writes a new sentinel
+    // (`then_body: 2`, see that function's own updated doc comment) into
+    // the `int *` declarator's own `STMT_DECL` specifically to make this
+    // field derivable -- `collect_vars_rec()` below is the only reader.
+    is_int_ptr: u8,
 }
 
 unsafe fn var_write(vars_ptr: u64, idx: u64, v: VarSlot) {
@@ -4764,7 +4878,24 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // `int *` path) still writes `expr: 0`, so this cast is safe
             // and this line changes behavior for NOTHING declared before
             // this milestone.
-            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: s.then_body as u8, is_array: if elem_count > 1 { 1 } else { 0 }, is_char_ptr: s.expr as u8 }) };
+            // MILESTONE 115: `s.then_body == 2` is the new sentinel
+            // `parse_pointer_decl()`'s own `int *` branch now writes (see
+            // that function's own updated doc comment) -- real, because
+            // no OTHER STMT_DECL producer ever writes anything but 0/1
+            // there. `is_int_ptr_decl` gates TWO things: (1) `is_char`
+            // must come out 0 for this slot, NOT `s.then_body` read
+            // directly (which would now be the literal value `2`, a real
+            // regression this milestone must avoid -- reading `p` itself,
+            // e.g. `q = p;`, must still load the full unnarrowed 8-byte
+            // address, exactly as it always has); (2) the new
+            // `is_int_ptr` field is 1 exactly here. A `char *` declarator
+            // is UNAFFECTED (`then_body` stays 0 for it, unchanged from
+            // every milestone before this one, so `is_int_ptr_decl` is
+            // correctly false and `is_char`/`is_char_ptr` both compute
+            // exactly as they always have).
+            let is_int_ptr_decl = s.then_body == 2;
+            let is_char_flag: u8 = if is_int_ptr_decl { 0 } else { s.then_body as u8 };
+            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: is_char_flag, is_array: if elem_count > 1 { 1 } else { 0 }, is_char_ptr: s.expr as u8, is_int_ptr: if is_int_ptr_decl { 1 } else { 0 } }) };
             // MILESTONE 108: an array of `elem_count` > 1 reserves
             // `elem_count` contiguous 8-byte stack slots (element `i`
             // lives at `off - 8*i`, i.e. progressively MORE negative as
@@ -4793,7 +4924,7 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             let mut k: u64 = 1;
             while k < elem_count {
                 let elem_off = off - 8 * (k as i32);
-                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0, is_array: 0, is_char_ptr: 0 }) };
+                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0, is_array: 0, is_char_ptr: 0, is_int_ptr: 0 }) };
                 k += 1;
             }
             *n += elem_count;
@@ -4896,7 +5027,18 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // call site at all, the same "accepting the grammar plus
         // threading the one flag IS the complete feature" shape Milestone
         // 110 already established for `int *` parameters.
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr }) };
+        // MILESTONE 115: `is_int_ptr` is always 0 for a parameter -- a
+        // real, disclosed scope cut, the exact same shape `is_char_ptr`
+        // itself carried for ONE milestone (112, before 113 closed it):
+        // `ParamInfo` has no equivalent bit recording whether a plain
+        // `int` parameter was actually declared `int *`, so this
+        // milestone's own pointer-arithmetic scaling (`EXPR_BINARY`'s new
+        // codegen below) cannot yet recognize an `int *` PARAMETER as a
+        // pointer -- `p + 1` inside a function taking `int *p` silently
+        // falls through to the ordinary UNSCALED integer add, exactly as
+        // it did before this milestone existed. See this milestone's own
+        // closing "Still genuinely open" note.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: 0 }) };
         n += 1;
         pi += 1;
     }
@@ -4934,16 +5076,70 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
 /// seventh call site this milestone adds -- before this milestone that
 /// arm never called `find_var()` at all, since `int *` dereference never
 /// needed to distinguish anything about the pointee.
-unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8, u8, u8)> {
+/// MILESTONE 115: now returns `(stack_off, is_char, is_array, is_char_ptr,
+/// is_int_ptr)` -- the fifth field is what makes real, TYPE-AWARE pointer
+/// arithmetic (`EXPR_BINARY`'s own new `+`/`-` codegen, via the new
+/// `ptr_operand_scale()` helper just below) possible: an `int *`
+/// variable must scale by 8, a `char *` by 1 (`is_char_ptr`, unchanged),
+/// and a plain `int` must not scale at all. All seven of this function's
+/// PRE-EXISTING call sites are updated for the new tuple arity, every one
+/// of which just ignores the new field -- none of `EXPR_IDENT`,
+/// `EXPR_INDEX`, `EXPR_UNARY`'s own `OP_ADDR`/`OP_DEREF` arms,
+/// `STMT_ASSIGN`, `STMT_ASSIGN_INDEX`, or `STMT_ASSIGN_DEREF` needs to
+/// know whether a variable is an `int *` specifically, the same "ignore
+/// the field you don't need" precedent every prior `find_var()` field
+/// addition already established. `ptr_operand_scale()` is a genuinely
+/// NEW, eighth call site this milestone adds.
+unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8, u8, u8, u8)> {
     let mut i: u64 = 0;
     while i < nvars {
         let v = unsafe { var_read(vars_ptr, i) };
         if unsafe { same_span(src_ptr, v.name_off as u64, v.name_len as u64, ident_off, ident_len) } {
-            return Some((v.stack_off, v.is_char, v.is_array, v.is_char_ptr));
+            return Some((v.stack_off, v.is_char, v.is_array, v.is_char_ptr, v.is_int_ptr));
         }
         i += 1;
     }
     None
+}
+
+/// MILESTONE 115: classifies a `+`/`-` operand for real, type-aware
+/// pointer-arithmetic address scaling. Returns `Some(1)` when `node` is a
+/// plain `EXPR_IDENT` naming a `char *` variable (`find_var()`'s own
+/// `is_char_ptr` field), `Some(8)` when it names either an `int *`
+/// variable (`is_int_ptr`) or a real declared ARRAY (`is_array` -- an
+/// array's own bare name decays to a pointer to its first `int` element,
+/// EXPR_IDENT's own Milestone 110 rule, so it scales exactly like an
+/// `int *` for arithmetic purposes too), and `None` for everything else:
+/// a plain `int`/`char` scalar (no scaling -- ordinary integer
+/// arithmetic), an undeclared name (`find_var()` returns `None`), or any
+/// non-`EXPR_IDENT` shape at all (a call result, a parenthesized
+/// sub-expression, another binary expression, ...). That last
+/// restriction is deliberate, not an oversight -- the exact same
+/// "resolved by operand SHAPE, not attempted for every expression"
+/// discipline `OP_ADDR` (Milestone 109) and `OP_DEREF` (Milestone
+/// 109/112) already established for `&`/`*`, applied here to `+`/`-` for
+/// the same reason: reliably recognizing a pointer TYPE from an arbitrary
+/// expression shape would need a real type system this subset does not
+/// have (see this milestone's own closing disclosure). A parameter is
+/// never recognized here regardless of its real declared type
+/// (`is_int_ptr` is unconditionally 0 for every parameter -- see
+/// `collect_vars_for_function()`'s own updated doc comment).
+unsafe fn ptr_operand_scale(src_ptr: u64, vars_ptr: u64, nvars: u64, node: &ExprNode) -> Option<u8> {
+    if node.kind != EXPR_IDENT {
+        return None;
+    }
+    match unsafe { find_var(src_ptr, vars_ptr, nvars, node.ident_off as u64, node.ident_len as u64) } {
+        Some((_o, _is_char, is_array, is_char_ptr, is_int_ptr)) => {
+            if is_char_ptr != 0 {
+                Some(1)
+            } else if is_array != 0 || is_int_ptr != 0 {
+                Some(8)
+            } else {
+                None
+            }
+        }
+        None => None,
+    }
 }
 
 // MILESTONE 72: a function-symbol table -- one FuncSym per function in
@@ -5535,6 +5731,27 @@ impl CodeBuf {
     unsafe fn emit_shl_rcx_imm8(&mut self, imm: u8) {
         unsafe { self.push_bytes(&[0x48, 0xC1, 0xE1, imm]) };
     }
+    /// MILESTONE 115: `SHL r/m64, imm8` (REX.W `C1` /4 ib) applied to RAX
+    /// specifically -- the RAX-targeted sibling of `emit_shl_rcx_imm8()`
+    /// just above, needed for real pointer-arithmetic scaling
+    /// (`EXPR_BINARY`'s own `+`/`-` codegen below) when the operand that
+    /// needs scaling by a pointer's own element size ends up sitting in
+    /// RAX rather than RCX -- see that codegen's own doc comment for
+    /// exactly which operand order puts the integer operand in which
+    /// register. Not a genuinely new encoding FAMILY: both halves were
+    /// independently hand-verified against the Intel SDM by an earlier
+    /// milestone already -- the `C1` immediate-shift opcode by
+    /// `emit_shl_rcx_imm8()` itself (Milestone 108, doc comment above),
+    /// the `0xE0` ModRM byte (mod=11/reg=100 (SHL's own opcode-extension
+    /// digit)/rm=000 (RAX)) by `emit_shl_rax_cl()` above (Milestone 79,
+    /// which already shifts RAX by the SAME `0xE0` ModRM byte, just via
+    /// the register-count `D3` opcode instead of this immediate-count
+    /// `C1` one) -- this is the same "combine two independently-verified
+    /// halves" real new instruction Milestone 112's own
+    /// `emit_movsx_rax_mem_rax_byte()` doc comment already described.
+    unsafe fn emit_shl_rax_imm8(&mut self, imm: u8) {
+        unsafe { self.push_bytes(&[0x48, 0xC1, 0xE0, imm]) };
+    }
     /// `MOV RAX, [RAX]` (REX.W `8B` /r) -- a real array-element LOAD
     /// through a runtime-computed address already sitting in RAX itself
     /// (the exact address emit_lea_rax_rbp_off()+emit_shl_rcx_imm8()+
@@ -5744,7 +5961,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 // own codegen is needed, since EXPR_CALL evaluates each
                 // argument through this same gen_expr()/EXPR_IDENT path
                 // like any other expression.
-                Some((o, is_char, is_array, _is_char_ptr)) => {
+                Some((o, is_char, is_array, _is_char_ptr, _is_int_ptr)) => {
                     if is_array != 0 {
                         unsafe { buf.emit_lea_rax_rbp_off(o) };
                     } else if is_char != 0 {
@@ -5864,7 +6081,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         EXPR_INDEX => {
             let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
             let (base_off, is_array, is_char_ptr) = match slot {
-                Some((o, _is_char, is_array, is_char_ptr)) => (o, is_array, is_char_ptr),
+                Some((o, _is_char, is_array, is_char_ptr, _is_int_ptr)) => (o, is_array, is_char_ptr),
                 None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
             };
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
@@ -6058,7 +6275,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 // rbp_off()` call already matches real C's own `&arr`
                 // rule for that reason, needing no is_array branch of
                 // its own, unlike EXPR_IDENT's plain read above it).
-                Some((o, _is_char, _is_array, _is_char_ptr)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
+                Some((o, _is_char, _is_array, _is_char_ptr, _is_int_ptr)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
                 None => return Err(CodeGenError::UndeclaredVariable(operand.ident_off as u64)),
             }
         }
@@ -6110,7 +6327,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
             let operand = unsafe { core::ptr::read(e.left as *const ExprNode) };
             let is_char_pointee = if operand.kind == EXPR_IDENT {
                 match unsafe { find_var(src_ptr, vars_ptr, nvars, operand.ident_off as u64, operand.ident_len as u64) } {
-                    Some((_, _, _, is_char_ptr)) => is_char_ptr != 0,
+                    Some((_, _, _, is_char_ptr, _)) => is_char_ptr != 0,
                     None => false,
                 }
             } else {
@@ -6248,14 +6465,125 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 unsafe { buf.emit_movzx_eax_al() };
                 unsafe { buf.patch_rel32(jmp_field) };
             } else {
+                // MILESTONE 115: real pointer arithmetic -- `p + n`,
+                // `n + p`, and `p - n` now genuinely scale the integer
+                // operand by the pointer's own pointee size (1 for a
+                // `char *`, 8 for an `int *` or a decayed array base)
+                // before the ordinary add/sub runs, instead of doing a
+                // plain, meaningless raw-address-plus-raw-integer add the
+                // way this codegen always has for every operand shape
+                // before this milestone. `ptr_operand_scale()` (above)
+                // classifies BOTH operands BEFORE either is evaluated --
+                // classification only ever inspects `e.left`/`e.right`'s
+                // own `ExprNode` (an `EXPR_IDENT` plus a `find_var()`
+                // lookup, both read-only, no codegen emitted), so doing
+                // this before the existing left-push/right-pop preamble
+                // below changes nothing about that preamble's own
+                // evaluation order or side effects -- the exact same
+                // "left evaluated before right" sequencing every prior
+                // milestone's own binary-operator codegen already
+                // guarantees is completely unchanged.
+                let left_node = unsafe { core::ptr::read(e.left as *const ExprNode) };
+                let right_node = unsafe { core::ptr::read(e.right as *const ExprNode) };
+                let left_scale = if e.op == b'+' || e.op == b'-' {
+                    unsafe { ptr_operand_scale(src_ptr, vars_ptr, nvars, &left_node) }
+                } else {
+                    None
+                };
+                let right_scale = if e.op == b'+' || e.op == b'-' {
+                    unsafe { ptr_operand_scale(src_ptr, vars_ptr, nvars, &right_node) }
+                } else {
+                    None
+                };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
                 unsafe { buf.emit_push_rax() };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.right) }?;
                 unsafe { buf.emit_mov_rcx_rax() };
                 unsafe { buf.emit_pop_rax() };
+                // After the preamble above (unchanged from every prior
+                // milestone): RAX == left operand's own value, RCX ==
+                // right operand's own value -- regardless of which side,
+                // if either, is a recognized pointer.
                 match e.op {
-                    b'+' => unsafe { buf.emit_add_rax_rcx() },
-                    b'-' => unsafe { buf.emit_sub_rax_rcx() },
+                    // MILESTONE 115: `p + n` (`left_scale == Some`, the
+                    // common case, real C's own canonical spelling) scales
+                    // RCX (the integer operand, already sitting there from
+                    // the preamble above) by the pointer's own element
+                    // size -- reusing `emit_shl_rcx_imm8()` completely
+                    // UNCHANGED, the exact same encoding EXPR_INDEX's own
+                    // Milestone 108/114 address computation already uses
+                    // for the identical "scale an index by 8" job. `n + p`
+                    // (`right_scale == Some`, real C's own commutative
+                    // spelling -- `1 + p` means the same thing as `p + 1`)
+                    // instead scales RAX (the integer operand, since the
+                    // pointer landed in RCX this time) via the new
+                    // `emit_shl_rax_imm8()` -- the one genuinely new
+                    // encoding this milestone adds (see its own doc
+                    // comment above). When EITHER a `char *` classification
+                    // gave `Some(1)`, the shift is skipped entirely (a
+                    // real, deliberate no-op -- shifting left by 0 would
+                    // also be a no-op, but skipping the instruction
+                    // entirely is what EXPR_INDEX's own `char *` branch
+                    // already does, Milestone 114, and this milestone
+                    // reuses that same convention rather than inventing a
+                    // second one). When BOTH sides classify as pointers
+                    // (real C has no defined meaning for `pointer +
+                    // pointer` at all) or NEITHER does (an ordinary `int +
+                    // int`), no scaling is applied -- the plain,
+                    // unscaled `add` below runs exactly as it always has,
+                    // a real, disclosed restriction, not a silently
+                    // fabricated meaning for an operator real C itself
+                    // does not define.
+                    b'+' => {
+                        match (left_scale, right_scale) {
+                            (Some(sc), None) => {
+                                if sc == 8 {
+                                    unsafe { buf.emit_shl_rcx_imm8(3) };
+                                }
+                            }
+                            (None, Some(sc)) => {
+                                if sc == 8 {
+                                    unsafe { buf.emit_shl_rax_imm8(3) };
+                                }
+                            }
+                            _ => {}
+                        }
+                        unsafe { buf.emit_add_rax_rcx() }
+                    }
+                    // MILESTONE 115: `p - n` (`left_scale == Some`, RIGHT
+                    // side NOT also a recognized pointer) scales RCX (the
+                    // integer operand) exactly like the `+` arm's own
+                    // `(Some(sc), None)` case above, then the ordinary
+                    // `sub` runs. Real C defines NO other `-` shape
+                    // involving a pointer as legal: `int - pointer` is not
+                    // legal C (this subset makes no attempt to fabricate a
+                    // meaning for it either -- `left_scale == None` here
+                    // always skips scaling, regardless of `right_scale`,
+                    // so it falls through to the same plain unscaled
+                    // subtract every non-pointer `-` already used before
+                    // this milestone), and `pointer - pointer` (real C:
+                    // the ELEMENT-COUNT difference, `(addr_a - addr_b) /
+                    // sizeof(T)`) is a real, disclosed gap this milestone
+                    // does NOT implement -- see this milestone's own
+                    // closing "Still genuinely open" note. Deliberately
+                    // NOT scaling RCX in that ptr-ptr case (`right_scale`
+                    // is also `Some` there) rather than scaling it anyway
+                    // and producing a different but equally wrong number:
+                    // this falls through to the exact same plain,
+                    // unscaled `sub` -- a real raw BYTE address
+                    // difference, not real C's own element-count meaning
+                    // -- that every pointer-involving `-` already computed
+                    // before this milestone existed, the same "no attempt
+                    // to fabricate a meaning" restriction the `int -
+                    // pointer` case just above already states.
+                    b'-' => {
+                        if let (Some(sc), None) = (left_scale, right_scale) {
+                            if sc == 8 {
+                                unsafe { buf.emit_shl_rcx_imm8(3) };
+                            }
+                        }
+                        unsafe { buf.emit_sub_rax_rcx() }
+                    }
                     b'*' => unsafe { buf.emit_imul_rax_rcx() },
                     b'/' => {
                         unsafe { buf.emit_cqo() };
@@ -6463,7 +6791,7 @@ unsafe fn gen_stmt_list(
                 // array is not a modifiable lvalue -- so this is the
                 // same call, not new invented semantics.
                 let store_off = match slot {
-                    Some((o, _is_char, is_array, _is_char_ptr)) => {
+                    Some((o, _is_char, is_array, _is_char_ptr, _is_int_ptr)) => {
                         if is_array != 0 {
                             return Err(CodeGenError::ArrayNotAssignable(s.ident_off as u64));
                         }
@@ -6528,7 +6856,7 @@ unsafe fn gen_stmt_list(
             STMT_ASSIGN_INDEX => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 let (base_off, is_array, is_char_ptr) = match slot {
-                    Some((o, _is_char, is_array, is_char_ptr)) => (o, is_array, is_char_ptr),
+                    Some((o, _is_char, is_array, is_char_ptr, _is_int_ptr)) => (o, is_array, is_char_ptr),
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.then_body) }?;
@@ -6585,7 +6913,7 @@ unsafe fn gen_stmt_list(
             STMT_ASSIGN_DEREF => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 match slot {
-                    Some((o, _is_char, _is_array, _is_char_ptr)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
+                    Some((o, _is_char, _is_array, _is_char_ptr, _is_int_ptr)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 }
                 unsafe { buf.emit_push_rax() };
@@ -11522,7 +11850,206 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m114 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 115: real pointer arithmetic -- `p + n`, `n + p`, and
+        // `p - n` now genuinely scale the integer operand by the
+        // pointer's own pointee size (1 for `char *`, 8 for `int *` or a
+        // decayed array base) instead of doing a plain, meaningless
+        // raw-address-plus-raw-integer add, closing the exact gap
+        // Milestone 109's own original closing disclosure first named
+        // ("no pointer arithmetic") and every pointer/array milestone
+        // since (110-114) re-confirmed still open. See this file's own
+        // top Milestone 115 doc comment and `EXPR_BINARY`'s own inline
+        // Milestone 115 comment for the full derivation, and `VarSlot`'s
+        // new `is_int_ptr` field / `parse_pointer_decl()`'s updated doc
+        // comment for why an `int *` variable -- unlike `char *` -- had
+        // no signal at all distinguishing it from a plain `int` before
+        // this milestone. All four cases run in-process
+        // (`CodegenMode::Callable`), the same tier Milestone 107 through
+        // 114 all already used for their own new cases -- no new real
+        // `fork()`/`exec()`/`wait()` cycle is added by this milestone.
+        //
+        // A note on WHICH addresses these cases hand-verify: this
+        // codegen's own stack frame grows toward LOWER addresses as
+        // MORE variables are declared (`collect_vars_rec()`'s own
+        // `off = -8 * (n+1)` rule, unchanged since Milestone 68 -- the
+        // Kth declared scalar lands at `rbp - 8*K`), so real,
+        // hardware-correct ADDRESS-INCREASING pointer addition (`p + 1`,
+        // this milestone's own new `add`/scaled-`shl` codegen, matching
+        // actual x86_64 semantics, not a compiler-specific reinterpretation
+        // of `+`) reaches whichever scalar was declared IMMEDIATELY
+        // BEFORE the pointer's own pointee in source order (a lower `K`,
+        // hence a real address `8` bytes ABOVE the pointee's own). CASE
+        // 110/111 rely on exactly this real, fully deterministic (though
+        // not something portable C itself guarantees between two
+        // UNRELATED scalars) property of THIS compiler's own declaration-
+        // order stack layout -- the same category of "real, disclosed,
+        // compiler-specific but fully reproducible" reliance this file's
+        // own array tests have used for arrays since Milestone 108, now
+        // applied to plain adjacent scalars for the first time. CASE 112
+        // deliberately uses a real declared ARRAY instead (a genuine,
+        // real-C-guaranteed contiguous layout) together with SUBTRACTION
+        // (`arr - n`) -- because this codegen's own array-element layout
+        // ALSO grows toward lower addresses as the index grows
+        // (`EXPR_INDEX`'s own Milestone 108 `off - 8*idx` rule), true,
+        // real, hardware-correct address-DEcreasing `p - n` is what
+        // lands on `arr[n]` here, not `p + n` -- a genuinely surprising,
+        // honestly disclosed consequence of this compiler's own
+        // downward-growing array convention, NOT a bug this milestone
+        // papers over by secretly making `+` subtract to "fix" the
+        // disagreement (that would make pointer arithmetic itself
+        // backwards relative to real address semantics, a strictly worse
+        // bug than the disclosed inconsistency between `arr +/- n` and
+        // `arr[n]`).
+        //
+        // CASE 110: the real, distinguishing proof that `p + n` (the
+        // pointer on the LEFT, the common real-C spelling, scaling
+        // happens on RCX via the pre-existing `emit_shl_rcx_imm8()`)
+        // genuinely scales an `int *` by 8, not 1: `y` is declared first
+        // (`rbp-8`), `x` second (`rbp-16`); `p = &x` (`rbp-16`); `p + 1`
+        // must reach `rbp-16 + 1*8 == rbp-8`, exactly `y`'s own slot. A
+        // pre-fix build (this milestone's own committed Milestone 114
+        // baseline, which has no scaling at all) would instead compute
+        // `rbp-16 + 1 == rbp-15`, an unaligned, real-but-wrong address
+        // one byte into the middle of `y`'s own slot -- not the clean
+        // `111` this case expects.
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *p; p = &x;
+        //       return *(p + 1) == 111;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC110: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *p; p = &x; return *(p + 1) == 111; }";
+        let case110_result = compile_and_run_program_callable(SRC110.as_ptr() as u64, SRC110.len() as u64);
+        w(b"  case110 (p + 1 through int* scales by 8, pointer on the left, in-process) returned=");
+        if let Some(r) = case110_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case110_ok = case110_result == Some(1);
+        write_check(b"case110_int_ptr_plus_scales_by_8_returns_1=", case110_ok);
+
+        w(b"\n");
+
+        // CASE 111: the real, distinguishing proof that `n + p` (the
+        // pointer on the RIGHT, real C's own commutative spelling --
+        // `1 + p` means exactly what `p + 1` means) ALSO scales
+        // correctly -- the genuinely distinct code path (scaling RAX via
+        // this milestone's own new `emit_shl_rax_imm8()`, not RCX) CASE
+        // 110 alone does not exercise: a bug that scaled only the
+        // pointer-on-the-left shape (e.g. an implementation that always
+        // scaled RCX regardless of which side the pointer classified as)
+        // would still pass CASE 110 but fail here, since RCX holds `p`'s
+        // OWN value in this operand order, not the integer `1` -- scaling
+        // it would corrupt the pointer itself rather than the offset.
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *p; p = &x;
+        //       return *(1 + p) == 111;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC111: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *p; p = &x; return *(1 + p) == 111; }";
+        let case111_result = compile_and_run_program_callable(SRC111.as_ptr() as u64, SRC111.len() as u64);
+        w(b"  case111 (1 + p through int* scales by 8, pointer on the right, exercises the new emit_shl_rax_imm8, in-process) returned=");
+        if let Some(r) = case111_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case111_ok = case111_result == Some(1);
+        write_check(b"case111_int_plus_ptr_scales_by_8_returns_1=", case111_ok);
+
+        w(b"\n");
+
+        // CASE 112: the real, distinguishing proof that a decayed ARRAY
+        // base (`is_array`, not `is_int_ptr`) ALSO scales by 8 through
+        // `-` specifically -- a genuinely separate `ptr_operand_scale()`
+        // classification branch from CASE 110/111's `int *` VARIABLE, and
+        // the real, honestly-disclosed "subtraction, not addition, reaches
+        // arr[n] here" consequence of this compiler's own downward-growing
+        // array layout (see this milestone's own top note above): `arr`
+        // decays to `&arr[0]`; `arr - 1` must reach `arr[1]`'s own real
+        // address (`&arr[0] - 8`, this compiler's own layout, NOT real
+        // C's usual "addresses increase with index" convention) and
+        // `arr - 2` must reach `arr[2]`'s.
+        //   int main() {
+        //       int arr[3];
+        //       arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        //       return (*(arr - 1) == 2) + (*(arr - 2) == 3) * 10;
+        //   }
+        // Hand-computed: 1 + 10 = 11.
+        // -------------------------------------------------------------
+        const SRC112: &[u8] = b"int main() { int arr[3]; arr[0] = 1; arr[1] = 2; arr[2] = 3; return (*(arr - 1) == 2) + (*(arr - 2) == 3) * 10; }";
+        let case112_result = compile_and_run_program_callable(SRC112.as_ptr() as u64, SRC112.len() as u64);
+        w(b"  case112 (decayed array base scales by 8 through `-`, reaching arr[1]/arr[2], in-process) returned=");
+        if let Some(r) = case112_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case112_ok = case112_result == Some(11);
+        write_check(b"case112_array_minus_scales_by_8_returns_11=", case112_ok);
+
+        w(b"\n");
+
+        // CASE 113: the real, distinguishing proof that a `char *`
+        // scales by 1, NOT 8, through `+` -- `d` declared first
+        // (`rbp-8`), `c` second (`rbp-16`); `cp = &c` (`rbp-16`); `cp + 8`
+        // (byte-scaled: `is_char_ptr` skips the `shl` entirely, per
+        // `ptr_operand_scale()`'s own `Some(1)` case) must land EXACTLY on
+        // `rbp-16 + 8 == rbp-8`, `d`'s own slot -- a real, decisive
+        // regression tripwire: if `char *` arithmetic were WRONGLY
+        // 8-scaled (treated like `int *`), `cp + 8` would instead compute
+        // `rbp-16 + 64 == rbp+48`, real stack memory that belongs to
+        // neither `d` nor `c` at all. A second, real, disclosed
+        // observation this same case proves with an actual number rather
+        // than mere prose: `*(cp + 8)` does NOT narrow to a signed byte
+        // (it reads back the full, un-narrowed `200`, not `-56`) --
+        // `cp + 8` is a real `EXPR_BINARY`, not the plain `EXPR_IDENT`
+        // shape `OP_DEREF`'s own Milestone 112 narrowing check requires,
+        // the exact same "resolved by operand SHAPE" restriction Milestone
+        // 113's own CASE 106 already proved for a `char *`-returning call
+        // result -- this milestone makes it newly reachable through
+        // pointer arithmetic too, and does not attempt to close it.
+        //   int main() {
+        //       char d; char c;
+        //       d = 200; c = 3;
+        //       char *cp; cp = &c;
+        //       return *(cp + 8) == 200;
+        //   }
+        // Hand-computed: 1 (the comparison is against the real, disclosed
+        // UN-narrowed value 200, not the morally "narrowed" -56).
+        // -------------------------------------------------------------
+        const SRC113: &[u8] = b"int main() { char d; char c; d = 200; c = 3; char *cp; cp = &c; return *(cp + 8) == 200; }";
+        let case113_result = compile_and_run_program_callable(SRC113.as_ptr() as u64, SRC113.len() as u64);
+        w(b"  case113 (char* pointer arithmetic scales by 1, and the result stays un-narrowed through +, in-process) returned=");
+        if let Some(r) = case113_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case113_ok = case113_result == Some(1);
+        write_check(b"case113_char_ptr_plus_scales_by_1_unnarrowed_returns_1=", case113_ok);
+
+        w(b"\n");
+
+        let overall_m115 = case110_ok && case111_ok && case112_ok && case113_ok;
+        w(b"OVERALL_M115=");
+        w(if overall_m115 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 { 0 } else { 1 });
     }
 }
 

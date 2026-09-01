@@ -749,6 +749,45 @@
 // `switch`/`goto`; the compiler self-test still leaks per-compile
 // (bounded, not fixed); one 4 KiB stack page per process.
 //
+// MILESTONE 91 adds `switch` / `case` / `default` --
+//   switch_stmt := "switch" "(" ternary ")" "{"
+//                    ("case" INTLIT ":" stmt*)* ("default" ":" stmt*)? "}"
+// -- with real C fall-through, `break` (jumps to the switch end, not
+// out of an enclosing loop), and an optional single `default`. The
+// discriminant is evaluated ONCE and spilled to a reserved
+// switch-scratch frame slot (`rbp - (nvars+1)*8`; every function's
+// frame now carries one extra slot -- 8 wasted bytes for a switch-free
+// function, disclosed). Dispatch is a linear `cmp rax, imm32; jz body`
+// per case (one new CodeBuf encoding, `emit_cmp_rax_imm32`); no match
+// jumps to `default` (or the end). Case bodies are emitted in source
+// order and fall through into each other and into `default`.
+// `gen_stmt_list` gains a `break_ok` value parameter (true inside a
+// loop body OR a switch case body); `break` now checks it instead of
+// `loop_top`. `break`'s placeholders reuse Milestone 87's `LOOP_BRK`
+// arena with the same per-scope save/restore, so a switch nested in a
+// loop (or vice versa) resolves each `break`/`continue` to the right
+// target. `collect_vars` learns to walk STMT_SWITCH/STMT_CASE bodies.
+//
+// Real, disclosed scope cuts: case labels are bare INTLITs (not
+// constant expressions), fitting in 32 bits (sign-extended); `default`
+// is always lowered as the LAST label (its body emitted after every
+// `case` body, and the no-match jump targets it), so a `default`
+// written textually in the MIDDLE of a switch does not fall through
+// from the preceding case the way a C compiler would -- put `default`
+// last, or give it a `break`. No duplicate-label check. No `switch` on
+// a non-`int` (this subset has only `int` anyway).
+//
+// Two new self-test cases: CASE 56 (in-process -- a match that falls
+// through into the next case, a `break`, a `default` not taken -> 25)
+// and CASE 57 (real on-disk-ELF -- a `switch` inside a `for`, proving
+// the switch `break` does not escape the loop and `default` runs on a
+// no-match -> 131).
+//
+// Still genuinely open after Milestone 91: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); no arrays/pointers, no additional C types; no `goto`; the
+// compiler self-test still leaks per-compile (bounded, not fixed); one
+// 4 KiB stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -941,6 +980,13 @@ const TOK_PERCENTEQ: u8 = 47; // "%="
 // encodings). `:` has no other use in this subset.
 const TOK_QUESTION: u8 = 48; // "?"
 const TOK_COLON: u8 = 49;    // ":"
+// MILESTONE 91: `switch` / `case` / `default`. Integer case labels only
+// (an INTLIT, not a constant expression), C fall-through, `break` jumps
+// to the switch end, optional single `default`. The discriminant is
+// evaluated ONCE and spilled to a reserved frame slot.
+const TOK_SWITCH: u8 = 50;  // keyword "switch"
+const TOK_CASE: u8 = 51;    // keyword "case"
+const TOK_DEFAULT: u8 = 52; // keyword "default"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1035,6 +1081,12 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             } else if unsafe { word_is(src_ptr, start, wlen, b"continue") } {
                 // MILESTONE 87
                 TOK_CONTINUE
+            } else if unsafe { word_is(src_ptr, start, wlen, b"switch") } {
+                TOK_SWITCH // MILESTONE 91
+            } else if unsafe { word_is(src_ptr, start, wlen, b"case") } {
+                TOK_CASE // MILESTONE 91
+            } else if unsafe { word_is(src_ptr, start, wlen, b"default") } {
+                TOK_DEFAULT // MILESTONE 91
             } else {
                 TOK_IDENT
             };
@@ -1314,6 +1366,8 @@ const STMT_IF: u8 = 4; // MILESTONE 70
 const STMT_WHILE: u8 = 5; // MILESTONE 71
 const STMT_BREAK: u8 = 6; // MILESTONE 87
 const STMT_CONTINUE: u8 = 7; // MILESTONE 87
+const STMT_SWITCH: u8 = 8; // MILESTONE 91: expr = discriminant, then_body = chain of STMT_CASE, else_body = the `default` body list (0 if none)
+const STMT_CASE: u8 = 9; // MILESTONE 91: one `case INTLIT:` -- expr = an EXPR_INTLIT for the label value, then_body = this case's own stmt list, next = the following STMT_CASE
 
 #[repr(C)]
 struct StmtNode {
@@ -2343,8 +2397,111 @@ impl Parser {
                 };
                 Ok(node)
             }
+            // MILESTONE 91: `switch "(" ternary ")" "{"
+            //   ("case" INTLIT ":" stmt*)* ("default" ":" stmt*)? "}"`.
+            // Builds a STMT_SWITCH whose `then_body` is a chain of
+            // STMT_CASE nodes (each carrying an EXPR_INTLIT label value
+            // and its own stmt list) and whose `else_body` is the
+            // `default` list (0 if absent). Fall-through, `break`, and
+            // the "discriminant evaluated once" guarantee are all
+            // codegen-side (STMT_SWITCH in gen_stmt_list).
+            TOK_SWITCH => {
+                unsafe { self.advance() };
+                unsafe { self.expect(TOK_LPAREN) }?;
+                let disc = unsafe { self.parse_ternary() }?;
+                unsafe { self.expect(TOK_RPAREN) }?;
+                unsafe { self.expect(TOK_LBRACE) }?;
+                let mut cases_head: u64 = 0;
+                let mut cases_tail: u64 = 0;
+                let mut default_body: u64 = 0;
+                loop {
+                    let k = unsafe { self.peek() }.kind;
+                    if k == TOK_RBRACE {
+                        break;
+                    }
+                    if k == TOK_CASE {
+                        unsafe { self.advance() };
+                        let val_tok = unsafe { self.expect(TOK_INTLIT) }?;
+                        unsafe { self.expect(TOK_COLON) }?;
+                        let label = unsafe { alloc_expr() };
+                        if label == 0 {
+                            return Err(ParseError::OutOfMemory);
+                        }
+                        unsafe {
+                            core::ptr::write(
+                                label as *mut ExprNode,
+                                ExprNode { kind: EXPR_INTLIT, int_val: val_tok.int_val, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+                            )
+                        };
+                        let body = unsafe { self.parse_case_body() }?;
+                        let cnode = unsafe { alloc_stmt() };
+                        if cnode == 0 {
+                            return Err(ParseError::OutOfMemory);
+                        }
+                        unsafe {
+                            core::ptr::write(
+                                cnode as *mut StmtNode,
+                                StmtNode { kind: STMT_CASE, ident_off: 0, ident_len: 0, expr: label, next: 0, then_body: body, else_body: 0 },
+                            )
+                        };
+                        if cases_head == 0 {
+                            cases_head = cnode;
+                        } else {
+                            unsafe { (*(cases_tail as *mut StmtNode)).next = cnode };
+                        }
+                        cases_tail = cnode;
+                    } else if k == TOK_DEFAULT {
+                        unsafe { self.advance() };
+                        unsafe { self.expect(TOK_COLON) }?;
+                        default_body = unsafe { self.parse_case_body() }?;
+                    } else {
+                        return Err(ParseError::UnexpectedToken(self.pos));
+                    }
+                }
+                unsafe { self.expect(TOK_RBRACE) }?;
+                let node = unsafe { alloc_stmt() };
+                if node == 0 {
+                    return Err(ParseError::OutOfMemory);
+                }
+                unsafe {
+                    core::ptr::write(
+                        node as *mut StmtNode,
+                        StmtNode { kind: STMT_SWITCH, ident_off: 0, ident_len: 0, expr: disc, next: 0, then_body: cases_head, else_body: default_body },
+                    )
+                };
+                Ok(node)
+            }
             _ => Err(ParseError::UnexpectedToken(self.pos)),
         }
+    }
+
+    /// MILESTONE 91: parse statements until (but not consuming) the next
+    /// `case`, `default`, or `}` -- the body of one `case`/`default`
+    /// label inside a `switch`. Same chain-tail bookkeeping as
+    /// parse_stmt_list_until_rbrace().
+    unsafe fn parse_case_body(&mut self) -> Result<u64, ParseError> {
+        let mut head: u64 = 0;
+        let mut tail: u64 = 0;
+        loop {
+            let k = unsafe { self.peek() }.kind;
+            if k == TOK_RBRACE || k == TOK_CASE || k == TOK_DEFAULT {
+                break;
+            }
+            if k == TOK_EOF {
+                return Err(ParseError::UnexpectedToken(self.pos));
+            }
+            let stmt = unsafe { self.parse_stmt() }?;
+            if head == 0 {
+                head = stmt;
+            } else {
+                unsafe { (*(tail as *mut StmtNode)).next = stmt };
+            }
+            tail = stmt;
+            while unsafe { (*(tail as *const StmtNode)).next } != 0 {
+                tail = unsafe { (*(tail as *const StmtNode)).next };
+            }
+        }
+        Ok(head)
     }
 
     /// MILESTONE 70: real, shared "parse statements until the closing
@@ -2765,6 +2922,14 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // keeping it symmetric with STMT_IF is correct, not lucky.
             unsafe { collect_vars_rec(s.then_body, vars_ptr, n) }?;
             unsafe { collect_vars_rec(s.else_body, vars_ptr, n) }?;
+        } else if s.kind == STMT_SWITCH {
+            // MILESTONE 91: `then_body` is a chain of STMT_CASE nodes
+            // (handled just below), `else_body` is the `default` list.
+            unsafe { collect_vars_rec(s.then_body, vars_ptr, n) }?;
+            unsafe { collect_vars_rec(s.else_body, vars_ptr, n) }?;
+        } else if s.kind == STMT_CASE {
+            // MILESTONE 91: one `case`'s own stmt list.
+            unsafe { collect_vars_rec(s.then_body, vars_ptr, n) }?;
         }
         cur = s.next;
     }
@@ -2961,6 +3126,16 @@ impl CodeBuf {
     }
     unsafe fn emit_sub_rax_rcx(&mut self) {
         unsafe { self.push_bytes(&[0x48, 0x29, 0xC8]) }; // sub rax, rcx
+    }
+    /// MILESTONE 91: `cmp rax, imm32` -- `48 3D <imm32>` (the special
+    /// short-form `cmp RAX/EAX, imm`, no ModRM). The imm32 is
+    /// SIGN-EXTENDED to 64 bits, which is exactly right for this
+    /// subset's signed-`int` case labels. Used only by STMT_SWITCH's
+    /// dispatch to test the spilled discriminant against each `case`
+    /// value without needing a scratch register.
+    unsafe fn emit_cmp_rax_imm32(&mut self, v: u32) {
+        unsafe { self.push_bytes(&[0x48, 0x3D]) };
+        unsafe { self.push_bytes(&v.to_le_bytes()) };
     }
     // MILESTONE 79: real bitwise-operator encodings -- AND/OR/XOR r/m64,
     // r64 are the SAME opcode family as ADD(0x01)/SUB(0x29)/CMP(0x39)
@@ -3783,6 +3958,11 @@ unsafe fn gen_stmt_list(
     // stack/heap.
     loop_top: u64,
     loop_is_for: u64,
+    // MILESTONE 91: 1 if a `break` is legal in this list -- true inside
+    // a loop body (as before) OR inside a `switch`'s case bodies.
+    // `continue` still checks `loop_top` (loops only). Threaded through
+    // STMT_IF like the loop fields; set by STMT_WHILE and STMT_SWITCH.
+    break_ok: u64,
 ) -> Result<(), CodeGenError> {
     let mut cur = head;
     while cur != 0 {
@@ -3807,7 +3987,7 @@ unsafe fn gen_stmt_list(
             // exit address is known). Outside any loop -> a real semantic
             // error, the same shape as UndeclaredVariable.
             STMT_BREAK => {
-                if loop_top == NOT_IN_LOOP {
+                if break_ok == 0 {
                     return Err(CodeGenError::BreakOutsideLoop);
                 }
                 let field = unsafe { buf.emit_jmp_placeholder() };
@@ -3837,11 +4017,11 @@ unsafe fn gen_stmt_list(
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 unsafe { buf.emit_test_rax_rax() };
                 let jz_field = unsafe { buf.emit_jz_placeholder() };
-                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, loop_top, loop_is_for) }?;
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, loop_top, loop_is_for, break_ok) }?;
                 if s.else_body != 0 {
                     let jmp_field = unsafe { buf.emit_jmp_placeholder() };
                     unsafe { buf.patch_rel32(jz_field) };
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for) }?;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for, break_ok) }?;
                     unsafe { buf.patch_rel32(jmp_field) };
                 } else {
                     unsafe { buf.patch_rel32(jz_field) };
@@ -3886,7 +4066,7 @@ unsafe fn gen_stmt_list(
                 let brk_base = unsafe { loop_brk_n() };
                 let cont_base = unsafe { loop_cont_n() };
 
-                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, my_top, my_is_for) }?;
+                unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.then_body, my_top, my_is_for, 1) }?;
 
                 if my_is_for != 0 {
                     // `continue`'s forward-jump target is HERE, right
@@ -3898,13 +4078,93 @@ unsafe fn gen_stmt_list(
                         i += 1;
                     }
                     unsafe { loop_set_cont_n(cont_base) };
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, NOT_IN_LOOP, 0) }?;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, NOT_IN_LOOP, 0, 0) }?;
                 }
 
                 unsafe { buf.emit_jmp_back(my_top) };
 
                 // exit: the `jz` (condition false) and every `break` land here.
                 unsafe { buf.patch_rel32(jz_field) };
+                let bn = unsafe { loop_brk_n() };
+                let mut j = brk_base;
+                while j < bn {
+                    unsafe { buf.patch_rel32(loop_brk_at(j)) };
+                    j += 1;
+                }
+                unsafe { loop_set_brk_n(brk_base) };
+            }
+            // MILESTONE 91: `switch`. Real C lowering, discriminant
+            // evaluated ONCE:
+            //   <discriminant>              (into RAX)
+            //   mov [rbp - (nvars+1)*8], rax     (spill to the reserved
+            //                                     switch-scratch slot)
+            //   -- dispatch: for each case Ci --
+            //   mov rax, [scratch]
+            //   cmp rax, Ci
+            //   jz body_i                   (forward-patched)
+            //   ...
+            //   jmp default  (or jmp end, if no default)   (fwd-patched)
+            //   -- bodies, in source order, FALL THROUGH --
+            // body_0:  <case 0 stmts>       (no jmp at the end: falls into body_1)
+            // body_1:  <case 1 stmts>
+            //   ...
+            // default: <default stmts>      (only if present)
+            // end:                          <- every `break` jumps here
+            // `break` inside a case body reaches `end` through the same
+            // LOOP_BRK arena + save/restore STMT_WHILE uses; `continue`
+            // is untouched (still targets the enclosing loop via
+            // `loop_top`, passed straight through).
+            STMT_SWITCH => {
+                let scratch_off: i32 = -((nvars + 1) as i32) * 8;
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
+                unsafe { buf.emit_mov_rbp_off_rax(scratch_off) };
+
+                let brk_base = unsafe { loop_brk_n() };
+
+                // First pass over the STMT_CASE chain: emit the compares,
+                // collecting one jz-placeholder field per case (kept in
+                // the LOOP_CONT arena, which is otherwise unused here --
+                // save/restore its count too so a `for`'s pending
+                // continues, if this switch sits in a for body, are
+                // untouched).
+                let cont_base = unsafe { loop_cont_n() };
+                let mut c = s.then_body;
+                while c != 0 {
+                    let cn = unsafe { core::ptr::read(c as *const StmtNode) };
+                    let label = unsafe { core::ptr::read(cn.expr as *const ExprNode) };
+                    unsafe { buf.emit_mov_rax_rbp_off(scratch_off) };
+                    unsafe { buf.emit_cmp_rax_imm32(label.int_val as u32) };
+                    let jz = unsafe { buf.emit_jz_placeholder() };
+                    unsafe { loop_push_cont(jz) }?;
+                    c = cn.next;
+                }
+                // No case matched -> jump to default (or end).
+                let miss_jmp = unsafe { buf.emit_jmp_placeholder() };
+
+                // Second pass: emit each case body, patching its own jz
+                // to the body's start. Bodies fall through (no jmp
+                // between them) -- real C switch semantics.
+                let mut idx = cont_base;
+                let mut c2 = s.then_body;
+                while c2 != 0 {
+                    let cn = unsafe { core::ptr::read(c2 as *const StmtNode) };
+                    unsafe { buf.patch_rel32(loop_cont_at(idx)) };
+                    idx += 1;
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, cn.then_body, loop_top, loop_is_for, 1) }?;
+                    c2 = cn.next;
+                }
+                unsafe { loop_set_cont_n(cont_base) };
+
+                // Default body (if any) -- the no-match jump lands at
+                // its start; otherwise it lands at `end` below.
+                if s.else_body != 0 {
+                    unsafe { buf.patch_rel32(miss_jmp) };
+                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for, 1) }?;
+                } else {
+                    unsafe { buf.patch_rel32(miss_jmp) };
+                }
+
+                // `end`: patch every `break` this switch's bodies recorded.
                 let bn = unsafe { loop_brk_n() };
                 let mut j = brk_base;
                 while j < bn {
@@ -3925,7 +4185,10 @@ unsafe fn gen_function(src_ptr: u64, func: u64, mode: CodegenMode) -> Result<Cod
 
     let vars_ptr = unsafe { malloc(MAX_VARS * core::mem::size_of::<VarSlot>() as u64) };
     let nvars = unsafe { collect_vars(f.body, vars_ptr) }?;
-    let raw_frame = nvars * 8;
+    // MILESTONE 91: +1 slot, always, for STMT_SWITCH to spill its
+    // discriminant into (rbp - (nvars+1)*8). 8 wasted bytes for a
+    // switch-free function -- negligible, and avoids an extra AST walk.
+    let raw_frame = (nvars + 1) * 8;
     let frame_bytes = if raw_frame == 0 { 0u8 } else { (((raw_frame + 15) / 16) * 16) as u8 };
 
     // MILESTONE 70: bumped from Milestone 68's original 512 to 1024 --
@@ -3947,7 +4210,7 @@ unsafe fn gen_function(src_ptr: u64, func: u64, mode: CodegenMode) -> Result<Cod
     // empty function table can never reach the EXPR_CALL arm that would
     // dereference them.
     unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
-    unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, 0, 0, 0, 0, mode, f.body, NOT_IN_LOOP, 0) }?;
+    unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, 0, 0, 0, 0, mode, f.body, NOT_IN_LOOP, 0, 0) }?;
 
     // Safety backstop -- see this function's own doc comment above.
     unsafe { emit_epilogue(&mut buf, mode) };
@@ -4129,7 +4392,10 @@ unsafe fn gen_program(src_ptr: u64, prog_head: u64, mode: CodegenMode) -> Result
 
         let vars_ptr = unsafe { malloc(MAX_VARS * core::mem::size_of::<VarSlot>() as u64) };
         let nvars = unsafe { collect_vars_for_function(&f, vars_ptr) }?;
-        let raw_frame = nvars * 8;
+        // MILESTONE 91: +1 slot, always, for STMT_SWITCH to spill its
+    // discriminant into (rbp - (nvars+1)*8). 8 wasted bytes for a
+    // switch-free function -- negligible, and avoids an extra AST walk.
+    let raw_frame = (nvars + 1) * 8;
         let frame_bytes = if raw_frame == 0 { 0u8 } else { (((raw_frame + 15) / 16) * 16) as u8 };
 
         unsafe { buf.emit_prologue(frame_bytes) };
@@ -4148,7 +4414,7 @@ unsafe fn gen_program(src_ptr: u64, prog_head: u64, mode: CodegenMode) -> Result
         }
 
         unsafe { loop_reset() }; // MILESTONE 87: fresh break/continue arena per function
-        unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs_total, pending_ptr, pending_count_ptr, this_fn_mode, f.body, NOT_IN_LOOP, 0) }?;
+        unsafe { gen_stmt_list(&mut buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs_total, pending_ptr, pending_count_ptr, this_fn_mode, f.body, NOT_IN_LOOP, 0, 0) }?;
 
         // Safety backstop -- same real reasoning as gen_function()'s own
         // trailing epilogue above, per-function here.
@@ -6676,7 +6942,83 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m90 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 91: `switch` / `case` / `default`.
+        //
+        // CASE 56 (in-process Callable path): a match that FALLS THROUGH
+        // into the next case, a `break`, a `+=` in a case body, and a
+        // `default` that is not taken.
+        //   int main() {
+        //       int x = 2;
+        //       int r = 0;
+        //       switch (x) {
+        //           case 1: r = 10; break;
+        //           case 2: r = 20;           // no break -> falls through
+        //           case 3: r += 5; break;
+        //           default: r = 99;
+        //       }
+        //       return r;
+        //   }
+        // Hand-computed: x == 2 -> r = 20, fall into case 3 -> r += 5 ->
+        // 25, break. return 25.
+        // -------------------------------------------------------------
+        const SRC56: &[u8] = b"int main() { int x = 2; int r = 0; switch (x) { case 1: r = 10; break; case 2: r = 20; case 3: r += 5; break; default: r = 99; } return r; }";
+        let case56_result = compile_and_run_program_callable(SRC56.as_ptr() as u64, SRC56.len() as u64);
+        w(b"  case56 (switch: match, fall-through, break, in-process) returned=");
+        if let Some(r) = case56_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 25)\n");
+        let case56_ok = case56_result == Some(25);
+        write_check(b"case56_switch_fallthrough_and_break_returns_25=", case56_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 57 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier): a `switch` INSIDE a `for` loop.
+        // Proves the switch's own `break` jumps to the switch end and
+        // does NOT escape the enclosing loop, that `default` runs on a
+        // no-match, and that the loop keeps iterating after each switch.
+        //   int main() {
+        //       int total = 0;
+        //       int i = 0;
+        //       for (i = 0; i < 6; i += 1) {
+        //           switch (i) {
+        //               case 0: total += 1; break;
+        //               case 3: total += 10; break;
+        //               default: total += 30;
+        //           }
+        //       }
+        //       return total;
+        //   }
+        // Hand-computed: i=0 -> +1 (=1); i=1 -> default +30 (=31); i=2
+        // -> +30 (=61); i=3 -> +10 (=71); i=4 -> +30 (=101); i=5 -> +30
+        // (=131). return 131. If the switch's `break` broke the loop,
+        // total would be 1; if `default` never ran, it would be 11.
+        // -------------------------------------------------------------
+        const SRC57: &[u8] =
+            b"int main() { int total = 0; int i = 0; for (i = 0; i < 6; i += 1) { switch (i) { case 0: total += 1; break; case 3: total += 10; break; default: total += 30; } } return total; }";
+        const PATH57: &[u8] = PATH8;
+        let (elf57_ptr, elf57_len) = compile_program_standalone_elf(SRC57.as_ptr() as u64, SRC57.len() as u64);
+        let case57_ok = if elf57_ptr == 0 {
+            w(b"  case57 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH57, elf57_ptr, elf57_len, 131)
+        };
+        write_check(b"case57_real_elf_exec_switch_in_for_returns_131=", case57_ok);
+
+        w(b"\n");
+
+        let overall_m91 = case56_ok && case57_ok;
+        w(b"OVERALL_M91=");
+        w(if overall_m91 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 { 0 } else { 1 });
     }
 }
 

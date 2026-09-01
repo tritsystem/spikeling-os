@@ -6340,6 +6340,50 @@ self-test suite, genuinely open for a future pass.
       compiler self-test still leaks per-compile (bounded, not fixed);
       one 4 KiB stack page per process.
 
+- [x] **Milestone 91**: `switch` / `case` / `default` in the
+      self-hosted subset-C compiler --
+      `switch "(" ternary ")" "{" ("case" INTLIT ":" stmt*)* ("default"
+      ":" stmt*)? "}"` -- with real C fall-through, `break` (jumps to
+      the switch end, *not* out of an enclosing loop), and an optional
+      single `default`.
+
+      The discriminant is evaluated **once** and spilled to a reserved
+      switch-scratch frame slot (`rbp - (nvars+1)*8`; every function's
+      frame now carries one extra slot). Dispatch is a linear
+      `cmp rax, imm32; jz body` per case (one new CodeBuf encoding,
+      `emit_cmp_rax_imm32`); no match jumps to `default`, or the end.
+      Case bodies are emitted in source order and fall through into each
+      other and into `default`. `gen_stmt_list` gains a `break_ok` value
+      parameter (true inside a loop body *or* a switch case body);
+      `break` checks it instead of `loop_top`, and its jump placeholders
+      reuse Milestone 87's `LOOP_BRK` arena with the same per-scope
+      save/restore, so a `switch` nested in a loop (or vice versa)
+      resolves each `break`/`continue` to the right target.
+      `collect_vars` learns to walk `STMT_SWITCH`/`STMT_CASE` bodies.
+
+      **Disclosed scope cuts**: case labels are bare `INTLIT`s (not
+      constant expressions), fitting in 32 bits; `default` is always
+      lowered as the *last* label, so a `default` written textually in
+      the middle of a switch does not fall through from the preceding
+      case the way a C compiler would -- put it last or give it a
+      `break`. No duplicate-label check.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`), no
+      warnings. Two QEMU boots, fresh then reused. CASE 56 (in-process
+      -- a match that falls through into the next case, a `break`, a
+      `default` not taken) returns `25`; CASE 57 (real on-disk-ELF +
+      kernel `exec()`+`wait()` -- a `switch` inside a `for`, proving the
+      switch `break` does not escape the loop and `default` runs on a
+      no-match) returns `131`. Both boots. `OVERALL_M91=PASS`,
+      `OVERALL_M68`..`M90` all still PASS, `milestone 64`/`65`/
+      `stdiotest` all still PASS, fresh vs. reused OVERALL markers
+      byte-identical. No regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); no
+      arrays/pointers, no additional C types; no `goto`; the compiler
+      self-test still leaks per-compile (bounded, not fixed); one 4 KiB
+      stack page per process.
+
 ## Building and running
 
 Requires:

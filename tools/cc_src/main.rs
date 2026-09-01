@@ -689,6 +689,28 @@
 // additional C types; no `switch`/`goto`; one 4 KiB stack page per
 // process.
 //
+// MILESTONE 88 adds the combined declaration-with-initializer,
+// `int IDENT ("=" logic_or)? ";"`, and the same in a `for` init clause
+// (`for (int i = 0; ...)`, the one shape Milestone 86's `for` could not
+// express). `int i = e;` is DESUGARED at parse time to `int i;`
+// immediately followed by `i = e;` -- a two-node chain (STMT_DECL ->
+// STMT_ASSIGN), which `parse_stmt_list_until_rbrace()` already handles
+// since Milestone 86 walks to a chain's real tail. ZERO new codegen,
+// zero new AST kinds: STMT_DECL is unchanged (still what `collect_vars`
+// counts) and the synthesized STMT_ASSIGN takes the exact
+// `finish_ident_assign()` path a plain `i = e;` already takes. Only a
+// plain `=` starts an initializer -- a compound op after `int i` reads
+// an uninitialized variable and is left to fall through as a parse
+// error. Two new self-test cases: CASE 50 (in-process -- two
+// initializers, the second referencing the first -> 80) and CASE 51
+// (real on-disk-ELF -- `for (int i = 1; i <= 5; i += 1) s += i` -> 15).
+//
+// Still genuinely open after Milestone 88: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); no arrays/pointers, no additional C types; no
+// `switch`/`goto`; the compiler self-test still leaks per-compile
+// (bounded by `heap_reset()` since Milestone 87, not fixed); one 4 KiB
+// stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -1924,6 +1946,35 @@ impl Parser {
         Ok(left)
     }
 
+    /// MILESTONE 88: build a STMT_DECL for `name`, and -- if the next
+    /// token is `=` -- a combined initializer, desugared to a
+    /// STMT_ASSIGN chained right after the decl (`decl.next = assign`).
+    /// Returns the decl (the head of the chain). `consume_semi` is true
+    /// at statement level (`int i = e;` ends in `;`), false for a `for`
+    /// init clause (the `for` parser consumes the `;`). Only plain `=`
+    /// starts an initializer -- a compound op after `int i` would be
+    /// reading an uninitialized variable, so it is left to fall through
+    /// as a parse error rather than silently accepted.
+    unsafe fn make_decl(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
+        let decl = unsafe { alloc_stmt() };
+        if decl == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                decl as *mut StmtNode,
+                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+            )
+        };
+        if unsafe { self.peek() }.kind == TOK_ASSIGN {
+            let assign = unsafe { self.finish_ident_assign(name, consume_semi) }?;
+            unsafe { (*(decl as *mut StmtNode)).next = assign };
+        } else if consume_semi {
+            unsafe { self.expect(TOK_SEMI) }?;
+        }
+        Ok(decl)
+    }
+
     /// MILESTONE 84 logic, extracted at MILESTONE 86 so `for`'s init and
     /// step clauses can reuse it. `name` is the already-consumed IDENT;
     /// the next token is `=` or one of the nine compound-assignment
@@ -1996,28 +2047,19 @@ impl Parser {
         let t = unsafe { self.peek() };
         match t.kind {
             TOK_INT => {
+                // MILESTONE 88: `int IDENT ("=" logic_or)? ";"` -- a
+                // combined declaration-with-initializer. `int i = e;` is
+                // desugared to `int i;` immediately followed by `i = e;`
+                // (a two-node chain -- parse_stmt_list_until_rbrace()
+                // already walks to a chain's real tail since Milestone
+                // 86). No new codegen, no new AST kind: STMT_DECL is
+                // unchanged (still what collect_vars() counts), and the
+                // synthesized STMT_ASSIGN uses the exact
+                // finish_ident_assign() path a plain `i = e;` already
+                // takes.
                 unsafe { self.advance() };
                 let name = unsafe { self.expect(TOK_IDENT) }?;
-                unsafe { self.expect(TOK_SEMI) }?;
-                let node = unsafe { alloc_stmt() };
-                if node == 0 {
-                    return Err(ParseError::OutOfMemory);
-                }
-                unsafe {
-                    core::ptr::write(
-                        node as *mut StmtNode,
-                        StmtNode {
-                            kind: STMT_DECL,
-                            ident_off: name.ident_off,
-                            ident_len: name.ident_len,
-                            expr: 0,
-                            next: 0,
-                            then_body: 0,
-                            else_body: 0,
-                        },
-                    )
-                };
-                Ok(node)
+                unsafe { self.make_decl(name, true) }
             }
             TOK_RETURN => {
                 unsafe { self.advance() };
@@ -2058,6 +2100,13 @@ impl Parser {
                 // init (optional)
                 let init: u64 = if unsafe { self.peek() }.kind == TOK_SEMI {
                     0
+                } else if unsafe { self.peek() }.kind == TOK_INT {
+                    // MILESTONE 88: `for (int i = 0; ...)` -- a combined
+                    // decl-init as the init clause, same desugar
+                    // (`int i;` then `i = 0;`) as at statement level.
+                    unsafe { self.advance() };
+                    let n = unsafe { self.expect(TOK_IDENT) }?;
+                    unsafe { self.make_decl(n, false) }?
                 } else {
                     let n = unsafe { self.expect(TOK_IDENT) }?;
                     unsafe { self.finish_ident_assign(n, false) }?
@@ -2112,7 +2161,14 @@ impl Parser {
                 if init == 0 {
                     Ok(while_node)
                 } else {
-                    unsafe { (*(init as *mut StmtNode)).next = while_node };
+                    // MILESTONE 88: `init` may be a two-node chain now
+                    // (`int i;` -> `i = 0;`), so link the while after its
+                    // real tail, not its head.
+                    let mut t = init;
+                    while unsafe { (*(t as *const StmtNode)).next } != 0 {
+                        t = unsafe { (*(t as *const StmtNode)).next };
+                    }
+                    unsafe { (*(t as *mut StmtNode)).next = while_node };
                     Ok(init)
                 }
             }
@@ -6307,7 +6363,67 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m87 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 88: combined declaration-with-initializer,
+        // `int i = e;` (desugared to `int i;` then `i = e;`).
+        //
+        // CASE 50 (in-process Callable path): two initializers, the
+        // second referencing the first, plus a real expression in each.
+        //   int main() {
+        //       int x = 40 + 2;
+        //       int y = x * 2;
+        //       return y - 4;
+        //   }
+        // Hand-computed: x = 42, y = 84, return 80.
+        // -------------------------------------------------------------
+        const SRC50: &[u8] = b"int main() { int x = 40 + 2; int y = x * 2; return y - 4; }";
+        let case50_result = compile_and_run_program_callable(SRC50.as_ptr() as u64, SRC50.len() as u64);
+        w(b"  case50 (decl-with-initializer, in-process) returned=");
+        if let Some(r) = case50_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 80)\n");
+        let case50_ok = case50_result == Some(80);
+        write_check(b"case50_decl_with_initializer_returns_80=", case50_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 51 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier): a combined decl-init as the `for`
+        // loop's OWN init clause -- `for (int i = 1; ...)`, the shape
+        // Milestone 86's `for` could not express (its init was an
+        // assignment to an already-declared variable).
+        //   int main() {
+        //       int s = 0;
+        //       for (int i = 1; i <= 5; i += 1) { s += i; }
+        //       return s;
+        //   }
+        // Hand-computed: s = 1+2+3+4+5 = 15. Exercises the `for`-init
+        // decl-init desugar chaining correctly ahead of the while.
+        // -------------------------------------------------------------
+        const SRC51: &[u8] =
+            b"int main() { int s = 0; for (int i = 1; i <= 5; i += 1) { s += i; } return s; }";
+        const PATH51: &[u8] = PATH8;
+        let (elf51_ptr, elf51_len) = compile_program_standalone_elf(SRC51.as_ptr() as u64, SRC51.len() as u64);
+        let case51_ok = if elf51_ptr == 0 {
+            w(b"  case51 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH51, elf51_ptr, elf51_len, 15)
+        };
+        write_check(b"case51_real_elf_exec_for_int_i_init_returns_15=", case51_ok);
+
+        w(b"\n");
+
+        let overall_m88 = case50_ok && case51_ok;
+        w(b"OVERALL_M88=");
+        w(if overall_m88 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 { 0 } else { 1 });
     }
 }
 

@@ -6252,6 +6252,37 @@ self-test suite, genuinely open for a future pass.
       per-compile (bounded now by `heap_reset()`, not fixed); one 4 KiB
       stack page per process.
 
+- [x] **Milestone 88**: combined declaration-with-initializer in the
+      self-hosted subset-C compiler -- `int IDENT ("=" logic_or)? ";"`,
+      and the same as a `for` init clause (`for (int i = 0; ...)`, the
+      one loop shape Milestone 86's `for` could not express -- its init
+      had to assign to an already-declared variable).
+
+      `int i = e;` is **desugared at parse time** to `int i;` immediately
+      followed by `i = e;` -- a two-node chain (`STMT_DECL` ->
+      `STMT_ASSIGN`), which `parse_stmt_list_until_rbrace()` already
+      handles since Milestone 86 walks to a chain's real tail.
+      **Zero new codegen, zero new AST kinds**: `STMT_DECL` is unchanged
+      (still what `collect_vars()` counts) and the synthesized
+      `STMT_ASSIGN` takes the exact `finish_ident_assign()` path a plain
+      `i = e;` already uses. Only a plain `=` starts an initializer -- a
+      compound op after `int i` would read an uninitialized variable and
+      is left to fall through as a parse error.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`), no
+      warnings. Two QEMU boots, fresh then reused. CASE 50 (in-process
+      -- two initializers, the second referencing the first) returns
+      `80`; CASE 51 (real on-disk-ELF + kernel `exec()`+`wait()` --
+      `for (int i = 1; i <= 5; i += 1) s += i`) returns `15`. Both
+      boots. `OVERALL_M88=PASS`, `OVERALL_M68`..`M87` all still PASS,
+      `milestone 64`/`65`/`stdiotest` all still PASS, fresh vs. reused
+      OVERALL markers byte-identical. No regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); no
+      arrays/pointers, no additional C types; no `switch`/`goto`; the
+      compiler self-test still leaks per-compile (bounded by
+      `heap_reset()`, not fixed); one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

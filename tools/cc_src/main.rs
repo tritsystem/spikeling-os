@@ -711,6 +711,25 @@
 // (bounded by `heap_reset()` since Milestone 87, not fixed); one 4 KiB
 // stack page per process.
 //
+// MILESTONE 89 adds the `%` (modulo) operator and its `%=` compound
+// form -- the last missing arithmetic operator in real C's `* / %`
+// group. `%` binds at the exact same precedence level as `*` and `/`,
+// left-associative (`parse_term` just gains it as a third alternative).
+// Codegen reuses `/`'s own `cqo; idiv rcx` -- `idiv` already produces
+// the remainder in RDX alongside the quotient in RAX -- and adds ONE
+// new encoding, `emit_mov_rax_rdx()`, to land the remainder in RAX per
+// gen_expr()'s "value in RAX" postcondition. `%=` drops into Milestone
+// 84's compound-assignment machinery with binop `b'%'`; its lexing is
+// the same "2-char before 1-char" order every other compound already
+// uses. Two new self-test cases: CASE 52 (in-process -- `%`, `/` and
+// `%=` combined -> 5) and CASE 53 (real on-disk-ELF -- a
+// `%`-vs-`*` precedence-regression test, `20 % 7 * 2` -> 12 not 6).
+//
+// Still genuinely open after Milestone 89: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); no arrays/pointers, no additional C types; no
+// `switch`/`goto`; the compiler self-test still leaks per-compile
+// (bounded, not fixed); one 4 KiB stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -888,6 +907,14 @@ const TOK_FOR: u8 = 43; // keyword "for"
 // carries the step in `else_body` instead of appending it to the body).
 const TOK_BREAK: u8 = 44;    // keyword "break"
 const TOK_CONTINUE: u8 = 45; // keyword "continue"
+// MILESTONE 89: the `%` (modulo) operator and its `%=` compound form.
+// `%` binds at the same precedence as `*` and `/` (real C: they are one
+// level). Codegen reuses `/`'s exact `cqo; idiv rcx` -- `idiv` already
+// produces the remainder in RDX alongside the quotient in RAX, so `%`
+// is one extra `mov rax, rdx` (one new CodeBuf encoding). `%=` slots
+// into Milestone 84's compound-assignment machinery with binop `b'%'`.
+const TOK_PERCENT: u8 = 46;   // "%"
+const TOK_PERCENTEQ: u8 = 47; // "%="
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1116,6 +1143,7 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
                 else if b == b'&' { Some(TOK_AMPEQ) }
                 else if b == b'|' { Some(TOK_PIPEEQ) }
                 else if b == b'^' { Some(TOK_CARETEQ) }
+                else if b == b'%' { Some(TOK_PERCENTEQ) } // MILESTONE 89
                 else { None };
             if let (Some(k), Some(b'=')) = (ce, next) {
                 unsafe { tok_write(toks_ptr, n, Token { kind: k, int_val: 0, ident_off: 0, ident_len: 0 }) };
@@ -1145,6 +1173,7 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             b'&' => TOK_AMP,
             b'|' => TOK_PIPE,
             b'^' => TOK_CARET,
+            b'%' => TOK_PERCENT, // MILESTONE 89 (a lone '%'; "%=" is caught above)
             b'~' => TOK_TILDE,
             // MILESTONE 83: lone '!' -- unreached for a genuine "!="
             // (that `continue`s above, before this match runs), so a
@@ -1644,10 +1673,11 @@ impl Parser {
         let mut left = unsafe { self.parse_unary() }?;
         loop {
             let k = unsafe { self.peek() }.kind;
-            if k != TOK_STAR && k != TOK_SLASH {
+            if k != TOK_STAR && k != TOK_SLASH && k != TOK_PERCENT {
                 break;
             }
-            let op = if k == TOK_STAR { b'*' } else { b'/' };
+            // MILESTONE 89: `%` joins `*`/`/` at this one precedence level.
+            let op = if k == TOK_STAR { b'*' } else if k == TOK_SLASH { b'/' } else { b'%' };
             unsafe { self.advance() };
             let right = unsafe { self.parse_unary() }?;
             let node = unsafe { alloc_expr() };
@@ -1990,6 +2020,7 @@ impl Parser {
             else if opk == TOK_MINUSEQ { Some(b'-') }
             else if opk == TOK_STAREQ { Some(b'*') }
             else if opk == TOK_SLASHEQ { Some(b'/') }
+            else if opk == TOK_PERCENTEQ { Some(b'%') } // MILESTONE 89
             else if opk == TOK_AMPEQ { Some(OP_BITAND) }
             else if opk == TOK_PIPEEQ { Some(OP_BITOR) }
             else if opk == TOK_CARETEQ { Some(OP_BITXOR) }
@@ -2931,7 +2962,16 @@ impl CodeBuf {
         unsafe { self.push_bytes(&[0x48, 0x99]) }; // cqo (sign-extend rax into rdx:rax)
     }
     unsafe fn emit_idiv_rcx(&mut self) {
-        unsafe { self.push_bytes(&[0x48, 0xF7, 0xF9]) }; // idiv rcx (quotient -> rax)
+        unsafe { self.push_bytes(&[0x48, 0xF7, 0xF9]) }; // idiv rcx (quotient -> rax, remainder -> rdx)
+    }
+    /// MILESTONE 89: `mov rax, rdx` -- the one new encoding `%` needs.
+    /// `idiv rcx` already leaves the remainder in RDX; `%` just moves
+    /// it into RAX to satisfy gen_expr()'s "every node leaves its value
+    /// in RAX" postcondition. Same REX.W + 0x89 (`mov r/m64, r64`) +
+    /// ModRM 11 010 000 (reg = RDX, rm = RAX) shape as
+    /// emit_mov_rcx_rax()/emit_mov_rbp_rsp() above.
+    unsafe fn emit_mov_rax_rdx(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x89, 0xD0]) }; // mov rax, rdx
     }
     unsafe fn emit_leave(&mut self) {
         unsafe { self.push(0xC9) };
@@ -3494,6 +3534,14 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                     b'/' => {
                         unsafe { buf.emit_cqo() };
                         unsafe { buf.emit_idiv_rcx() };
+                    }
+                    // MILESTONE 89: `%` -- same `cqo; idiv rcx` as `/`
+                    // (idiv leaves the remainder in RDX alongside the
+                    // quotient in RAX), then move the remainder into RAX.
+                    b'%' => {
+                        unsafe { buf.emit_cqo() };
+                        unsafe { buf.emit_idiv_rcx() };
+                        unsafe { buf.emit_mov_rax_rdx() };
                     }
                     // MILESTONE 79: the five new binary bitwise operators.
                     // AND/OR/XOR reuse this exact same left-in-rax/
@@ -6423,7 +6471,64 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m88 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 89: the `%` (modulo) operator and its `%=` compound.
+        //
+        // CASE 52 (in-process Callable path): `%`, `/` and `%=` over
+        // real variables, plus a decl-init.
+        //   int main() {
+        //       int a = 17;
+        //       int b = 5;
+        //       int r = a % b;      // 17 % 5 = 2
+        //       r += a / b;         // + (17 / 5 = 3)  -> 5
+        //       r %= 7;             // 5 % 7 = 5
+        //       return r;
+        //   }
+        // Hand-computed: 5.
+        // -------------------------------------------------------------
+        const SRC52: &[u8] = b"int main() { int a = 17; int b = 5; int r = a % b; r += a / b; r %= 7; return r; }";
+        let case52_result = compile_and_run_program_callable(SRC52.as_ptr() as u64, SRC52.len() as u64);
+        w(b"  case52 (%, / and %= combined, in-process) returned=");
+        if let Some(r) = case52_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 5)\n");
+        let case52_ok = case52_result == Some(5);
+        write_check(b"case52_modulo_and_compound_returns_5=", case52_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 53 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier): a precedence-regression test.
+        // `%` is one level with `*` and `/`, left-associative.
+        //   int main() { int r = 20 % 7 * 2; return r; }
+        // Hand-computed (CORRECT: left-assoc, `%` and `*` same level):
+        // (20 % 7) * 2 = 6 * 2 = 12. If `%` bound LOOSER than `*`, it
+        // would be 20 % (7 * 2) = 20 % 14 = 6 -- a different,
+        // distinguishable result.
+        // -------------------------------------------------------------
+        const SRC53: &[u8] = b"int main() { int r = 20 % 7 * 2; return r; }";
+        const PATH53: &[u8] = PATH8;
+        let (elf53_ptr, elf53_len) = compile_program_standalone_elf(SRC53.as_ptr() as u64, SRC53.len() as u64);
+        let case53_ok = if elf53_ptr == 0 {
+            w(b"  case53 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH53, elf53_ptr, elf53_len, 12)
+        };
+        write_check(b"case53_real_elf_exec_modulo_precedence_returns_12=", case53_ok);
+
+        w(b"\n");
+
+        let overall_m89 = case52_ok && case53_ok;
+        w(b"OVERALL_M89=");
+        w(if overall_m89 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 { 0 } else { 1 });
     }
 }
 

@@ -6283,6 +6283,33 @@ self-test suite, genuinely open for a future pass.
       compiler self-test still leaks per-compile (bounded by
       `heap_reset()`, not fixed); one 4 KiB stack page per process.
 
+- [x] **Milestone 89**: the `%` (modulo) operator and its `%=` compound
+      form in the self-hosted subset-C compiler -- the last missing
+      operator in real C's `* / %` group.
+
+      `%` binds at the exact same precedence level as `*` and `/`,
+      left-associative (`parse_term` gains it as a third alternative).
+      Codegen reuses `/`'s own `cqo; idiv rcx` -- `idiv` already
+      produces the remainder in RDX alongside the quotient in RAX -- and
+      adds **one** new encoding, `mov rax, rdx`, to land the remainder
+      in RAX. `%=` drops straight into Milestone 84's compound-assignment
+      machinery with binop `b'%'`.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`), no
+      warnings. Two QEMU boots, fresh then reused. CASE 52 (in-process
+      -- `%`, `/` and `%=` combined over real variables) returns `5`;
+      CASE 53 (real on-disk-ELF + kernel `exec()`+`wait()` -- a
+      `%`-vs-`*` precedence-regression test, `20 % 7 * 2`, built so a
+      wrong binding gives `6` instead of `12`) returns `12`. Both boots.
+      `OVERALL_M89=PASS`, `OVERALL_M68`..`M88` all still PASS,
+      `milestone 64`/`65`/`stdiotest` all still PASS, fresh vs. reused
+      OVERALL markers byte-identical. No regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); no
+      arrays/pointers, no additional C types; no `switch`/`goto`; the
+      compiler self-test still leaks per-compile (bounded, not fixed);
+      one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

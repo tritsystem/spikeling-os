@@ -6048,6 +6048,57 @@ self-test suite, genuinely open for a future pass.
       every process exactly ONE 4 KiB stack page (a pure userspace
       toolchain change).
 
+- [x] **Milestone 84**: the nine compound-assignment operators (`+=`,
+      `-=`, `*=`, `/=`, `&=`, `|=`, `^=`, `<<=`, `>>=`) in the
+      self-hosted subset-C compiler (`tools/cc_src`) -- the gap
+      Milestone 83's own closing disclosure named as "the oldest-standing
+      named grammar gap". Picked over the other two standing candidates
+      (`MAX_FUNCS`/`MAX_PARAMS`, still unblocked by any concrete program;
+      arrays/pointers, a substantially bigger step).
+
+      **Grammar**: one production changes --
+      `assign_stmt := IDENT ("=" | "+=" | ... | ">>=") logic_or ";"`.
+      `x OP= e` is **desugared at parse time** to `x = (x OP e)`: the
+      parser synthesizes an ordinary `EXPR_BINARY` node with the matching
+      op over a fresh `EXPR_IDENT` reference to `x` and the parsed RHS,
+      and hands it to the existing `STMT_ASSIGN` path. Nine new lexer
+      tokens, one parser branch, **zero new codegen** -- `gen_expr()`
+      already emits correct code for every shape the desugaring produces.
+      Evaluating `x` twice is exact because `x` is always a plain `IDENT`
+      in this subset (no index, deref, or call as an lvalue), so real
+      C's "the lvalue is evaluated exactly once" guarantee holds for free
+      without a temporary. RHS is `logic_or` (lowest precedence), so
+      `x += 3 * 4` is `x = x + (3*4)` and `x <<= 1 + 1` is
+      `x = x << (1+1)`.
+
+      **Lexing**: same longest-match-first order every other multi-char
+      operator uses -- `<<=`/`>>=` (3 chars, a new third byte of
+      lookahead) before `<<`/`>>` (M79) before `<=`/`>=` (M70) and
+      `<`/`>`; the seven 2-char operators before their single-char forms;
+      `&=`/`|=` fall through M76's `&&`/`||` checks unharmed. No `//`
+      comment syntax in this subset, so `/=` is unambiguous.
+
+      **Verified**: `cargo build --target x86_64-unknown-none` clean, no
+      warnings; `cc.elf` rebuilt (13 expected "never used" warnings,
+      unchanged set). Two full QEMU boots, a fresh-disk then reused-disk
+      pair. CASE 41 (in-process Callable path -- all nine operators
+      chained on one variable: `100 +=5 -=20 *=3 /=2 &=60 |=3 ^=1 <<=2
+      >>=1`) returns exactly `124` both boots; CASE 42 (real on-disk-ELF
+      + kernel `exec()`+`wait()` path -- a precedence-regression test
+      built so a wrong RHS binding gives `20`/`29` instead of `56`)
+      returns `56` both boots. `OVERALL_M84=PASS`, `OVERALL_M68`..`M83`
+      all still PASS, `milestone 64`/`65`/`stdiotest` all still PASS,
+      fresh vs. reused OVERALL markers byte-identical. Only `FAIL` lines
+      are the disclosed set every milestone since 70 has named. No new
+      regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); no
+      arrays/pointers, no additional C types; no `++`/`--` (this subset
+      has never had them and this milestone adds none -- `x += 1` covers
+      the same ground); SAR vs. SHR still undistinguished by any test
+      (Milestone 79's open verification gap, untouched); one 4 KiB stack
+      page per process (a pure userspace toolchain change).
+
 ## Building and running
 
 Requires:

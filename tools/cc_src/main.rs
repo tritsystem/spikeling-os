@@ -528,6 +528,54 @@
 // page, completely untouched by this milestone (a pure userspace
 // toolchain change).
 //
+// MILESTONE 84 closes the compound-assignment gap Milestone 83's own
+// closing disclosure named as "the oldest-standing named grammar gap"
+// -- the nine operators `+=` `-=` `*=` `/=` `&=` `|=` `^=` `<<=` `>>=`.
+// Picked over the other two standing candidates (MAX_FUNCS/MAX_PARAMS,
+// still unblocked by any concrete program; arrays/pointers, a
+// substantially bigger memory-addressing step). Grammar change, a
+// single production:
+//   assign_stmt := IDENT ("=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|="
+//                          | "^=" | "<<=" | ">>=") logic_or ";"
+// `x OP= e` is DESUGARED at parse time to `x = (x OP e)` -- the parser
+// synthesizes an ordinary EXPR_BINARY node (matching op) over a fresh
+// EXPR_IDENT reference to `x` and the parsed RHS, and hands that to the
+// existing STMT_ASSIGN path. So this milestone adds NINE lexer tokens
+// and ONE parser branch and ZERO new codegen: `gen_expr()`/
+// `STMT_ASSIGN` already generate correct code for every AST shape the
+// desugaring produces. Evaluating `x` twice is exact here because `x`
+// is always a plain IDENT in this subset (no index/deref/call as an
+// lvalue), so real C's "the lvalue is evaluated exactly once" guarantee
+// is satisfied for free rather than needing a temp. RHS is `logic_or`,
+// this subset's lowest-precedence expression, so `x += a * b + c` is
+// `x = x + ((a*b)+c)` and `x <<= 1 + 1` is `x = x << (1+1)` -- checked
+// against real C's precedence table, and CASE 42 below is a real
+// precedence-regression test built so a wrong binding gives a
+// different, distinguishable number.
+//
+// Lexing follows the same longest-match-first order every other
+// multi-char operator already uses: `<<=`/`>>=` (3 chars, a new third
+// byte of lookahead) are matched before `<<`/`>>` (M79), which are
+// matched before `<=`/`>=` (M70) and `<`/`>`; the seven 2-char
+// operators are matched before their single-char forms; `&=`/`|=` fall
+// through M76's `&&`/`||` checks unharmed (those test the second byte
+// for `&`/`|`, not `=`). `/=` is safe -- this subset has no `//`
+// comment syntax.
+//
+// Two new self-test cases: CASE 41 (in-process Callable path -- all
+// nine operators applied in sequence to one variable, each result
+// hand-computed) and CASE 42 (real on-disk-ELF + kernel exec()+wait()
+// path, this milestone's strongest tier -- the precedence-regression
+// check).
+//
+// Still genuinely open after this milestone: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); no arrays/pointers, no additional C types; no `++`/`--`
+// (this subset has never had them and nothing here adds them -- `x +=
+// 1` now covers the same ground); SAR vs. SHR still undistinguished by
+// any test case (Milestone 79's open verification gap, untouched); one
+// 4 KiB stack page per process, untouched (a pure userspace toolchain
+// change).
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -668,6 +716,25 @@ const TOK_SHR: u8 = 32; // ">>"
 // closed: unary "-" (M76), "~" (M79), and "!" (this milestone) are the
 // complete real unary set for this subset.
 const TOK_BANG: u8 = 33; // "!"
+// MILESTONE 84: the nine compound-assignment operators. `x OP= e` is
+// parsed as `x = x OP e` (a real desugaring in parse_stmt, not new
+// codegen -- `x` is always a plain IDENT in this subset, so evaluating
+// it twice is identical to once). Nine new lexer tokens, one parser
+// branch, ZERO new CodeBuf encodings. Lexed with the same
+// longest-match-first discipline every other multi-char operator uses:
+// "<<="/">>=" (3 chars) are checked before "<<"/">>" (M79) which are
+// checked before "<="/">=" (M70) and "<"/">"; "+="/"-="/... (2 chars)
+// before the single-char "+"/"-"/... ; "&="/"|=" are distinct from
+// M76's "&&"/"||" by their second byte.
+const TOK_PLUSEQ: u8 = 34;  // "+="
+const TOK_MINUSEQ: u8 = 35; // "-="
+const TOK_STAREQ: u8 = 36;  // "*="
+const TOK_SLASHEQ: u8 = 37; // "/="
+const TOK_AMPEQ: u8 = 38;   // "&="
+const TOK_PIPEEQ: u8 = 39;  // "|="
+const TOK_CARETEQ: u8 = 40; // "^="
+const TOK_SHLEQ: u8 = 41;   // "<<="
+const TOK_SHREQ: u8 = 42;   // ">>="
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -792,6 +859,10 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
         // the single-char match below so the longer token always wins
         // (a lone '!' still falls through to the single-char match).
         let next = if i + 1 < src_len { Some(unsafe { core::ptr::read((src_ptr + i + 1) as *const u8) }) } else { None };
+        // MILESTONE 84: a third byte of lookahead, only for the two
+        // 3-char operators "<<=" and ">>=" -- checked further below,
+        // before "<<"/">>", so a genuine "<<=" is never split.
+        let next2 = if i + 2 < src_len { Some(unsafe { core::ptr::read((src_ptr + i + 2) as *const u8) }) } else { None };
         if b == b'=' && next == Some(b'=') {
             unsafe { tok_write(toks_ptr, n, Token { kind: TOK_EQ, int_val: 0, ident_off: 0, ident_len: 0 }) };
             n += 1;
@@ -835,6 +906,22 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             i += 2;
             continue;
         }
+        // MILESTONE 84: "<<="/">>=" -- the two 3-char operators, checked
+        // BEFORE "<<"/">>" just below so a genuine "x <<= 1" lexes as
+        // TOK_SHLEQ, not TOK_SHL followed by a stray TOK_ASSIGN. "<="/">="
+        // above already fail for these (their `next` is '<'/'>' not '=').
+        if b == b'<' && next == Some(b'<') && next2 == Some(b'=') {
+            unsafe { tok_write(toks_ptr, n, Token { kind: TOK_SHLEQ, int_val: 0, ident_off: 0, ident_len: 0 }) };
+            n += 1;
+            i += 3;
+            continue;
+        }
+        if b == b'>' && next == Some(b'>') && next2 == Some(b'=') {
+            unsafe { tok_write(toks_ptr, n, Token { kind: TOK_SHREQ, int_val: 0, ident_off: 0, ident_len: 0 }) };
+            n += 1;
+            i += 3;
+            continue;
+        }
         // MILESTONE 79: "<<"/">>" -- same two-char-lookahead-before-
         // single-char shape as every other multi-char operator above.
         // Checked here (before the single-char match below, where '<'/
@@ -851,6 +938,29 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             n += 1;
             i += 2;
             continue;
+        }
+        // MILESTONE 84: the seven 2-char compound-assignment operators
+        // "+=" "-=" "*=" "/=" "&=" "|=" "^=" -- each checked before the
+        // single-char match below so a lone '+'/'-'/... followed by '='
+        // is one token, not two. "&="/"|=" fall through M76's "&&"/"||"
+        // checks above (whose `next` is '&'/'|', not '='). "/=" is safe:
+        // this subset has no "//" comment syntax, '/' is only ever
+        // TOK_SLASH.
+        {
+            let ce = if b == b'+' { Some(TOK_PLUSEQ) }
+                else if b == b'-' { Some(TOK_MINUSEQ) }
+                else if b == b'*' { Some(TOK_STAREQ) }
+                else if b == b'/' { Some(TOK_SLASHEQ) }
+                else if b == b'&' { Some(TOK_AMPEQ) }
+                else if b == b'|' { Some(TOK_PIPEEQ) }
+                else if b == b'^' { Some(TOK_CARETEQ) }
+                else { None };
+            if let (Some(k), Some(b'=')) = (ce, next) {
+                unsafe { tok_write(toks_ptr, n, Token { kind: k, int_val: 0, ident_off: 0, ident_len: 0 }) };
+                n += 1;
+                i += 2;
+                continue;
+            }
         }
         let kind = match b {
             b'(' => TOK_LPAREN,
@@ -1717,9 +1827,60 @@ impl Parser {
             }
             TOK_IDENT => {
                 let name = unsafe { self.advance() };
-                unsafe { self.expect(TOK_ASSIGN) }?;
-                let e = unsafe { self.parse_logic_or() }?;
+                // MILESTONE 84: plain "=" OR one of the nine compound
+                // assignment operators. `x OP= e` is desugared to
+                // `x = (x OP e)` right here: a synthesized EXPR_BINARY
+                // node with the matching op, over a fresh EXPR_IDENT
+                // reference to `name` and the parsed RHS. No new codegen
+                // -- STMT_ASSIGN + gen_expr() already handle every shape
+                // this produces. Evaluating `x` twice is exact here
+                // because `x` is always a simple IDENT in this subset
+                // (no arrays, no calls as lvalues), so the "lvalue
+                // evaluated once" rule real C needs is satisfied for
+                // free.
+                let opk = unsafe { self.peek() }.kind;
+                let binop: Option<u8> = if opk == TOK_PLUSEQ { Some(b'+') }
+                    else if opk == TOK_MINUSEQ { Some(b'-') }
+                    else if opk == TOK_STAREQ { Some(b'*') }
+                    else if opk == TOK_SLASHEQ { Some(b'/') }
+                    else if opk == TOK_AMPEQ { Some(OP_BITAND) }
+                    else if opk == TOK_PIPEEQ { Some(OP_BITOR) }
+                    else if opk == TOK_CARETEQ { Some(OP_BITXOR) }
+                    else if opk == TOK_SHLEQ { Some(OP_SHL) }
+                    else if opk == TOK_SHREQ { Some(OP_SHR) }
+                    else { None };
+                if binop.is_none() {
+                    unsafe { self.expect(TOK_ASSIGN) }?;
+                } else {
+                    unsafe { self.advance() };
+                }
+                let rhs = unsafe { self.parse_logic_or() }?;
                 unsafe { self.expect(TOK_SEMI) }?;
+                let expr = if let Some(op) = binop {
+                    let lhs_ref = unsafe { alloc_expr() };
+                    if lhs_ref == 0 {
+                        return Err(ParseError::OutOfMemory);
+                    }
+                    unsafe {
+                        core::ptr::write(
+                            lhs_ref as *mut ExprNode,
+                            ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+                        )
+                    };
+                    let bin = unsafe { alloc_expr() };
+                    if bin == 0 {
+                        return Err(ParseError::OutOfMemory);
+                    }
+                    unsafe {
+                        core::ptr::write(
+                            bin as *mut ExprNode,
+                            ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: lhs_ref, right: rhs, call_args_ptr: 0, call_argc: 0 },
+                        )
+                    };
+                    bin
+                } else {
+                    rhs
+                };
                 let node = unsafe { alloc_stmt() };
                 if node == 0 {
                     return Err(ParseError::OutOfMemory);
@@ -1731,7 +1892,7 @@ impl Parser {
                             kind: STMT_ASSIGN,
                             ident_off: name.ident_off,
                             ident_len: name.ident_len,
-                            expr: e,
+                            expr,
                             next: 0,
                             then_body: 0,
                             else_body: 0,
@@ -5413,7 +5574,76 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m83 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // CASE 41: the in-process Callable path -- every one of the nine
+        // compound-assignment operators applied in sequence to a single
+        // variable, each intermediate result hand-computed so a bug in
+        // any one operator's desugaring blows the final number.
+        //   int main() {
+        //       int x; x = 100;
+        //       x += 5;    x -= 20;   x *= 3;    x /= 2;   x &= 60;
+        //       x |= 3;    x ^= 1;    x <<= 2;   x >>= 1;
+        //       return x;
+        //   }
+        // Hand-computed: 100 -> +5=105 -> -20=85 -> *3=255 -> /2=127
+        // (integer) -> &60: 127=0b1111111 & 60=0b0111100 = 0b0111100 =
+        // 60 -> |3: 0b111100 | 0b000011 = 0b111111 = 63 -> ^1: 63^1 =
+        // 62 -> <<2: 62<<2 = 248 -> >>1: 248>>1 = 124. Return 124.
+        // -------------------------------------------------------------
+        const SRC41: &[u8] = b"int main() { int x; x = 100; x += 5; x -= 20; x *= 3; x /= 2; x &= 60; x |= 3; x ^= 1; x <<= 2; x >>= 1; return x; }";
+        let case41_result = compile_and_run_program_callable(SRC41.as_ptr() as u64, SRC41.len() as u64);
+        w(b"  case41 (all nine compound-assign ops chained, in-process) returned=");
+        if let Some(r) = case41_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 124)\n");
+        let case41_ok = case41_result == Some(124);
+        write_check(b"case41_compound_assign_all_nine_ops_returns_124=", case41_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 42: the real on-disk-ELF + kernel exec()+wait() path --
+        // this milestone's strongest tier, same precedent as every
+        // milestone since 69 -- and a REAL precedence-regression test:
+        // the RHS of a compound assignment is a full `logic_or`, this
+        // subset's lowest-precedence production, so `x += 3 * 4` MUST
+        // parse as `x = x + (3*4)` and `x <<= 1 + 1` as `x = x <<
+        // (1+1)`. Built so a wrong binding gives a different number.
+        //   int main() {
+        //       int x; x = 2;
+        //       x += 3 * 4;   // x = x + (3*4) = 2 + 12 = 14
+        //       x <<= 1 + 1;  // x = x << (1+1) = 14 << 2 = 56
+        //       return x;
+        //   }
+        // Hand-computed (CORRECT precedence): 2 + 12 = 14, then 14 << 2
+        // = 56. If `+=`'s RHS bound only a `factor` (or tighter than
+        // `*`), `x += 3` then `* 4` is a dangling `* 4` -> parse error
+        // or `(x+3)*4 = 20`; if `<<=`'s RHS bound tighter than `+`,
+        // `(x<<1)+1 = 29`. 56 is reachable only with real C precedence.
+        // -------------------------------------------------------------
+        const SRC42: &[u8] =
+            b"int main() { int x; x = 2; x += 3 * 4; x <<= 1 + 1; return x; }";
+        const PATH42: &[u8] = PATH8;
+        let (elf42_ptr, elf42_len) = compile_program_standalone_elf(SRC42.as_ptr() as u64, SRC42.len() as u64);
+        let case42_ok = if elf42_ptr == 0 {
+            w(b"  case42 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH42, elf42_ptr, elf42_len, 56)
+        };
+        write_check(b"case42_real_elf_exec_compound_assign_precedence_returns_56=", case42_ok);
+
+        w(b"\n");
+
+        let overall_m84 = case41_ok && case42_ok;
+        w(b"OVERALL_M84=");
+        w(if overall_m84 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 { 0 } else { 1 });
     }
 }
 

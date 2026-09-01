@@ -6523,6 +6523,41 @@ self-test suite, genuinely open for a future pass.
       stack page per process; `case8`/`OVERALL_M69` (fixed next
       milestone).
 
+- [x] **Milestone 96**: regression fix -- `OVERALL_M69` back to PASS.
+      Not a feature: no new grammar, no new codegen, no new `cc.elf`
+      surface. `case8` (the single ELF-exec self-test that reused CASE
+      1's already-parsed `func1` AST pointer instead of re-parsing) had
+      been exiting `0` instead of `42` -- and dragging `OVERALL_M69` to
+      FAIL -- on **every boot from Milestone 87 through Milestone 95**
+      (the committed `m87_*_boot.log` .. `m95_*_boot.log` all show it).
+      **Cause**: Milestone 87 added `heap_reset()` on entry of the
+      compile helpers to bound the ~60-compile self-test's per-compile
+      leak inside the fixed per-process heap; that rewinds the bump
+      allocator between CASE 1 and CASE 8, so CASE 4/5/6/7's intervening
+      in-process compiles overwrite `func1`'s malloc'd nodes and
+      `gen_function` codegens a stale/empty function. `case9`/`case10`
+      and every later ELF-exec case (17/22/28/31/33/36/38/42/44/46/48/
+      51/53/55/57/60) re-parse fresh source after each reset, so they
+      were unaffected -- the on-disk-ELF + real `exec()`/`wait()` path
+      itself was always sound. **Fix**: `case8` now calls `heap_reset()`
+      and re-parses CASE 1's exact source in place, putting it on the
+      same "every compile entry resets" invariant as every other case;
+      its intent is unchanged (CASE 1's exact function, through the
+      Standalone/ELF64 backend). New self-test check `OVERALL_M96 =
+      case8_ok && overall_m69`.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`, 72752
+      bytes). Two QEMU boots, fresh then reused. `case8_real_elf_exec_
+      returns_42=PASS`, `OVERALL_M69=PASS` (was FAIL M87..M95),
+      `OVERALL_M96=PASS`, on **both** boots. `OVERALL_M68`, `M70`..`M95`
+      all still PASS and byte-identical fresh vs. reused. `milestone
+      64`/`65` kernel self-tests PASS both boots. No regressions.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; only the `int` type; the compiler
+      self-test still leaks per-compile (bounded by `heap_reset()`, not
+      eliminated); one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

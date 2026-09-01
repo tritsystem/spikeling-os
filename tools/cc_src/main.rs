@@ -866,10 +866,23 @@
 // three bases in one expression: `0xFF + 0b1010 + 0x10` -> 281) and
 // CASE 65 (the empty-`0x` LexError path).
 //
-// Still genuinely open after Milestone 95: `MAX_PARAMS` (4, needs
+// MILESTONE 96 is a regression fix, not a feature. `case8` (the one
+// ELF-exec self-test that reused CASE 1's already-parsed `func1` AST
+// instead of re-parsing) had been exiting 0 instead of 42 -- and so
+// `OVERALL_M69=FAIL` -- on every boot since Milestone 87. Cause:
+// Milestone 87 added `heap_reset()` on entry of the compile helpers to
+// bound the self-test's per-compile leak; that rewinds the bump
+// allocator between CASE 1 and CASE 8, so CASE 4/5/6/7's intervening
+// compiles overwrite `func1`'s nodes and `gen_function` codegens a
+// stale function. Fix: CASE 8 now `heap_reset()`s and re-parses CASE
+// 1's exact source in place (same intent -- CASE 1's function through
+// the Standalone/ELF64 backend -- with no dependency on cross-compile
+// heap survival). New check `OVERALL_M96 = case8_ok && overall_m69`.
+//
+// Still genuinely open after Milestone 96: `MAX_PARAMS` (4, needs
 // stack-passed arguments); no arrays/pointers; only the `int` type;
-// the compiler self-test still leaks per-compile (bounded, not fixed);
-// one 4 KiB stack page per process.
+// the compiler self-test still leaks per-compile (bounded by
+// `heap_reset()`, not eliminated); one 4 KiB stack page per process.
 //
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
@@ -5660,20 +5673,39 @@ pub extern "C" fn _start() -> ! {
         // code: 42 (same value CASE 4 already proved in-process).
         // -------------------------------------------------------------
         const PATH8: &[u8] = b"ccout1";
-        let case8_ok = if parse1_ok && ast1_ok {
-            match gen_function(src1_ptr, func1, CodegenMode::Standalone) {
+        // MILESTONE 96: re-parse CASE 1's exact source RIGHT HERE rather
+        // than reusing CASE 1's `func1` pointer. Since Milestone 87 the
+        // compile helpers call `heap_reset()` on entry (to bound the
+        // ~60-compile self-test's per-compile leak inside the fixed
+        // per-process heap), which rewinds the bump allocator between
+        // CASE 1 and this point -- by now CASE 4/5/6/7's intervening
+        // compiles have overwritten `func1`'s malloc'd AST nodes, so
+        // `gen_function(func1, ...)` was codegen'ing a stale/empty
+        // function and the ELF exited 0 instead of 42 (a real
+        // regression from M87 through M95; `OVERALL_M69=FAIL`). CASE 8's
+        // intent is unchanged -- CASE 1's exact source, compiled through
+        // the Standalone (ELF64 + real `exec()`) backend -- it just no
+        // longer leans on heap state that M87 legitimately rewinds. A
+        // fresh `heap_reset()` first keeps CASE 8 on the same
+        // "every compile entry resets" invariant as CASE 9/10 and every
+        // later ELF-exec case. `src1_ptr` is a `&[u8]` static, never on
+        // the heap, so it survives the reset.
+        unsafe { heap_reset() };
+        let case8_ok = match lex_and_parse(src1_ptr, src1_len) {
+            Ok(func8) => match gen_function(src1_ptr, func8, CodegenMode::Standalone) {
                 Ok(buf8) => {
                     let (elf8_ptr, elf8_len) = build_elf64_standalone(buf8.ptr, buf8.len, 0);
                     write_exec_and_check!(PATH8, elf8_ptr, elf8_len, 42)
                 }
                 Err(_) => {
-                    w(b"  case8 gen_function(func1, Standalone) returned Err unexpectedly\n");
+                    w(b"  case8 gen_function(Standalone) returned Err unexpectedly\n");
                     false
                 }
+            },
+            Err(_) => {
+                w(b"  case8 re-parse of CASE 1's source returned Err unexpectedly\n");
+                false
             }
-        } else {
-            w(b"  case8 skipped -- CASE 1's own func1 was not valid\n");
-            false
         };
         write_check(b"case8_real_elf_exec_returns_42=", case8_ok);
 
@@ -5745,6 +5777,27 @@ pub extern "C" fn _start() -> ! {
         let overall_m69 = case8_ok && case9_ok && case10_ok;
         w(b"OVERALL_M69=");
         w(if overall_m69 { b"PASS" } else { b"FAIL" });
+        w(b"\n\n");
+
+        // ===============================================================
+        // MILESTONE 96: regression fix -- `case8` above no longer reuses
+        // CASE 1's `func1` AST pointer (dead since Milestone 87's
+        // `heap_reset()` started rewinding the bump allocator between
+        // compiles); it re-parses CASE 1's exact source in place. This
+        // milestone's own check is that the fix actually took: `case8`
+        // PASSES and `OVERALL_M69` is back to PASS. `OVERALL_M69` was
+        // FAIL on every boot from Milestone 87 through Milestone 95
+        // (committed boot logs `m87_*`..`m95_*` all show it); this is the
+        // milestone that flips it back. No new grammar, no new codegen,
+        // no new `cc.elf` feature -- a self-test correctness fix, in the
+        // same spirit as Milestone 85 (SAR verification) closing an
+        // on-the-books hole rather than adding surface.
+        // ===============================================================
+        let overall_m96 = case8_ok && overall_m69;
+        write_check(b"case8_reparse_no_longer_leans_on_stale_func1_heap=", case8_ok);
+        write_check(b"m96_overall_m69_regression_cleared=", overall_m96);
+        w(b"OVERALL_M96=");
+        w(if overall_m96 { b"PASS" } else { b"FAIL" });
         w(b"\n\n");
 
         // ===============================================================
@@ -7637,7 +7690,7 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m95 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 { 0 } else { 1 });
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 { 0 } else { 1 });
     }
 }
 

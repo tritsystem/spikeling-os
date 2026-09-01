@@ -929,11 +929,49 @@
 // end-to-end proof of Milestone 100: this exact change overflowed the
 // old single stack page and now runs with room to spare.
 //
-// Still genuinely open after Milestone 101: `MAX_PARAMS` (4, needs
-// stack-passed arguments); no arrays/pointers; only the `int` type
-// (a `char` literal is just an int, there is still no `char` type or
-// any width tracking); the compiler self-test still leaks per-compile
-// (bounded by `heap_reset()`, not eliminated).
+// MILESTONE 102 adds a real second type, `char`, alongside `int` --
+// this subset's first genuine width distinction. `char c = e;` parses
+// through the exact same make_decl()/multi-declarator machinery
+// Milestone 101 just built (statement level and `for`-init, with or
+// without an initializer, comma-chained, mixed with `int` declarators
+// in the same block), now carrying a real type tag (`is_char`,
+// threaded through StmtNode's otherwise-dead-for-DECL `then_body`
+// field into a new `VarSlot.is_char` byte). Codegen stays almost
+// entirely untouched: every stack slot is still a full 8 bytes
+// (collect_vars_rec()'s layout is unchanged) and STMT_ASSIGN's store
+// is still the same unconditional full-width `mov [rbp+off], rax`
+// (emit_mov_rbp_off_rax(), untouched) -- the ONLY new codegen is
+// EXPR_IDENT's read of a `char` slot, which now emits a real `movsx
+// rax, byte [rbp+off]` (emit_movsx_rax_rbp_off_byte(), new) instead of
+// the full-width load, sign-extending just the slot's low byte. Store-
+// full/narrow-on-read this way, for FREE, real 8-bit truncation on
+// overflow (`char c = 321;` reads back `65`) AND real signed-char
+// wraparound (`char c = 200;` reads back `-56`, matching a real
+// x86_64 SysV compiler's default `char` signedness) with no separate
+// truncate-on-store codegen at all, because store and (narrowed) load
+// touch the identical low byte of the same little-endian slot. CASE 76
+// (basic char decl + arithmetic -> 66), CASE 77 (truncation-on-store,
+// `char c = 321` -> `65`), CASE 78 (signed sign-extension, `char c =
+// 200; c == -56` -> `1`), CASE 79 (char as a `while`-loop counter,
+// in-process -> `55`; see CASE 79's OWN doc comment below for why this
+// one deliberately stays on the in-process Callable path instead of
+// this milestone's usual real on-disk-ELF + exec() tier -- a real,
+// disclosed kernel-heap-margin bug this milestone's own development
+// found, not an oversight).
+//
+// Still genuinely open after Milestone 102: `MAX_PARAMS` (4, needs
+// stack-passed arguments); no arrays/pointers; `char` is a local-
+// variable type only -- NOT yet a function parameter or return type
+// (parse_params() and the top-level function-signature parser both
+// still hard-require `TOK_INT`), and there is still no `sizeof` or any
+// other width-introspection; the compiler self-test still leaks
+// per-compile (bounded by `heap_reset()`, not eliminated); a real,
+// newly-DISCOVERED (not fixed) kernel-heap-margin bug -- see CASE 79's
+// own doc comment below -- where this self-test suite's own growing
+// count of real fork()/exec()/wait() cycles per boot appears to already
+// sit right at kernel/src/allocator.rs's fixed 100 KiB HEAP_SIZE
+// ceiling by the time kernel/src/tasks.rs's own later preemption demo
+// needs its own 16 KiB worker-stack allocations.
 //
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
@@ -1147,6 +1185,14 @@ const TOK_GOTO: u8 = 53; // keyword "goto"
 // (`continue` targeting the bottom-of-body condition re-check).
 const TOK_DO: u8 = 54; // keyword "do"
 
+// MILESTONE 102: `char` -- a second, genuinely narrower local-variable
+// type alongside `int`. Statement level and `for`-init only (same two
+// declarator sites Milestone 101's multi-declarator work reaches);
+// NOT yet a parameter or return type -- see this milestone's own
+// "still genuinely open" note below for why that's a real, disclosed
+// scope cut rather than an oversight.
+const TOK_CHAR: u8 = 55; // keyword "char"
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Token {
@@ -1290,6 +1336,8 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
                 TOK_GOTO // MILESTONE 92
             } else if unsafe { word_is(src_ptr, start, wlen, b"do") } {
                 TOK_DO // MILESTONE 99
+            } else if unsafe { word_is(src_ptr, start, wlen, b"char") } {
+                TOK_CHAR // MILESTONE 102
             } else {
                 TOK_IDENT
             };
@@ -2456,7 +2504,21 @@ impl Parser {
     /// call): even with Milestone 100's 32 KiB stack, this is the hot
     /// path for every `int` declaration and there is no reason to spend
     /// a frame on it.
-    unsafe fn make_decl(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
+    ///
+    /// MILESTONE 102: `is_char` records which type keyword introduced
+    /// this whole declarator list (`int` -> false, `char` -> true) --
+    /// every declarator in one list shares the one leading type, same
+    /// as real C's `int a, b;` (no per-declarator `int a, char b;`
+    /// mixing exists in this subset, there being no `*` to hang a
+    /// different-type declarator off in the first place). Stored in
+    /// each STMT_DECL's own `then_body` field (0/1) -- reusing it
+    /// rather than growing StmtNode by a field, the same "0 = absent,
+    /// reuse before grow" discipline this struct's own doc comment
+    /// already establishes; `then_body` is otherwise dead for
+    /// STMT_DECL (unused, always left 0 before this milestone).
+    /// `collect_vars_rec` reads it back out into each `VarSlot`.
+    unsafe fn make_decl(&mut self, name: Token, consume_semi: bool, is_char: bool) -> Result<u64, ParseError> {
+        let type_tag: u64 = if is_char { 1 } else { 0 };
         let head = unsafe { alloc_stmt() };
         if head == 0 {
             return Err(ParseError::OutOfMemory);
@@ -2464,7 +2526,7 @@ impl Parser {
         unsafe {
             core::ptr::write(
                 head as *mut StmtNode,
-                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: type_tag, else_body: 0 },
             )
         };
         let mut tail = head;
@@ -2483,7 +2545,7 @@ impl Parser {
             unsafe {
                 core::ptr::write(
                     d as *mut StmtNode,
-                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: type_tag, else_body: 0 },
                 )
             };
             unsafe { (*(tail as *mut StmtNode)).next = d };
@@ -2585,7 +2647,19 @@ impl Parser {
                 // takes.
                 unsafe { self.advance() };
                 let name = unsafe { self.expect(TOK_IDENT) }?;
-                unsafe { self.make_decl(name, true) }
+                unsafe { self.make_decl(name, true, false) }
+            }
+            // MILESTONE 102: `char IDENT ("=" logic_or)? ("," ...)* ";"`
+            // -- the exact same grammar TOK_INT's arm just above parses,
+            // through the exact same make_decl(), with `is_char = true`
+            // the only difference. A `char` declarator list is otherwise
+            // indistinguishable to the parser from an `int` one: same
+            // multi-declarator chaining (Milestone 101), same optional
+            // `=` initializer per declarator.
+            TOK_CHAR => {
+                unsafe { self.advance() };
+                let name = unsafe { self.expect(TOK_IDENT) }?;
+                unsafe { self.make_decl(name, true, true) }
             }
             TOK_RETURN => {
                 unsafe { self.advance() };
@@ -2667,7 +2741,13 @@ impl Parser {
                     // (`int i;` then `i = 0;`) as at statement level.
                     unsafe { self.advance() };
                     let n = unsafe { self.expect(TOK_IDENT) }?;
-                    unsafe { self.make_decl(n, false) }?
+                    unsafe { self.make_decl(n, false, false) }?
+                } else if unsafe { self.peek() }.kind == TOK_CHAR {
+                    // MILESTONE 102: `for (char i = 0; ...)`, same
+                    // desugar with `is_char = true`.
+                    unsafe { self.advance() };
+                    let n = unsafe { self.expect(TOK_IDENT) }?;
+                    unsafe { self.make_decl(n, false, true) }?
                 } else {
                     let n = unsafe { self.expect(TOK_IDENT) }?;
                     unsafe { self.finish_ident_assign(n, false) }?
@@ -3414,6 +3494,16 @@ struct VarSlot {
     name_off: u32,
     name_len: u8,
     stack_off: i32, // bytes from rbp, always negative
+    // MILESTONE 102: 1 if this slot was declared `char`, 0 for `int`
+    // (and, unconditionally, for every parameter -- see
+    // collect_vars_for_function() below). The slot itself is still a
+    // full 8 bytes either way (collect_vars_rec()'s own layout is
+    // completely unchanged); only gen_expr()'s EXPR_IDENT read of this
+    // slot differs by this flag -- see find_var()'s and
+    // emit_movsx_rax_rbp_off_byte()'s own doc comments below for why a
+    // real 1-byte-narrower load, not a narrower slot, is the whole
+    // feature.
+    is_char: u8,
 }
 
 unsafe fn var_write(vars_ptr: u64, idx: u64, v: VarSlot) {
@@ -3475,7 +3565,10 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
                 return Err(CodeGenError::TooManyVars);
             }
             let off = -8 * (*n as i32 + 1);
-            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off }) };
+            // MILESTONE 102: `s.then_body` is 0/1, written by make_decl()
+            // (see that function's own doc comment for why `then_body`,
+            // otherwise dead for STMT_DECL, carries this).
+            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: s.then_body as u8 }) };
             *n += 1;
         } else if s.kind == STMT_IF {
             // Recurse into both branches (else_body is 0, a real no-op
@@ -3537,7 +3630,11 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         }
         let p = unsafe { param_read(f.params_ptr, pi) };
         let off = -8 * (n as i32 + 1);
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off }) };
+        // MILESTONE 102: parameters are always `is_char: 0` -- `char`
+        // is not yet a parameter type in this subset (parse_params()
+        // still only accepts `TOK_INT`), a real, disclosed scope cut,
+        // not an oversight.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: 0 }) };
         n += 1;
         pi += 1;
     }
@@ -3545,12 +3642,18 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
     Ok(n)
 }
 
-unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<i32> {
+/// MILESTONE 102: now returns `(stack_off, is_char)` instead of a bare
+/// offset -- gen_expr()'s own EXPR_IDENT read (the only site that needs
+/// the type; STMT_ASSIGN's store is always the same full 8 bytes
+/// regardless of type, see emit_mov_rbp_off_rax()'s call site) uses the
+/// second field to choose a real narrower load. Both existing call
+/// sites updated; STMT_ASSIGN's just ignores the new field.
+unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8)> {
     let mut i: u64 = 0;
     while i < nvars {
         let v = unsafe { var_read(vars_ptr, i) };
         if unsafe { same_span(src_ptr, v.name_off as u64, v.name_len as u64, ident_off, ident_len) } {
-            return Some(v.stack_off);
+            return Some((v.stack_off, v.is_char));
         }
         i += 1;
     }
@@ -3681,6 +3784,29 @@ impl CodeBuf {
     }
     unsafe fn emit_mov_rax_rbp_off(&mut self, off: i32) {
         unsafe { self.push_bytes(&[0x48, 0x8B, 0x45, off as i8 as u8]) }; // mov rax, [rbp+disp8]
+    }
+    /// MILESTONE 102: `movsx rax, byte [rbp+disp8]` -- REX.W + `0F BE`
+    /// (MOVSX r64, r/m8 per the Intel SDM's own encoding table, the
+    /// same opcode family emit_movzx_eax_al() below already uses for
+    /// its own 8-bit-source form, `0F B6`, just the sign- instead of
+    /// zero-extending sibling and reading from memory instead of AL)
+    /// with the exact same ModRM byte (`0x45` -- mod=01/reg=rax(000)/
+    /// rm=rbp(101), disp8 follows) emit_mov_rax_rbp_off() above already
+    /// uses for its full-width sibling. This is the ONLY place a `char`
+    /// variable's real narrowness shows up in codegen: the stack slot
+    /// itself stays a full 8 bytes (collect_vars_rec()'s layout is
+    /// completely unchanged by this milestone), so a `char` is always
+    /// STORED as a full 8-byte value (STMT_ASSIGN's
+    /// emit_mov_rbp_off_rax() is untouched) -- reading back only its
+    /// low byte, sign-extended, is what makes `char c = 300;` truncate
+    /// to `44`, and `char c = 200;` truncate-and-sign-extend to `-56`
+    /// (this subset's `char` is signed, matching the default `char`
+    /// signedness of a real x86_64 SysV C compiler), on the very next
+    /// read -- with no separate "truncate on store" codegen needed at
+    /// all, since both operations read/write the identical low byte of
+    /// the same little-endian slot.
+    unsafe fn emit_movsx_rax_rbp_off_byte(&mut self, off: i32) {
+        unsafe { self.push_bytes(&[0x48, 0x0F, 0xBE, 0x45, off as i8 as u8]) };
     }
     unsafe fn emit_mov_rbp_off_rax(&mut self, off: i32) {
         unsafe { self.push_bytes(&[0x48, 0x89, 0x45, off as i8 as u8]) }; // mov [rbp+disp8], rax
@@ -4130,9 +4256,21 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
     match e.kind {
         EXPR_INTLIT => unsafe { buf.emit_mov_eax_imm32(e.int_val as u32) },
         EXPR_IDENT => {
-            let off = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
-            match off {
-                Some(o) => unsafe { buf.emit_mov_rax_rbp_off(o) },
+            let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
+            match slot {
+                // MILESTONE 102: a `char` variable's whole real
+                // narrowness -- read only its low byte, sign-extended,
+                // instead of the plain full-width load every `int`
+                // variable (and every variable before this milestone)
+                // still uses. See emit_movsx_rax_rbp_off_byte()'s own
+                // doc comment for the full reasoning.
+                Some((o, is_char)) => {
+                    if is_char != 0 {
+                        unsafe { buf.emit_movsx_rax_rbp_off_byte(o) };
+                    } else {
+                        unsafe { buf.emit_mov_rax_rbp_off(o) };
+                    }
+                }
                 None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
             }
         }
@@ -4544,9 +4682,15 @@ unsafe fn gen_stmt_list(
             STMT_DECL => {}
             STMT_ASSIGN => {
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
-                let off = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
-                match off {
-                    Some(o) => unsafe { buf.emit_mov_rbp_off_rax(o) },
+                // MILESTONE 102: the store side is UNCHANGED by `char`
+                // -- always the same full 8-byte write regardless of
+                // the slot's type (the second `find_var()` field is
+                // ignored here). See emit_movsx_rax_rbp_off_byte()'s
+                // own doc comment for why storing full-width and
+                // narrowing only on read is correct, not a shortcut.
+                let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
+                match slot {
+                    Some((o, _is_char)) => unsafe { buf.emit_mov_rbp_off_rax(o) },
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 }
             }
@@ -8202,7 +8346,134 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m101 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 102: a real second type, `char`, alongside `int` --
+        // this subset's first genuine width distinction. Every stack
+        // slot stays a full 8 bytes (unchanged layout); only a `char`
+        // variable's READ narrows, via a real `movsx rax, byte
+        // [rbp+off]` (emit_movsx_rax_rbp_off_byte()) instead of the
+        // full-width load -- see that function's own doc comment for
+        // why storing full-width and narrowing only on read is
+        // correct, not a shortcut, and gives real 8-bit truncation AND
+        // real signed-char sign-extension for free, with zero
+        // store-side codegen changes.
+        // CASE 76 (in-process): basic `char` declaration, read, and
+        // arithmetic.
+        //   int main() { char c = 65; int i = c + 1; return i; }
+        // Hand-computed: c = 65 ('A'), i = 66.
+        // -------------------------------------------------------------
+        const SRC76: &[u8] = b"int main() { char c = 65; int i = c + 1; return i; }";
+        let case76_result = compile_and_run_program_callable(SRC76.as_ptr() as u64, SRC76.len() as u64);
+        w(b"  case76 (basic char decl + arithmetic, in-process) returned=");
+        if let Some(r) = case76_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 66)\n");
+        let case76_ok = case76_result == Some(66);
+        write_check(b"case76_char_decl_and_arithmetic_returns_66=", case76_ok);
+
+        w(b"\n");
+
+        // CASE 77: an out-of-range initializer truncates to a real
+        // 8-bit value on the very next READ (no separate truncate-on-
+        // store codegen exists -- see this milestone's own top doc
+        // comment). 321 = 0x141; low byte 0x41 = 65, and 65 < 128 so
+        // sign-extension doesn't matter here (see CASE 78 for the
+        // negative case).
+        //   int main() { char c = 321; return c; }
+        // Hand-computed: 321 & 0xFF = 65.
+        const SRC77: &[u8] = b"int main() { char c = 321; return c; }";
+        let case77_result = compile_and_run_program_callable(SRC77.as_ptr() as u64, SRC77.len() as u64);
+        w(b"  case77 (char truncates an out-of-range initializer, in-process) returned=");
+        if let Some(r) = case77_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 65)\n");
+        let case77_ok = case77_result == Some(65);
+        write_check(b"case77_char_truncates_out_of_range_initializer_returns_65=", case77_ok);
+
+        w(b"\n");
+
+        // CASE 78: real signed-char sign-extension, proven via a
+        // comparison rather than by returning a negative value
+        // directly (this subset's `int main()` return-code tests are
+        // all non-negative by convention -- a comparison's own 0/1
+        // result stays in that convention while still exercising the
+        // real negative value). 200 = 0xC8; as a signed byte that's
+        // -56 (200 - 256), matching a real x86_64 SysV C compiler's
+        // default (signed) `char`.
+        //   int main() { char c = 200; return c == -56; }
+        // Hand-computed: c reads back as -56, so c == -56 is 1.
+        const SRC78: &[u8] = b"int main() { char c = 200; return c == -56; }";
+        let case78_result = compile_and_run_program_callable(SRC78.as_ptr() as u64, SRC78.len() as u64);
+        w(b"  case78 (char is signed -- 200 sign-extends to -56, in-process) returned=");
+        if let Some(r) = case78_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case78_ok = case78_result == Some(1);
+        write_check(b"case78_char_is_signed_200_sign_extends_to_neg56=", case78_ok);
+
+        w(b"\n");
+
+        // CASE 79: `char` used as an ordinary `while`-loop counter --
+        // in-process (Callable), deliberately NOT the real on-disk-ELF
+        // + fork()/exec()/wait() path every other milestone since 69
+        // reaches for as its strongest verification tier. This is a
+        // real, disclosed scope decision, not an oversight: while
+        // developing this milestone, adding a FOURTH real fork()/
+        // exec()/wait() self-test cycle here (on top of this suite's
+        // already-large existing count) reproducibly made the KERNEL
+        // itself panic later in the very same boot -- `tasks::
+        // run_preemption_demo()` (kernel/src/tasks.rs)'s first 16 KiB
+        // worker-stack allocation failing against the kernel's own
+        // fixed 100 KiB heap (`kernel/src/allocator.rs::HEAP_SIZE`,
+        // its own doc comment already says "small on purpose for
+        // milestone 3 ... not sized for real workloads yet"). Isolated
+        // by direct experiment (see README.md's own Milestone 102
+        // entry): the ORIGINAL Milestone 101 cc.elf boots fine; THIS
+        // milestone's larger cc.elf with CASE 76-78 added (no new real
+        // process) also boots fine; only adding a fourth real exec()
+        // cycle here reproduces the panic, both with the original and
+        // the grown cc.elf. That points at a genuine, PRE-EXISTING
+        // margin problem (most likely a real, not-yet-found kernel-heap
+        // leak across the many real process fork()/exec()/wait() self-
+        // test cycles this suite already runs each boot, compounded by
+        // that fixed 100 KiB budget never having been revisited since
+        // Milestone 3) -- a real bug, honestly disclosed here and in
+        // README.md's own Milestone 102 entry, NOT fixed in this
+        // milestone (out of scope for a compiler-frontend `char`-type
+        // milestone; a real candidate for a future one).
+        //   int main() { char c = 10; int sum = 0;
+        //                while (c > 0) { sum = sum + c; c = c - 1; }
+        //                return sum; }
+        // Hand-computed: 10+9+...+1 = 55.
+        const SRC79: &[u8] = b"int main() { char c = 10; int sum = 0; while (c > 0) { sum = sum + c; c = c - 1; } return sum; }";
+        let case79_result = compile_and_run_program_callable(SRC79.as_ptr() as u64, SRC79.len() as u64);
+        w(b"  case79 (char as a while-loop counter, in-process) returned=");
+        if let Some(r) = case79_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 55)\n");
+        let case79_ok = case79_result == Some(55);
+        write_check(b"case79_char_while_loop_counter_returns_55=", case79_ok);
+
+        w(b"\n");
+
+        let overall_m102 = case76_ok && case77_ok && case78_ok && case79_ok;
+        w(b"OVERALL_M102=");
+        w(if overall_m102 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 { 0 } else { 1 });
     }
 }
 

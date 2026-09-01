@@ -819,6 +819,24 @@
 // now COMPLETE (if/else, while, for, break/continue, switch,
 // goto/labels, function calls, recursion).
 //
+// MILESTONE 93 raises `MAX_FUNCS` 4 -> 8 and `MAX_TOKENS` 128 -> 256 --
+// the bump Milestones 76/79/84/90 each explicitly weighed and DEFERRED
+// for lack of "a concrete program driving it". Now that full C control
+// flow is in place (Milestone 92), CASE 61 is that program: six
+// functions, one forward call, > 128 tokens. Both caps are transient
+// `malloc()`ed scratch buffers freed at process exit, so raising them
+// has zero effect on cc.elf's own compiled/linked size -- exactly the
+// reasoning MAX_TOKENS' own 64 -> 128 bump (Milestone 70) used.
+// `MAX_PARAMS` stays 4: only four argument registers, and stack-passed
+// arguments are genuine new codegen (a separate milestone). One new
+// self-test case, CASE 61 (in-process, six functions + a forward call
+// -> 30).
+//
+// Still genuinely open after Milestone 93: `MAX_PARAMS` (4 -- see
+// above); no arrays/pointers; only the `int` type; the compiler
+// self-test still leaks per-compile (bounded, not fixed); one 4 KiB
+// stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -1049,7 +1067,11 @@ struct Token {
 /// 128 is real, deliberate headroom (roughly 2x CASE 11's own 68) for
 /// this and future milestones' own combined-source test cases, not
 /// picked to exactly fit today's one known failure.
-const MAX_TOKENS: usize = 128;
+// MILESTONE 93: raised 128 -> 256 alongside MAX_FUNCS 4 -> 8 -- a
+// six-function program (CASE 61) lexes past 128 tokens. Same "transient
+// malloc()ed scratch, zero effect on cc.elf's linked size" reasoning as
+// the 64 -> 128 bump at Milestone 70.
+const MAX_TOKENS: usize = 256;
 
 unsafe fn tok_write(toks_ptr: u64, idx: u64, t: Token) {
     unsafe { core::ptr::write((toks_ptr + idx * core::mem::size_of::<Token>() as u64) as *mut Token, t) };
@@ -1461,13 +1483,20 @@ struct ParamInfo {
 const MAX_PARAMS: u64 = 4;
 
 /// MILESTONE 72: the maximum number of function definitions a single
-/// program may contain -- real, deliberate, small headroom (2x this
-/// milestone's own largest real test program, which uses 2 functions),
-/// not picked to exactly fit today's cases; a real, disclosed,
-/// deliberately-unraised cap, the same "small real headroom, not
-/// maximal generality" discipline MAX_TOKENS/MAX_VARS above already
-/// established for their own milestones.
-const MAX_FUNCS: u64 = 4;
+/// program may contain.
+/// MILESTONE 93: raised 4 -> 8. Now that the subset expresses full C
+/// control flow (Milestone 92), real multi-function test programs
+/// naturally want more than four -- Milestones 76/79/84/90 each
+/// explicitly weighed and DEFERRED this bump for lack of "a concrete
+/// program driving it"; CASE 61 is that program (six functions, one
+/// forward call). `funcs_ptr` is a transient `malloc(MAX_FUNCS * size
+/// of FuncSym)` scratch buffer freed at process exit, so raising this
+/// has zero effect on cc.elf's own compiled/linked size -- exactly the
+/// reasoning MAX_TOKENS' own bump (64 -> 128, Milestone 70) already
+/// used. `MAX_PARAMS` stays 4: this codegen's calling convention only
+/// has four argument registers (RDI/RSI/RDX/RCX) and stack-passed
+/// arguments are genuine new codegen, a separate milestone.
+const MAX_FUNCS: u64 = 8;
 
 /// MILESTONE 74: the maximum number of real forward-call PATCH-LIST
 /// entries a single program's own codegen pass may record (see
@@ -7337,7 +7366,42 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m92 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 93: MAX_FUNCS 4 -> 8, MAX_TOKENS 128 -> 256.
+        //
+        // CASE 61 (in-process Callable path): SIX functions in one
+        // program -- impossible to compile under the old cap -- with a
+        // real forward call (`poly` calls `lin`, defined after it).
+        //   int add(int a, int b) { return a + b; }
+        //   int mul(int a, int b) { return a * b; }
+        //   int neg(int x) { return 0 - x; }
+        //   int poly(int x) { return add(mul(x, x), lin(x)); }
+        //   int lin(int x) { return add(mul(3, x), 7); }        // x^2 + 3x + 7, split
+        //   int main() { return poly(4) + neg(5); }
+        // Hand-computed: lin(4) = 3*4 + 7 = 19; poly(4) = 4*4 + 19 = 35;
+        // neg(5) = -5; main = 35 + (-5) = 30. Any function-table or
+        // forward-patch bug at 6 > 4 functions blows this.
+        // -------------------------------------------------------------
+        const SRC61: &[u8] = b"int add(int a, int b) { return a + b; } int mul(int a, int b) { return a * b; } int neg(int x) { return 0 - x; } int poly(int x) { return add(mul(x, x), lin(x)); } int lin(int x) { return add(mul(3, x), 7); } int main() { return poly(4) + neg(5); }";
+        let case61_result = compile_and_run_program_callable(SRC61.as_ptr() as u64, SRC61.len() as u64);
+        w(b"  case61 (six functions + a forward call, in-process) returned=");
+        if let Some(r) = case61_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 30)\n");
+        let case61_ok = case61_result == Some(30);
+        write_check(b"case61_six_functions_forward_call_returns_30=", case61_ok);
+
+        w(b"\n");
+
+        let overall_m93 = case61_ok;
+        w(b"OVERALL_M93=");
+        w(if overall_m93 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 { 0 } else { 1 });
     }
 }
 

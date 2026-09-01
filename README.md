@@ -6425,6 +6425,35 @@ self-test suite, genuinely open for a future pass.
       still leaks per-compile (bounded, not fixed); one 4 KiB stack
       page per process.
 
+- [x] **Milestone 93**: `MAX_FUNCS` 4 &rarr; 8, `MAX_TOKENS` 128 &rarr;
+      256 in the self-hosted subset-C compiler -- the bump Milestones
+      76/79/84/90 each explicitly weighed and *deferred* for lack of "a
+      concrete program driving it". Now that full C control flow is in
+      place (Milestone 92), CASE 61 is that program: **six functions**,
+      one forward call, over 128 tokens. Both caps are transient
+      `malloc()`ed scratch buffers freed at process exit, so raising
+      them has zero effect on `cc.elf`'s own compiled/linked size --
+      exactly the reasoning `MAX_TOKENS`' own 64&rarr;128 bump
+      (Milestone 70) used. `MAX_PARAMS` stays 4: this codegen's calling
+      convention has only four argument registers (RDI/RSI/RDX/RCX) and
+      stack-passed arguments are genuine new codegen, a separate
+      milestone.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`). Two QEMU
+      boots, fresh then reused. CASE 61 (in-process -- six functions,
+      `poly` forward-calls `lin`, computes `x^2 + 3x + 7` split across
+      helpers plus `neg`) returns `30`. Both boots. `OVERALL_M93=PASS`,
+      `OVERALL_M68`..`M92` all still PASS (including `OVERALL_M72`/`M74`,
+      the function-call and forward-call milestones -- no regression
+      from the table-size bump), `milestone 64`/`65`/`stdiotest` all
+      still PASS, fresh vs. reused OVERALL markers byte-identical. No
+      regressions.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; only the `int` type; the compiler
+      self-test still leaks per-compile (bounded by `heap_reset()`, not
+      fixed); one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

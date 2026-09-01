@@ -71,6 +71,20 @@ pub const SYSCALL_VECTOR: u8 = 0x80;
 /// already-caught failure mode diagnosable at a glance in the serial
 /// log, and gives it a real, direct, end-to-end verification for the
 /// first time.
+///
+/// MILESTONE 100 UPDATE: the "single 4 KiB stack page" premise above is
+/// now historical. `process.rs` maps `1 + usertest::USER_STACK_EXTRA_PAGES`
+/// stack pages per full process (`create_process_from_image` /
+/// `create_process_from_elf`, and via them `fork`): the top page at
+/// `USER_STACK_ADDR` plus 7 more immediately below it, 32 KiB total.
+/// The subset-C compiler's recursive-descent parser ran the old single
+/// page off the bottom. `page_fault_handler` below now measures the
+/// overflow band from `usertest::USER_STACK_LIMIT` (the real bottom of
+/// the mapped region) rather than from `USER_STACK_ADDR`; everything
+/// else about this heuristic is unchanged, and there is still no
+/// software recursion-depth counter -- the extra pages just move the
+/// wall further out. The one-off Milestone 27 `usertest::setup()` demo
+/// still maps a single page (its hand-assembled program never pushes).
 const STACK_GUARD_REGION_SIZE: u64 = 0x10_0000; // 1 MiB
 
 lazy_static! {
@@ -272,15 +286,22 @@ extern "x86-interrupt" fn page_fault_handler(
         // STACK_GUARD_REGION_SIZE bytes of it is overwhelmingly likely
         // the active process running its own stack pointer off the
         // bottom of its single mapped page.
-        let stack_bottom = usertest::USER_STACK_ADDR;
+        // MILESTONE 100: the mapped stack is no longer one page -- it is
+        // the top page at USER_STACK_ADDR plus USER_STACK_EXTRA_PAGES
+        // below it, so a genuine overflow now faults below
+        // USER_STACK_LIMIT (== USER_STACK_ADDR - USER_STACK_EXTRA_PAGES
+        // * 4096), not below USER_STACK_ADDR. The 1 MiB cosmetic
+        // classification band moves down with it.
+        let stack_bottom = usertest::USER_STACK_LIMIT;
         let looks_like_stack_overflow = !error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION)
             && fault_addr < stack_bottom
             && fault_addr >= stack_bottom.saturating_sub(STACK_GUARD_REGION_SIZE);
         if looks_like_stack_overflow {
             let _ = writeln!(
                 serial(),
-                "milestone 75: STACK OVERFLOW -- process {active} ran off the bottom of its own single {}-byte stack page (fault address {:?}, {} bytes below USER_STACK_ADDR {:#x} -- inside this kernel's real, deliberately-unmapped guard gap below the stack, not a wild-pointer SIGSEGV) -- terminating this process, kernel continues",
-                usertest::USER_STACK_SIZE,
+                "milestone 75/100: STACK OVERFLOW -- process {active} ran off the bottom of its {}-byte ({}-page) stack (fault address {:?}, {} bytes below the stack limit {:#x} -- inside this kernel's real, deliberately-unmapped guard gap below the stack, not a wild-pointer SIGSEGV) -- terminating this process, kernel continues",
+                usertest::USER_STACK_TOTAL_BYTES,
+                1 + usertest::USER_STACK_EXTRA_PAGES,
                 Cr2::read(),
                 stack_bottom - fault_addr,
                 stack_bottom

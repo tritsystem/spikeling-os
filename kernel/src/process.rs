@@ -661,7 +661,19 @@ pub struct Process {
     label: &'static str,
     pml4_frame: PhysFrame<Size4KiB>,
     code_frame: PhysFrame<Size4KiB>,
+    /// The TOP stack page, at `usertest::USER_STACK_ADDR`. Unchanged in
+    /// meaning since Milestone 30 -- `rsp` starts just above it and the
+    /// argv/envp writer works relative to it, so every reader of this
+    /// field keeps working as-is.
     stack_frame: PhysFrame<Size4KiB>,
+    /// MILESTONE 100: `usertest::USER_STACK_EXTRA_PAGES` frames backing
+    /// the pages immediately BELOW `stack_frame`, `extra_stack_frames[i]`
+    /// backing `[USER_STACK_ADDR - (i+1)*4096, USER_STACK_ADDR - i*4096)`.
+    /// Always fully populated (mapped eagerly at process creation, unlike
+    /// the lazy `heap_frames`/`extra_frames`) -- a stack page that is not
+    /// there when `rsp` reaches it is a fault, not a demand-page
+    /// opportunity. Copied byte-for-byte on `fork`, freed on teardown.
+    extra_stack_frames: Vec<PhysFrame<Size4KiB>>,
     /// MILESTONE 33/57: this process's own private heap frames, ALWAYS
     /// exactly `HEAP_PAGE_COUNT` entries long, indexed by heap page number
     /// (`heap_frames[i]` backs `HEAP_START + i*PAGE_SIZE`). As of
@@ -2695,6 +2707,13 @@ fn reclaim_process_frames(p: Process) {
             fa.deallocate_frame(p.stack_frame);
         }
         n += 3;
+        // MILESTONE 100: the extra stack pages below USER_STACK_ADDR --
+        // always fully populated (mapped eagerly at creation), so unlike
+        // heap_frames/extra_frames there is nothing sparse to skip.
+        for frame in p.extra_stack_frames.iter().copied() {
+            unsafe { fa.deallocate_frame(frame) };
+            n += 1;
+        }
         // MILESTONE 57: heap_frames is now sparse (`Option` per slot,
         // `None` for a never-demand-paged page) -- only free the ones
         // that actually got a real physical frame mapped in.
@@ -3069,6 +3088,37 @@ pub(crate) fn dup2_fd(id: u8, fd: u64, newfd: u64) -> Option<bool> {
     })?
 }
 
+/// MILESTONE 100: map `usertest::USER_STACK_EXTRA_PAGES` extra stack
+/// pages into `process_mapper`, immediately BELOW `USER_STACK_ADDR`
+/// (returned frame `i` backs `USER_STACK_ADDR - (i+1)*PAGE_SIZE`). Used
+/// by both real process constructors so the "grow the stack down by N
+/// pages" change lives in exactly one place. Not zeroed -- matching the
+/// single `stack_frame` map above it, which never was either (nothing
+/// reads stack memory it hasn't first written). `flags` is the same
+/// PRESENT|WRITABLE|USER_ACCESSIBLE every other user page uses.
+fn map_extra_stack_pages(
+    process_mapper: &mut OffsetPageTable,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+    flags: PageTableFlags,
+) -> Result<Vec<PhysFrame<Size4KiB>>, &'static str> {
+    let mut frames = Vec::with_capacity(usertest::USER_STACK_EXTRA_PAGES as usize);
+    for i in 0..usertest::USER_STACK_EXTRA_PAGES {
+        let frame = frame_allocator
+            .allocate_frame()
+            .ok_or("out of physical frames (extra stack)")?;
+        let va = usertest::USER_STACK_ADDR - (i + 1) * PAGE_SIZE as u64;
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+        unsafe {
+            process_mapper
+                .map_to(page, frame, flags, frame_allocator)
+                .map_err(|_| "map_to failed (extra stack page)")?
+                .flush();
+        }
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
 /// MILESTONE 34: the actual page-table-building mechanism, factored out
 /// so BOTH the hardcoded PROCESS_A/PROCESS_B path (create_process(),
 /// below) and loader.rs's real-file path (create_loaded_process(), the
@@ -3161,6 +3211,15 @@ fn create_process_from_image(
         stack_frame.start_address().as_u64()
     );
 
+    // MILESTONE 100: extra stack pages below USER_STACK_ADDR.
+    let extra_stack_frames = map_extra_stack_pages(&mut process_mapper, frame_allocator, flags)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 100: process {label} -- {} extra stack page(s) mapped below USER_STACK_ADDR ({} KiB total stack)",
+        extra_stack_frames.len(),
+        usertest::USER_STACK_TOTAL_BYTES / 1024
+    );
+
     // MILESTONE 57: the heap's virtual range (HEAP_START..HEAP_START+
     // HEAP_SIZE, same private-P3/P2/P1-chain territory as code/stack
     // above -- HEAP_START shares USER_CODE_ADDR/USER_STACK_ADDR's
@@ -3206,6 +3265,7 @@ fn create_process_from_image(
         pml4_frame: new_pml4_frame,
         code_frame,
         stack_frame,
+        extra_stack_frames,
         heap_frames,
         heap_used: 0,
         // MILESTONE 35: every process gets a real, empty fd table
@@ -4270,6 +4330,16 @@ fn create_process_from_elf(
         stack_frame.start_address().as_u64()
     );
 
+    // MILESTONE 100: extra stack pages below USER_STACK_ADDR -- same
+    // helper, same flags, as the flat-image constructor.
+    let extra_stack_frames = map_extra_stack_pages(&mut process_mapper, frame_allocator, flags)?;
+    let _ = writeln!(
+        serial(),
+        "milestone 100: process {label} -- {} extra stack page(s) mapped below USER_STACK_ADDR ({} KiB total stack)",
+        extra_stack_frames.len(),
+        usertest::USER_STACK_TOTAL_BYTES / 1024
+    );
+
     // MILESTONE 57: same reserved-but-not-mapped heap as
     // create_process_from_image() -- see that function's own comment for
     // the full reasoning; sbrk() itself still only recognizes
@@ -4289,6 +4359,7 @@ fn create_process_from_elf(
         pml4_frame: new_pml4_frame,
         code_frame,
         stack_frame,
+        extra_stack_frames,
         heap_frames,
         heap_used: 0,
         // MILESTONE 35: create_process_from_elf predates the fd table --
@@ -4660,6 +4731,7 @@ fn fork_build_child(
     phys_mem_offset: VirtAddr,
     parent_code_frame: PhysFrame<Size4KiB>,
     parent_stack_frame: PhysFrame<Size4KiB>,
+    parent_extra_stack_frames: &[PhysFrame<Size4KiB>],
     parent_heap_frames: &[Option<PhysFrame<Size4KiB>>],
     parent_extra_frames: &[(VirtAddr, PhysFrame<Size4KiB>)],
 ) -> Result<Process, &'static str> {
@@ -4674,6 +4746,23 @@ fn fork_build_child(
     unsafe {
         core::ptr::copy_nonoverlapping(parent_stack_virt.as_ptr::<u8>(), child_stack_virt.as_mut_ptr::<u8>(), PAGE_SIZE)
     };
+
+    // MILESTONE 100: the extra stack pages. `create_process_from_image`
+    // already allocated and mapped the child's own set (same count,
+    // same virtual addresses) -- fork only needs to copy the parent's
+    // real bytes into each, index for index, exactly like the single
+    // top page just above. Counts always match: both went through the
+    // same constructor with the same `USER_STACK_EXTRA_PAGES`.
+    for (child_frame, parent_frame) in child
+        .extra_stack_frames
+        .iter()
+        .copied()
+        .zip(parent_extra_stack_frames.iter().copied())
+    {
+        let cv = phys_mem_offset + child_frame.start_address().as_u64();
+        let pv = phys_mem_offset + parent_frame.start_address().as_u64();
+        unsafe { core::ptr::copy_nonoverlapping(pv.as_ptr::<u8>(), cv.as_mut_ptr::<u8>(), PAGE_SIZE) };
+    }
 
     // MILESTONE 57: `child.heap_frames` came back from
     // create_process_from_image() as 64 `None`s (nothing mapped yet --
@@ -4800,6 +4889,10 @@ pub(crate) fn fork(parent_id: u8, resume_rip: u64, resume_rsp: u64) -> Option<u8
     let snapshot = with_process_mut(parent_id, |p| {
         let code_frame = p.code_frame;
         let stack_frame = p.stack_frame;
+        // MILESTONE 100: the extra stack pages travel with the single
+        // top page -- fork_build_child copies each one's real bytes into
+        // the child's own already-mapped set.
+        let extra_stack_frames = p.extra_stack_frames.clone();
         let heap_frames = p.heap_frames.clone();
         let heap_used = p.heap_used;
         let fd0 = p.fds[0].clone();
@@ -4813,14 +4906,14 @@ pub(crate) fn fork(parent_id: u8, resume_rip: u64, resume_rsp: u64) -> Option<u8
         // ELF-loaded process's pages beyond page 0 were silently never
         // copied into a forked child at all).
         let extra_frames = p.extra_frames.clone();
-        (code_frame, stack_frame, heap_frames, heap_used, [fd0, fd1, fd2, fd3], label, pgid, extra_frames)
+        (code_frame, stack_frame, extra_stack_frames, heap_frames, heap_used, [fd0, fd1, fd2, fd3], label, pgid, extra_frames)
     })?;
-    let (parent_code, parent_stack, parent_heap_frames, parent_heap_used, parent_fds, parent_label, parent_pgid, parent_extra_frames) =
+    let (parent_code, parent_stack, parent_extra_stack_frames, parent_heap_frames, parent_heap_used, parent_fds, parent_label, parent_pgid, parent_extra_frames) =
         snapshot;
 
     let phys_mem_offset = memory::phys_mem_offset();
     let build_result = memory::with_frame_allocator(|frame_allocator| {
-        fork_build_child(frame_allocator, phys_mem_offset, parent_code, parent_stack, &parent_heap_frames, &parent_extra_frames)
+        fork_build_child(frame_allocator, phys_mem_offset, parent_code, parent_stack, &parent_extra_stack_frames, &parent_heap_frames, &parent_extra_frames)
     });
     let mut child = match build_result {
         Some(Ok(c)) => c,
@@ -6403,7 +6496,9 @@ pub fn self_test_frame_reclaim() {
             // versus Milestone 54's original eager-heap-mapping design,
             // computed live rather than hardcoded either way.
             let mapped_heap = p.heap_frames.iter().filter(|f| f.is_some()).count();
-            let leaf = 3 + mapped_heap + p.extra_frames.len();
+            // 3 = pml4 + code + top stack page; MILESTONE 100 adds the
+            // eagerly-mapped extra stack pages (always a fixed count).
+            let leaf = 3 + p.extra_stack_frames.len() + mapped_heap + p.extra_frames.len();
             count_private_page_tables(p.pml4_frame, phys_mem_offset) + leaf
         })
     }

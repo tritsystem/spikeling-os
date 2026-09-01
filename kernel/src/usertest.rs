@@ -75,7 +75,31 @@ use x86_64::structures::paging::{FrameAllocator, Mapper, Page, PageTableFlags, P
 
 pub const USER_CODE_ADDR: u64 = 0x_5555_5000_0000;
 pub const USER_STACK_ADDR: u64 = 0x_5555_6000_0000;
+/// The ONE page at `USER_STACK_ADDR` itself -- the top of the stack.
+/// `rsp` still starts at `USER_STACK_ADDR + USER_STACK_SIZE` for every
+/// process (unchanged since Milestone 30), and the argv/envp writer
+/// still writes down from there. This constant is deliberately NOT the
+/// total stack size -- see `USER_STACK_EXTRA_PAGES` below.
 pub const USER_STACK_SIZE: u64 = 4096;
+/// MILESTONE 100: extra stack pages mapped BELOW `USER_STACK_ADDR`,
+/// i.e. backing `[USER_STACK_ADDR - USER_STACK_EXTRA_PAGES*4096,
+/// USER_STACK_ADDR)`. The x86 stack grows DOWN from
+/// `USER_STACK_ADDR + USER_STACK_SIZE`, so these pages extend how far
+/// `rsp` can descend before an unmapped fault. Every full process
+/// (`create_process_from_image`/`create_process_from_elf`, and via
+/// them `fork`) maps all of them eagerly; the one-off Milestone 27
+/// `usertest::setup()` ring-3 demo keeps a single page (its hand-
+/// assembled program never pushes). 7 extra -> 8 pages -> 32 KiB total:
+/// the subset-C compiler's recursive-descent parser (`tools/cc_src`)
+/// ran a single 4 KiB page off the bottom at Milestone 100's first
+/// attempt, and it will only get deeper on the way to self-hosting.
+pub const USER_STACK_EXTRA_PAGES: u64 = 7;
+/// Total mapped stack, in bytes: the top page plus every extra page.
+pub const USER_STACK_TOTAL_BYTES: u64 = USER_STACK_SIZE + USER_STACK_EXTRA_PAGES * 4096;
+/// Lowest address the mapped stack reaches. A fault strictly below this
+/// (and not a protection violation) is a genuine stack overflow -- the
+/// process ran `rsp` off the bottom of even the extra pages.
+pub const USER_STACK_LIMIT: u64 = USER_STACK_ADDR - USER_STACK_EXTRA_PAGES * 4096;
 
 /// MILESTONE 31: offset (from the start of a process's code page) and
 /// fixed length (in bytes) of the message region the shared USER_PROGRAM

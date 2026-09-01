@@ -6651,6 +6651,52 @@ self-test suite, genuinely open for a future pass.
       tracking; the compiler self-test still leaks per-compile (bounded,
       not eliminated); one 4 KiB stack page per process.
 
+- [x] **Milestone 100**: multi-page user stack -- a **kernel** change,
+      not a compiler feature. Every full process
+      (`create_process_from_image` / `create_process_from_elf`, and via
+      them `fork`) now maps `1 + usertest::USER_STACK_EXTRA_PAGES` stack
+      pages: the top page at `USER_STACK_ADDR` (unchanged -- `rsp` still
+      starts just above it, the argv/envp writer is untouched) plus **7
+      more immediately below it, 32 KiB total**. The x86 stack grows
+      down, so the extra pages simply let `rsp` descend further before
+      an unmapped fault. The Milestone 75 stack-overflow guard now
+      measures its band from `USER_STACK_LIMIT` (the real bottom of the
+      mapped region) instead of `USER_STACK_ADDR`. Extra frames are
+      mapped eagerly (a missing stack page is a fault, not a
+      demand-page opportunity), copied byte-for-byte on `fork`, and
+      freed on teardown.
+
+      **Why now**: the self-hosted subset-C compiler's recursive-descent
+      parser ran a single 4 KiB page off the bottom -- Milestone 101's
+      first attempt (multi-declarator) stack-overflowed mid-self-test,
+      bisected to exactly that. This milestone lifts the ceiling that
+      the roadmap's own "one 4 KiB stack page per process" caveat named;
+      Milestone 101 re-lands the reverted feature as the end-to-end
+      proof the pages are real and usable.
+
+      **Verified**: `cargo build` clean. Two QEMU boots, fresh then
+      reused. Pre-registered predictions, all confirmed: the
+      `milestone 54` frame-reclaim self-test's independently-counted
+      per-process frame cost rose by exactly **7** (8 &rarr; 15,
+      `symmetric=true`, `fully drained=true` -- every freed frame
+      reused); `case34` (cc's unbounded-recursion test) still hits the
+      guard -- `milestone 75/100: STACK OVERFLOW ... 8 bytes below the
+      stack limit 0x55555fff9000` (`== USER_STACK_ADDR - 7*0x1000`),
+      `signaled` not `exited`; the three `milestone 41` SIGSEGV tests,
+      `milestone 30`/`36`/`37` (process create / ELF load / fork),
+      `milestone 58` (exec+argv), `milestone 64`/`65` (mmap), and
+      `OVERALL_M68`..`M99` from the embedded `cc.elf` all still PASS,
+      byte-identical fresh vs. reused. Every process's
+      `milestone 100:` line confirms `7 extra stack page(s) ... 32 KiB
+      total stack`. No regressions.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; the `char` *type* and all width
+      tracking; the compiler self-test still leaks per-compile (bounded,
+      not eliminated); the one-off Milestone 27 `usertest::setup()` demo
+      still maps a single stack page (its hand-assembled program never
+      pushes).
+
 ## Building and running
 
 Requires:

@@ -6310,6 +6310,36 @@ self-test suite, genuinely open for a future pass.
       compiler self-test still leaks per-compile (bounded, not fixed);
       one 4 KiB stack page per process.
 
+- [x] **Milestone 90**: the conditional (ternary) operator
+      `cond ? a : b` in the self-hosted subset-C compiler.
+
+      One new parser layer -- `parse_ternary` -- sits directly above
+      `parse_logic_or` (looser than `||`, looser than everything except
+      assignment, real C's ordering) and is now what every "parse a
+      whole expression" position calls. Right-associative
+      (`a ? b : c ? d : e` is `a ? b : (c ? d : e)`), the middle operand
+      a full expression. One new `EXPR_TERNARY` AST kind whose codegen
+      **is** `gen_stmt_list`'s `STMT_IF` lowering (test + forward-patched
+      `jz` + then-branch + forward-patched `jmp` + else-branch) but as an
+      *expression* -- exactly one branch runs and leaves its value in
+      RAX. **Zero new CodeBuf encodings.** Field reuse:
+      `EXPR_TERNARY`'s `left`/`right`/`call_args_ptr` = cond/then/else.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`), no
+      warnings. Two QEMU boots, fresh then reused. CASE 54 (in-process
+      -- the operator both ways, its result stored and reused) returns
+      `73`; CASE 55 (real on-disk-ELF + kernel `exec()`+`wait()` --
+      ternary as a sub-expression inside real arithmetic, with a `*` in
+      one branch and a `%` in another, two `?:` added together) returns
+      `12`. Both boots. `OVERALL_M90=PASS`, `OVERALL_M68`..`M89` all
+      still PASS, `milestone 64`/`65`/`stdiotest` all still PASS, fresh
+      vs. reused OVERALL markers byte-identical. No regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each); no
+      arrays/pointers, no additional C types; no `switch`/`goto`; the
+      compiler self-test still leaks per-compile (bounded, not fixed);
+      one 4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

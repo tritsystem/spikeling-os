@@ -730,6 +730,25 @@
 // `switch`/`goto`; the compiler self-test still leaks per-compile
 // (bounded, not fixed); one 4 KiB stack page per process.
 //
+// MILESTONE 90 adds the conditional (ternary) operator, `cond ? a : b`.
+// One new parser layer, `parse_ternary`, sits directly above
+// `parse_logic_or` (looser than `||`, looser than everything except
+// assignment -- real C ordering) and is now what every "parse a whole
+// expression" position calls. Right-associative (`a?b:c?d:e` is
+// `a?b:(c?d:e)`), the middle operand a full expression. One new EXPR
+// kind whose codegen IS gen_stmt_list::STMT_IF's exact jz/jmp/patch
+// shape, but as an expression leaving its value in RAX: exactly one of
+// the two branches runs. ZERO new CodeBuf encodings. Field reuse --
+// EXPR_TERNARY's `left`/`right`/`call_args_ptr` = cond/then/else. Two
+// new self-test cases: CASE 54 (both ways, in-process -> 73) and CASE
+// 55 (ternary as a sub-expression in real arithmetic, on-disk ELF
+// -> 12).
+//
+// Still genuinely open after Milestone 90: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); no arrays/pointers, no additional C types; no
+// `switch`/`goto`; the compiler self-test still leaks per-compile
+// (bounded, not fixed); one 4 KiB stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -915,6 +934,13 @@ const TOK_CONTINUE: u8 = 45; // keyword "continue"
 // into Milestone 84's compound-assignment machinery with binop `b'%'`.
 const TOK_PERCENT: u8 = 46;   // "%"
 const TOK_PERCENTEQ: u8 = 47; // "%="
+// MILESTONE 90: the conditional (ternary) operator `? :`. Two single-
+// char tokens; the whole feature is one new parser layer above
+// `logic_or` and one new EXPR kind whose codegen reuses the same
+// jz/jmp/patch_rel32 machinery if/else already uses (zero new CodeBuf
+// encodings). `:` has no other use in this subset.
+const TOK_QUESTION: u8 = 48; // "?"
+const TOK_COLON: u8 = 49;    // ":"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1174,6 +1200,8 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             b'|' => TOK_PIPE,
             b'^' => TOK_CARET,
             b'%' => TOK_PERCENT, // MILESTONE 89 (a lone '%'; "%=" is caught above)
+            b'?' => TOK_QUESTION, // MILESTONE 90
+            b':' => TOK_COLON,    // MILESTONE 90
             b'~' => TOK_TILDE,
             // MILESTONE 83: lone '!' -- unreached for a genuine "!="
             // (that `continue`s above, before this match runs), so a
@@ -1207,6 +1235,7 @@ const EXPR_IDENT: u8 = 2;
 const EXPR_BINARY: u8 = 3;
 const EXPR_CALL: u8 = 4; // MILESTONE 72: a function-call expression, IDENT "(" args? ")"
 const EXPR_UNARY: u8 = 5; // MILESTONE 76: a unary-minus expression, "-" unary -- only `left` is meaningful (the operand); `right` stays 0, the same "unused field stays 0" convention this AST already uses throughout
+const EXPR_TERNARY: u8 = 6; // MILESTONE 90: `cond ? then : else` -- `left` = cond, `right` = then, `call_args_ptr` (field-reused) = else. Codegen is if/else's exact jz/jmp/patch shape, into RAX.
 
 // MILESTONE 70: comparison-operator sentinels for ExprNode.op, deliberately
 // NOT reusing raw ASCII bytes the way the four arithmetic ops do (b'+' etc)
@@ -1544,7 +1573,7 @@ impl Parser {
                             // this subset can build, e.g. `add(x, y + 1)`,
                             // the same widening parse_cond_expr's own
                             // parenthesized-factor case already relies on.
-                            let e = unsafe { self.parse_logic_or() }?;
+                            let e = unsafe { self.parse_ternary() }?;
                             unsafe { call_arg_write(args_ptr, argc as u64, e) };
                             argc += 1;
                             if unsafe { self.peek() }.kind == TOK_COMMA {
@@ -1607,7 +1636,7 @@ impl Parser {
                 // `(a < b)` is a legal sub-expression -- see this file's
                 // own top grammar comment for why that widening is
                 // deliberate.
-                let e = unsafe { self.parse_logic_or() }?;
+                let e = unsafe { self.parse_ternary() }?;
                 unsafe { self.expect(TOK_RPAREN) }?;
                 Ok(e)
             }
@@ -1976,6 +2005,38 @@ impl Parser {
         Ok(left)
     }
 
+    /// MILESTONE 90: the conditional operator --
+    /// `ternary := logic_or ("?" ternary ":" ternary)?`. Sits directly
+    /// above `logic_or` (looser than `||`, looser than everything except
+    /// assignment, exactly real C's ordering). Right-associative:
+    /// `a ? b : c ? d : e` parses as `a ? b : (c ? d : e)` because the
+    /// else branch recurses through `parse_ternary` itself. The middle
+    /// operand is also a full `parse_ternary` (real C treats it as a
+    /// parenthesis-free full expression). This is now what every "parse
+    /// a whole expression" position calls in place of `parse_logic_or`.
+    unsafe fn parse_ternary(&mut self) -> Result<u64, ParseError> {
+        let cond = unsafe { self.parse_logic_or() }?;
+        if unsafe { self.peek() }.kind != TOK_QUESTION {
+            return Ok(cond);
+        }
+        unsafe { self.advance() }; // consume '?'
+        let then_e = unsafe { self.parse_ternary() }?;
+        unsafe { self.expect(TOK_COLON) }?;
+        let else_e = unsafe { self.parse_ternary() }?;
+        let node = unsafe { alloc_expr() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut ExprNode,
+                // field reuse: left=cond, right=then, call_args_ptr=else.
+                ExprNode { kind: EXPR_TERNARY, int_val: 0, ident_off: 0, ident_len: 0, op: 0, left: cond, right: then_e, call_args_ptr: else_e, call_argc: 0 },
+            )
+        };
+        Ok(node)
+    }
+
     /// MILESTONE 88: build a STMT_DECL for `name`, and -- if the next
     /// token is `=` -- a combined initializer, desugared to a
     /// STMT_ASSIGN chained right after the decl (`decl.next = assign`).
@@ -2032,7 +2093,7 @@ impl Parser {
         } else {
             unsafe { self.advance() };
         }
-        let rhs = unsafe { self.parse_logic_or() }?;
+        let rhs = unsafe { self.parse_ternary() }?;
         if consume_semi {
             unsafe { self.expect(TOK_SEMI) }?;
         }
@@ -2094,7 +2155,7 @@ impl Parser {
             }
             TOK_RETURN => {
                 unsafe { self.advance() };
-                let e = unsafe { self.parse_logic_or() }?;
+                let e = unsafe { self.parse_ternary() }?;
                 unsafe { self.expect(TOK_SEMI) }?;
                 let node = unsafe { alloc_stmt() };
                 if node == 0 {
@@ -2157,7 +2218,7 @@ impl Parser {
                     };
                     one
                 } else {
-                    unsafe { self.parse_logic_or() }?
+                    unsafe { self.parse_ternary() }?
                 };
                 unsafe { self.expect(TOK_SEMI) }?;
                 // step (optional)
@@ -2206,7 +2267,7 @@ impl Parser {
             TOK_IF => {
                 unsafe { self.advance() };
                 unsafe { self.expect(TOK_LPAREN) }?;
-                let cond = unsafe { self.parse_logic_or() }?;
+                let cond = unsafe { self.parse_ternary() }?;
                 unsafe { self.expect(TOK_RPAREN) }?;
                 unsafe { self.expect(TOK_LBRACE) }?;
                 let then_body = unsafe { self.parse_stmt_list_until_rbrace() }?;
@@ -2236,7 +2297,7 @@ impl Parser {
             TOK_WHILE => {
                 unsafe { self.advance() };
                 unsafe { self.expect(TOK_LPAREN) }?;
-                let cond = unsafe { self.parse_logic_or() }?;
+                let cond = unsafe { self.parse_ternary() }?;
                 unsafe { self.expect(TOK_RPAREN) }?;
                 unsafe { self.expect(TOK_LBRACE) }?;
                 let body = unsafe { self.parse_stmt_list_until_rbrace() }?;
@@ -3433,6 +3494,32 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
             } else {
                 unsafe { buf.emit_neg_rax() };
             }
+        }
+        // MILESTONE 90: `cond ? then : else`. The exact if/else lowering
+        // gen_stmt_list's STMT_IF arm already uses, but as an EXPRESSION
+        // (result in RAX) rather than statements:
+        //   <cond>            (into RAX)
+        //   test rax, rax
+        //   jz else_label     (forward-patched)
+        //   <then>            (into RAX)
+        //   jmp end_label     (forward-patched)
+        // else_label:
+        //   <else>            (into RAX)
+        // end_label:
+        // Exactly one side runs; both leave their value in RAX, so the
+        // whole expression's postcondition holds either way. Zero new
+        // CodeBuf encodings -- emit_jz_placeholder/emit_jmp_placeholder/
+        // patch_rel32 are all Milestone 70's. `left`=cond, `right`=then,
+        // `call_args_ptr`=else (field reuse, see EXPR_TERNARY's const).
+        EXPR_TERNARY => {
+            unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
+            unsafe { buf.emit_test_rax_rax() };
+            let jz_field = unsafe { buf.emit_jz_placeholder() };
+            unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.right) }?;
+            let jmp_field = unsafe { buf.emit_jmp_placeholder() };
+            unsafe { buf.patch_rel32(jz_field) };
+            unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.call_args_ptr) }?;
+            unsafe { buf.patch_rel32(jmp_field) };
         }
         EXPR_BINARY => {
             // MILESTONE 76: `&&`/`||` need real SHORT-CIRCUIT codegen --
@@ -6528,7 +6615,68 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m89 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 90: the conditional (ternary) operator `? :`.
+        //
+        // CASE 54 (in-process Callable path): the operator both ways,
+        // over real variables, its result stored and reused.
+        //   int main() {
+        //       int a = 7;
+        //       int b = 3;
+        //       int m = a > b ? a : b;   // true  -> 7
+        //       int n = a < b ? a : b;   // false -> 3
+        //       return m * 10 + n;
+        //   }
+        // Hand-computed: 73.
+        // -------------------------------------------------------------
+        const SRC54: &[u8] = b"int main() { int a = 7; int b = 3; int m = a > b ? a : b; int n = a < b ? a : b; return m * 10 + n; }";
+        let case54_result = compile_and_run_program_callable(SRC54.as_ptr() as u64, SRC54.len() as u64);
+        w(b"  case54 (ternary both ways, in-process) returned=");
+        if let Some(r) = case54_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 73)\n");
+        let case54_ok = case54_result == Some(73);
+        write_check(b"case54_ternary_both_ways_returns_73=", case54_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 55 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier): ternary as a SUB-EXPRESSION
+        // inside real arithmetic, with a `*` in one branch and a `%` in
+        // another (Milestone 89), and two ternaries added together.
+        //   int main() {
+        //       int a = 5;
+        //       int r = (a > 0 ? a * 2 : 0 - a) + (a > 10 ? 999 : a % 3);
+        //       return r;
+        //   }
+        // Hand-computed: a>0 -> a*2 = 10; a>10 false -> a%3 = 5%3 = 2;
+        // 10 + 2 = 12. Only the taken branch of each `?:` contributes;
+        // a wrong branch pick gives -5+2, 10+999, etc. -- all different.
+        // -------------------------------------------------------------
+        const SRC55: &[u8] =
+            b"int main() { int a = 5; int r = (a > 0 ? a * 2 : 0 - a) + (a > 10 ? 999 : a % 3); return r; }";
+        const PATH55: &[u8] = PATH8;
+        let (elf55_ptr, elf55_len) = compile_program_standalone_elf(SRC55.as_ptr() as u64, SRC55.len() as u64);
+        let case55_ok = if elf55_ptr == 0 {
+            w(b"  case55 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH55, elf55_ptr, elf55_len, 12)
+        };
+        write_check(b"case55_real_elf_exec_ternary_subexpression_returns_12=", case55_ok);
+
+        w(b"\n");
+
+        let overall_m90 = case54_ok && case55_ok;
+        w(b"OVERALL_M90=");
+        w(if overall_m90 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 { 0 } else { 1 });
     }
 }
 

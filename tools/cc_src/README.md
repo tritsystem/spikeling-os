@@ -427,3 +427,37 @@ size grew from Milestone 110's 92720 bytes to 94032 bytes; the real
 page count as Milestone 110, just more bytes within it) -- still
 comfortably under the 64-page per-segment cap and 128-page total cap, no
 cap change needed.
+
+**Milestone 112 addition**: real `char *` pointers -- declaration and a
+real byte-narrowing dereference-READ. One new lookahead branch (`char`
+immediately followed by `*` is now a pointer declarator, mirroring `int
+*`'s own existing check); one new `VarSlot` field, `is_char_ptr` (a
+genuinely separate property from `is_char` -- a `char *`'s own value is
+never narrowed, only what it points AT); one genuinely new x86_64
+encoding, `emit_movsx_rax_mem_rax_byte()` (`MOVSX RAX, BYTE PTR [RAX]`),
+a real combination of two halves each already independently hand-
+verified by an earlier milestone (Milestone 102's own MOVSX opcode
+bytes, Milestone 108's own `[RAX]` register-indirect ModRM byte) -- the
+first pointer/array milestone since 108 to need a genuinely new
+encoding rather than only branching among existing ones. The write side
+(`*p = expr;`) is deliberately UNCHANGED -- always the ordinary full
+8-byte store, matching an ordinary `char` scalar's own store convention,
+needing zero new codegen. A real, disclosed scope restriction: the read-
+side narrowing is only recognized when the dereferenced expression is
+syntactically a plain IDENT, which costs nothing reachable in this
+milestone's own scope (no `char *` parameters/returns, no array decay to
+`char *`, no pointer arithmetic -- a local declaration is the only way
+to construct a `char *` here). Three new self-test cases, all run
+in-process (no new real `fork()`/`exec()`/`wait()` cycle): CASE 100 (a
+real, distinguishing proof `*p` narrows to a signed byte, returns `1`),
+CASE 101 (a real, distinguishing proof a write through `char *` is
+genuine aliasing, read back through a DIFFERENT access path, returns
+`1`), and CASE 102 (`int *` and `char *` dereferences coexist in one
+program with zero cross-contamination, returns `11`). See README.md's
+own Milestone 112 entry for the full design reasoning and the real,
+quoted serial-log evidence from both a fresh-disk and a reused-disk
+boot. File size grew from Milestone 111's 94032 bytes to 95816 bytes;
+the real `PT_LOAD` segment `p_memsz` is 79776 bytes, still 20 pages (the
+same page count as Milestone 111, just more bytes within it) -- still
+comfortably under the 64-page per-segment cap and 128-page total cap, no
+cap change needed.

@@ -1304,6 +1304,107 @@
 // element assignment) remains open and untouched by this milestone --
 // this is a single, narrow, honestly-scoped fix to one named asymmetry,
 // not a broader array/pointer pass.
+//
+// MILESTONE 112: real `char *` pointers -- the OTHER candidate Milestone
+// 110's own closing disclosure named alongside the `arr = expr;`
+// asymmetry Milestone 111 just resolved. A deliberately narrow first
+// slice, the same discipline every prior array/pointer milestone (108
+// through 111) already used: `char *p;` declaration (`parse_pointer_
+// decl()`, extended with a new `is_char_pointee` parameter -- `char`
+// immediately followed by `*` is now ALSO a pointer declarator,
+// TOK_CHAR's own arm in parse_stmt() gaining the exact one-token-
+// lookahead check TOK_INT's arm already had), `&c` (already worked
+// unconditionally for any variable, `int` or `char`, zero change), and a
+// real byte-narrowing dereference-READ (`*p`). Grammar delta: none at
+// all beyond the one new lookahead branch -- `*`/`&` already exist in
+// every grammar position they need.
+//
+// Unlike Milestone 109/110 (which needed ZERO new x86_64 encodings,
+// every new capability built purely by branching among sequences
+// Milestone 108 already hand-verified), this milestone needs exactly
+// ONE genuinely new encoding: `emit_movsx_rax_mem_rax_byte()`
+// (`MOVSX RAX, BYTE PTR [RAX]`, REX.W `0F BE` /r, ModRM `0x00`) --
+// real char*-dereference-read narrowing. Reasoning for why it's needed
+// at all: `char *`'s only real correctness requirement THIS milestone
+// exercises is that `*p` reads back the pointee's own low byte,
+// sign-extended, exactly matching what an ordinary `char` SCALAR's own
+// read already does (`char c = 300;` reads back `44`; `int *`'s
+// dereference has never narrowed anything, since `int` never narrows).
+// Since a `char` variable's own stack slot is STILL a full 8 bytes
+// (unchanged since Milestone 102 -- `char` never got a packed 1-byte
+// slot, only a narrower READ), the existing `emit_mov_rax_mem_rax()`
+// (`int *`'s own full-width dereference-read) would read back the
+// pointee's RAW, un-narrowed 8-byte value -- wrong for a `char *`. The
+// new encoding is a real, deliberate COMBINATION of two halves each
+// independently already hand-verified against the Intel SDM by an
+// earlier milestone: `emit_movsx_rax_rbp_off_byte()`'s own opcode bytes
+// (Milestone 102) and `emit_mov_rax_mem_rax()`'s own `[RAX]`
+// register-indirect ModRM byte (Milestone 108) -- see that function's
+// own doc comment for the full derivation.
+//
+// The one genuinely new `VarSlot` field this milestone adds,
+// `is_char_ptr` (see that field's own doc comment for the full
+// reasoning), is a real, DELIBERATELY SEPARATE property from `is_char`:
+// a `char *p;`'s own slot still has `is_char == 0` (reading `p` ITSELF,
+// e.g. `q = p;`, must load the full 8-byte address unnarrowed) and
+// `is_char_ptr == 1` (reading `*p` should narrow). Threaded from
+// `parse_pointer_decl()`'s new boolean parameter into `s.expr`
+// (otherwise always dead for a pointer-declarator STMT_DECL -- the
+// pointer's own optional initializer is handled by a separately chained
+// STMT_ASSIGN, exactly as before this milestone, so `expr` was never
+// used for anything on THIS statement kind) through to
+// `collect_vars_rec()`'s VarSlot construction, and out through
+// `find_var()`'s now-four-element return tuple (a new SEVENTH call
+// site, `EXPR_UNARY`'s own `OP_DEREF` arm, which never called
+// `find_var()` at all before this milestone -- `int *` dereference never
+// needed to distinguish anything about the pointee).
+//
+// `*p = expr;` (the WRITE side, `STMT_ASSIGN_DEREF`) is DELIBERATELY
+// UNCHANGED -- always the ordinary full 8-byte store, for both `int *`
+// and `char *` alike, exactly matching the convention an ordinary `char`
+// SCALAR's own store already uses (`char c = expr;` also always writes
+// the full 8 bytes, narrowing only ever happening on read). Since the
+// pointee, in every case this subset can reach, is always another
+// VarSlot's own full 8-byte stack slot (no packed multi-char buffer
+// exists anywhere in this language -- no `char[]`, no `malloc`-backed
+// byte buffer), writing all 8 bytes through the pointer lands on the
+// identical bytes an ordinary direct write to that same variable already
+// would -- a real, deliberate design choice, not an oversight.
+//
+// A real, deliberate, DISCLOSED scope restriction on the READ side:
+// `*p`'s char-narrowing is only recognized when `p` is syntactically a
+// plain `EXPR_IDENT` (checked directly on `e.left`'s own AST node kind).
+// This is not a limitation that costs anything reachable in THIS
+// milestone's own scope -- `char *` cannot cross a function-call
+// boundary (no `char *` parameters or return values, the same real,
+// deliberate scope cut Milestone 109 itself used for `int *` before
+// Milestone 110 later closed it), there is no array-to-pointer decay to
+// a `char *` (no `char[]` exists anywhere in this subset), and there is
+// no pointer arithmetic -- so a local `char *` DECLARATION, optionally
+// initialized via `&c`, is the ONLY way this milestone's own grammar can
+// ever construct a `char *` value, and every such value is always named
+// by a plain IDENT at its one real use site (`*p`). A future milestone
+// extending `char *` across a call boundary the way Milestone 110 did
+// for `int *` would need to revisit this restriction (and would likely
+// need real, declared-type tracking through `ParamInfo`/`FuncDef`, which
+// does not exist today for ANY type in this codegen).
+//
+// Scope, deliberately real and disclosed: single-level `char *` only (no
+// `char **`); no `char *` function parameters or return values; no
+// array-to-pointer decay (no `char[]` exists to decay from); no pointer
+// arithmetic (the same standing gap `int *` has carried since Milestone
+// 109); no `p[idx]` byte-scaled indexing through a `char *` --
+// `EXPR_INDEX`/`STMT_ASSIGN_INDEX` are UNTOUCHED by this milestone, so
+// `char *cp; return cp[0];` would compile and run but still perform the
+// pre-existing `int`-style 8-byte-scaled index arithmetic and an
+// un-narrowed 8-byte load, a real, disclosed, NOT silently-corrected gap
+// for a future milestone (this asymmetry with `*p`'s own real narrowing
+// is deliberately not resolved here, honestly named rather than
+// papered over); no `*p += 1;`-style compound assignment through a
+// `char *` (the same standing gap `int *` already has); no NULL-pointer
+// concept and no bounds/validity checking on any dereference (the same
+// standing gap every pointer milestone since 109 has carried, for the
+// same reasons).
 #![no_std]
 #![no_main]
 
@@ -3183,7 +3284,20 @@ impl Parser {
     /// lvalue) -- see their own doc comments for the full derivation,
     /// and this file's own top Milestone 109 doc comment for why zero
     /// new CodeBuf encodings were needed anywhere in this milestone.
-    unsafe fn parse_pointer_decl(&mut self, name: Token) -> Result<u64, ParseError> {
+    // MILESTONE 112: new `is_char_pointee` parameter -- true for a
+    // `char *p ...;` declarator (TOK_CHAR's own arm in parse_stmt(), new),
+    // false for the pre-existing `int *p ...;` shape (TOK_INT's own arm,
+    // unchanged in every other respect). Threaded into the produced
+    // STMT_DECL's own `expr` field (0/1 -- otherwise always 0/dead for a
+    // pointer declarator, since a pointer's own initializer is handled by
+    // the separate chained STMT_ASSIGN below, exactly as before this
+    // milestone) purely so collect_vars_rec() can recover it later and
+    // set the new VarSlot `is_char_ptr` flag -- see that struct field's
+    // own doc comment for the full reasoning and why this is safe (every
+    // OTHER STMT_DECL producer in this file still always writes `expr:
+    // 0`, so this new meaning never collides with anything declared
+    // before this milestone).
+    unsafe fn parse_pointer_decl(&mut self, name: Token, is_char_pointee: bool) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
             return Err(ParseError::OutOfMemory);
@@ -3191,7 +3305,7 @@ impl Parser {
         unsafe {
             core::ptr::write(
                 head as *mut StmtNode,
-                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: if is_char_pointee { 1 } else { 0 }, next: 0, then_body: 0, else_body: 0 },
             )
         };
         if unsafe { self.peek() }.kind == TOK_ASSIGN {
@@ -3299,7 +3413,7 @@ impl Parser {
                 if unsafe { self.peek() }.kind == TOK_STAR {
                     unsafe { self.advance() }; // consume '*'
                     let name = unsafe { self.expect(TOK_IDENT) }?;
-                    return unsafe { self.parse_pointer_decl(name) };
+                    return unsafe { self.parse_pointer_decl(name, false) };
                 }
                 let name = unsafe { self.expect(TOK_IDENT) }?;
                 // MILESTONE 108: one token of lookahead after the IDENT
@@ -3324,8 +3438,20 @@ impl Parser {
             // indistinguishable to the parser from an `int` one: same
             // multi-declarator chaining (Milestone 101), same optional
             // `=` initializer per declarator.
+            // MILESTONE 112: `char` immediately followed by `*` is now
+            // ALSO a pointer declarator (`char *p ...;`), the exact same
+            // one-token-lookahead check TOK_INT's own arm above already
+            // uses for `int *p ...;` -- checked BEFORE the IDENT is
+            // consumed, for the identical reason (the `*` sits between
+            // the type keyword and the name). Reuses `parse_pointer_decl()`
+            // completely, just with `is_char_pointee = true` this time.
             TOK_CHAR => {
                 unsafe { self.advance() };
+                if unsafe { self.peek() }.kind == TOK_STAR {
+                    unsafe { self.advance() }; // consume '*'
+                    let name = unsafe { self.expect(TOK_IDENT) }?;
+                    return unsafe { self.parse_pointer_decl(name, true) };
+                }
                 let name = unsafe { self.expect(TOK_IDENT) }?;
                 unsafe { self.make_decl(name, true, true) }
             }
@@ -4332,6 +4458,28 @@ struct VarSlot {
     // of decaying" simplification Milestone 108's own closing disclosure
     // named honestly at the time.
     is_array: u8,
+    // MILESTONE 112: 1 exactly for a `char *p;` pointer DECLARATOR's own
+    // named slot (`parse_pointer_decl()`'s new `is_char_pointee`
+    // parameter, threaded through `s.expr` -- otherwise dead for
+    // STMT_DECL, the same field-reuse-over-new-field discipline
+    // `then_body`/`else_body` already established for `is_char`/array
+    // element count), 0 for everything else -- an ordinary `int`, a
+    // `char` SCALAR, an `int *` pointer, an array, and every parameter
+    // (this milestone deliberately does not extend `char *` across a
+    // function-call boundary -- see this file's own top Milestone 112
+    // doc comment for the scope reasoning). Deliberately a SEPARATE
+    // property from `is_char` above: `is_char` means "THIS slot's own
+    // stored VALUE narrows to a signed byte on read" (true for a `char`
+    // scalar, always false for ANY pointer, since a pointer's own value
+    // is an address, never narrowed); `is_char_ptr` means "a dereference
+    // THROUGH this pointer should narrow" -- a `char *p;`'s own slot
+    // still has `is_char == 0` (reading `p` itself, e.g. `q = p;`, must
+    // still load the full 8-byte address unnarrowed) and `is_char_ptr ==
+    // 1` (reading `*p` should not). Consulted by exactly one site,
+    // `EXPR_UNARY`'s `OP_DEREF` arm -- see that arm's own doc comment for
+    // the real, disclosed restriction on which `*expr` shapes this
+    // milestone can actually resolve it for.
+    is_char_ptr: u8,
 }
 
 unsafe fn var_write(vars_ptr: u64, idx: u64, v: VarSlot) {
@@ -4409,7 +4557,18 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // `elem_count == 1`) -- computed straight from the same
             // `elem_count` this branch already derived above, not a
             // second independent check.
-            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: s.then_body as u8, is_array: if elem_count > 1 { 1 } else { 0 } }) };
+            // MILESTONE 112: `is_char_ptr` is `s.expr` (0/1, otherwise
+            // dead for STMT_DECL -- see VarSlot's own `is_char_ptr` doc
+            // comment for why this is a genuinely separate property from
+            // `is_char` just before it, not a duplicate of it). Only
+            // `parse_pointer_decl()`'s own new `is_char_pointee` branch
+            // ever writes a nonzero `s.expr` on a STMT_DECL -- every other
+            // producer (`make_decl()` for scalars, `parse_array_decl()`
+            // for arrays, and `parse_pointer_decl()`'s own pre-existing
+            // `int *` path) still writes `expr: 0`, so this cast is safe
+            // and this line changes behavior for NOTHING declared before
+            // this milestone.
+            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: s.then_body as u8, is_array: if elem_count > 1 { 1 } else { 0 }, is_char_ptr: s.expr as u8 }) };
             // MILESTONE 108: an array of `elem_count` > 1 reserves
             // `elem_count` contiguous 8-byte stack slots (element `i`
             // lives at `off - 8*i`, i.e. progressively MORE negative as
@@ -4438,7 +4597,7 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             let mut k: u64 = 1;
             while k < elem_count {
                 let elem_off = off - 8 * (k as i32);
-                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0, is_array: 0 }) };
+                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0, is_array: 0, is_char_ptr: 0 }) };
                 k += 1;
             }
             *n += elem_count;
@@ -4519,7 +4678,15 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // slot as if it WERE the array (which would be wrong -- see
         // those two codegen arms' own doc comments for the full
         // derivation).
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0 }) };
+        // MILESTONE 112: `is_char_ptr` is always 0 for a parameter -- this
+        // milestone deliberately does not extend `char *` across a
+        // function-call boundary (no `char *` parameters/returns), the
+        // same real, disclosed scope cut Milestone 109 itself used for
+        // `int *` before Milestone 110 later closed it; a future
+        // milestone extending `char *` across calls the way Milestone 110
+        // did for `int *` would need to thread a real declared-parameter-
+        // type bit through `ParamInfo` here, which does not exist today.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: 0 }) };
         n += 1;
         pi += 1;
     }
@@ -4541,12 +4708,28 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
 /// it, the same "ignore the field you don't need" precedent
 /// Milestone 102's own `is_char` addition already established for
 /// STMT_ASSIGN.
-unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8, u8)> {
+/// MILESTONE 112: now returns `(stack_off, is_char, is_array,
+/// is_char_ptr)` -- the fourth field is what makes a real `*p`
+/// dereference-READ narrow to a signed byte when `p` was declared
+/// `char *` (see VarSlot's own `is_char_ptr` doc comment for why this is
+/// a genuinely separate property from `is_char`, not a duplicate); all
+/// six of this function's PRE-EXISTING call sites are updated for the
+/// new tuple arity, every one of which just ignores the new field
+/// (`EXPR_IDENT`,
+/// `EXPR_INDEX`, `EXPR_UNARY`'s own `OP_ADDR` arm, `STMT_ASSIGN`,
+/// `STMT_ASSIGN_INDEX`, `STMT_ASSIGN_DEREF` -- none of these needs
+/// pointee-narrowing information, the same "ignore the field you don't
+/// need" precedent every prior `find_var()` field addition already
+/// established. `EXPR_UNARY`'s own `OP_DEREF` arm is a genuinely NEW,
+/// seventh call site this milestone adds -- before this milestone that
+/// arm never called `find_var()` at all, since `int *` dereference never
+/// needed to distinguish anything about the pointee.
+unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8, u8, u8)> {
     let mut i: u64 = 0;
     while i < nvars {
         let v = unsafe { var_read(vars_ptr, i) };
         if unsafe { same_span(src_ptr, v.name_off as u64, v.name_len as u64, ident_off, ident_len) } {
-            return Some((v.stack_off, v.is_char, v.is_array));
+            return Some((v.stack_off, v.is_char, v.is_array, v.is_char_ptr));
         }
         i += 1;
     }
@@ -5162,6 +5345,32 @@ impl CodeBuf {
     unsafe fn emit_mov_rax_mem_rax(&mut self) {
         unsafe { self.push_bytes(&[0x48, 0x8B, 0x00]) };
     }
+    /// MILESTONE 112: `MOVSX RAX, BYTE PTR [RAX]` (REX.W `0F BE` /r) --
+    /// this milestone's one genuinely NEW real x86_64 encoding, a real
+    /// `char *` dereference-READ. Combines two halves each ALREADY
+    /// individually hand-verified against the Intel SDM by an earlier
+    /// milestone: the opcode bytes (`0F BE`, MOVSX r64, r/m8, REX.W for
+    /// the 64-bit destination) are IDENTICAL to
+    /// emit_movsx_rax_rbp_off_byte()'s own (Milestone 102); the ModRM
+    /// byte (`0x00` = mod=00/reg=000 (RAX, destination)/rm=000 (RAX, the
+    /// address register), real plain `[RAX]` register-indirect
+    /// addressing, no SIB, no displacement) is IDENTICAL to
+    /// emit_mov_rax_mem_rax()'s own, just above (Milestone 108). Neither
+    /// half is new; what IS genuinely new here is the claim that
+    /// COMBINING them -- a byte-sized, sign-extending source, addressed
+    /// through a register-indirect operand instead of an rbp-relative
+    /// one -- is itself a real, valid, distinct instruction encoding,
+    /// checked directly against the Intel SDM's own MOVSX entry rather
+    /// than assumed correct by analogy. This is the one place this
+    /// milestone's own `*p` dereference (EXPR_UNARY's OP_DEREF arm,
+    /// gen_expr(), gated on `find_var()`'s new `is_char_ptr` field)
+    /// narrows to a real signed byte, exactly mirroring what an ordinary
+    /// `char` variable's own read already does for its rbp-relative slot
+    /// -- the pointee, not the pointer's own value (an address, never
+    /// narrowed), is what narrows.
+    unsafe fn emit_movsx_rax_mem_rax_byte(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x0F, 0xBE, 0x00]) };
+    }
     /// `MOV [RCX], RAX` (REX.W `89` /r) -- the store-side sibling of
     /// emit_mov_rax_mem_rax() above: writes RAX's own value to the real
     /// runtime address already sitting in RCX (STMT_ASSIGN_INDEX's own
@@ -5325,7 +5534,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 // own codegen is needed, since EXPR_CALL evaluates each
                 // argument through this same gen_expr()/EXPR_IDENT path
                 // like any other expression.
-                Some((o, is_char, is_array)) => {
+                Some((o, is_char, is_array, _is_char_ptr)) => {
                     if is_array != 0 {
                         unsafe { buf.emit_lea_rax_rbp_off(o) };
                     } else if is_char != 0 {
@@ -5406,7 +5615,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         EXPR_INDEX => {
             let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
             let (base_off, is_array) = match slot {
-                Some((o, _is_char, is_array)) => (o, is_array),
+                Some((o, _is_char, is_array, _is_char_ptr)) => (o, is_array),
                 None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
             };
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
@@ -5595,7 +5804,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 // rbp_off()` call already matches real C's own `&arr`
                 // rule for that reason, needing no is_array branch of
                 // its own, unlike EXPR_IDENT's plain read above it).
-                Some((o, _is_char, _is_array)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
+                Some((o, _is_char, _is_array, _is_char_ptr)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
                 None => return Err(CodeGenError::UndeclaredVariable(operand.ident_off as u64)),
             }
         }
@@ -5619,9 +5828,45 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         // dereference is the same operation with the address coming
         // from a variable's own VALUE instead of a LEA+index
         // computation.
+        // MILESTONE 112: real `char *` dereference-READ narrowing. `e.left`
+        // is evaluated completely ordinarily first (unchanged from
+        // Milestone 109 -- the pointer's own VALUE ends up in RAX exactly
+        // as before), but THEN, separately, this arm checks whether
+        // `e.left` is a plain `EXPR_IDENT` naming a `char *` variable
+        // (`find_var()`'s new fourth field, `is_char_ptr`) and, if so,
+        // emits the new `emit_movsx_rax_mem_rax_byte()` (sign-extending
+        // BYTE load through the address already sitting in RAX -- the
+        // real char-pointee-narrowing counterpart to
+        // `emit_movsx_rax_rbp_off_byte()`'s own rbp-relative form) instead
+        // of the ordinary full-width `emit_mov_rax_mem_rax()`. A real,
+        // deliberate, DISCLOSED scope restriction: `e.left` is checked
+        // for the EXACT shape `parse_unary()`'s own `*` grammar always
+        // produces when the pointer is held directly in a local variable
+        // (every reachable `char *` value in THIS milestone's own scope
+        // -- no `char *` function parameters/returns, no array decay to a
+        // `char *`, so a local pointer variable is the only way this
+        // milestone can ever construct one) -- any OTHER shape (a nested
+        // dereference `**q`, a call result `*f()`, etc.) falls through to
+        // the ordinary full-width load unconditionally, the same
+        // "resolved by operand SHAPE, not attempted for every expression"
+        // precedent Milestone 109's own `&` restriction already
+        // established for this exact operator family.
         EXPR_UNARY if e.op == OP_DEREF => {
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
-            unsafe { buf.emit_mov_rax_mem_rax() };
+            let operand = unsafe { core::ptr::read(e.left as *const ExprNode) };
+            let is_char_pointee = if operand.kind == EXPR_IDENT {
+                match unsafe { find_var(src_ptr, vars_ptr, nvars, operand.ident_off as u64, operand.ident_len as u64) } {
+                    Some((_, _, _, is_char_ptr)) => is_char_ptr != 0,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            if is_char_pointee {
+                unsafe { buf.emit_movsx_rax_mem_rax_byte() };
+            } else {
+                unsafe { buf.emit_mov_rax_mem_rax() };
+            }
         }
         EXPR_UNARY => {
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
@@ -5964,7 +6209,7 @@ unsafe fn gen_stmt_list(
                 // array is not a modifiable lvalue -- so this is the
                 // same call, not new invented semantics.
                 let store_off = match slot {
-                    Some((o, _is_char, is_array)) => {
+                    Some((o, _is_char, is_array, _is_char_ptr)) => {
                         if is_array != 0 {
                             return Err(CodeGenError::ArrayNotAssignable(s.ident_off as u64));
                         }
@@ -6020,7 +6265,7 @@ unsafe fn gen_stmt_list(
             STMT_ASSIGN_INDEX => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 let (base_off, is_array) = match slot {
-                    Some((o, _is_char, is_array)) => (o, is_array),
+                    Some((o, _is_char, is_array, _is_char_ptr)) => (o, is_array),
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.then_body) }?;
@@ -6058,10 +6303,24 @@ unsafe fn gen_stmt_list(
             //   <rhs>                (gen_expr, value into RAX)
             //   pop rcx              (RCX = the saved target address)
             //   mov [rcx], rax       (*p = value, the real store)
+            // MILESTONE 112: this arm is UNCHANGED -- `*p = expr;` always
+            // does the ordinary full 8-byte store regardless of whether
+            // `p` is `int *` or `char *`, matching the exact convention
+            // an ordinary `char` SCALAR's own store already uses (`char
+            // c = expr;` also always writes the full 8 bytes,
+            // `emit_mov_rbp_off_rax()`, narrowing only ever happening on
+            // READ -- see that instruction's own Milestone 102 doc
+            // comment). This is a real, deliberate design choice, not an
+            // oversight: since the pointee, in every case this subset can
+            // reach, is always another VarSlot's own full 8-byte stack
+            // slot (no packed multi-char buffer exists anywhere in this
+            // language), writing all 8 bytes through the pointer lands on
+            // the identical bytes an ordinary write to that same variable
+            // already would.
             STMT_ASSIGN_DEREF => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 match slot {
-                    Some((o, _is_char, _is_array)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
+                    Some((o, _is_char, _is_array, _is_char_ptr)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 }
                 unsafe { buf.emit_push_rax() };
@@ -10569,7 +10828,130 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m111 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 112: real `char *` pointers -- declaration and a real
+        // byte-narrowing dereference-READ, the narrow first slice
+        // Milestone 110's own closing disclosure named as the OTHER
+        // candidate alongside the `arr = expr;` asymmetry Milestone 111
+        // just resolved. See this file's own top Milestone 112 doc
+        // comment and `VarSlot::is_char_ptr`'s own doc comment for the
+        // full grammar/codegen derivation. All three cases run in-process
+        // (`CodegenMode::Callable`), the same tier Milestone 107 through
+        // 111 all already used for their own new cases -- no new real
+        // `fork()`/`exec()`/`wait()` cycle is added by this milestone.
+        //
+        // CASE 100: the real, distinguishing proof that `*p` genuinely
+        // narrows to a signed byte when `p` is `char *`, not merely that
+        // it reads SOME value back correctly. `c`'s own full 8-byte slot
+        // stores 200 (`char`'s own store side is always full-width,
+        // unchanged since Milestone 102); a buggy/shallow implementation
+        // that reused `int *`'s own unconditional full-width
+        // `emit_mov_rax_mem_rax()` for `*p` too would read back 200 (the
+        // raw stored value, not narrowed), making `*p == -56` false; the
+        // real byte-narrowing load only correctly reads back the
+        // sign-extended low byte, -56 (200 - 256, the exact `char`
+        // signedness precedent CASE 78/84 already established for a
+        // PLAIN `char` variable's own read, now proven true through a
+        // pointer for the first time).
+        //   int main() {
+        //       char c; c = 200;
+        //       char *p = &c;
+        //       return *p == -56;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC100: &[u8] = b"int main() { char c; c = 200; char *p = &c; return *p == -56; }";
+        let case100_result = compile_and_run_program_callable(SRC100.as_ptr() as u64, SRC100.len() as u64);
+        w(b"  case100 (*p == -56 -- char* dereference-read narrows to a real signed byte, in-process) returned=");
+        if let Some(r) = case100_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case100_ok = case100_result == Some(1);
+        write_check(b"case100_char_ptr_deref_read_narrows_returns_1=", case100_ok);
+
+        w(b"\n");
+
+        // CASE 101: the real, distinguishing proof that a WRITE through a
+        // `char *` is genuine aliasing into the pointee's own real stack
+        // slot -- not a disconnected copy -- combined with proof that the
+        // write side deliberately does NOT narrow (this milestone's own
+        // disclosed design choice: `*p = expr;` always stores the full 8
+        // bytes, exactly like an ordinary `char` scalar's own store
+        // already does, narrowing only ever happening on READ). `*p =
+        // 200;` writes the full raw value 200 into `c`'s own slot;
+        // reading `c` DIRECTLY afterward (NOT through `p`) narrows it via
+        // the pre-existing, unchanged `char`-scalar read path to -56 --
+        // the same "read back through a DIFFERENT access path than the
+        // one that wrote it" distinguishing shape Milestone 109's own
+        // CASE 92 established for `int *` aliasing, now proven for
+        // `char *` too.
+        //   int main() {
+        //       char c; c = 5;
+        //       char *p = &c;
+        //       *p = 200;
+        //       return c == -56;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC101: &[u8] = b"int main() { char c; c = 5; char *p = &c; *p = 200; return c == -56; }";
+        let case101_result = compile_and_run_program_callable(SRC101.as_ptr() as u64, SRC101.len() as u64);
+        w(b"  case101 (*p = 200; return c == -56; -- real aliasing through char*, write side stays full-width, in-process) returned=");
+        if let Some(r) = case101_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case101_ok = case101_result == Some(1);
+        write_check(b"case101_char_ptr_write_aliases_pointee_returns_1=", case101_ok);
+
+        w(b"\n");
+
+        // CASE 102: the real, distinguishing proof that `int *` and
+        // `char *` dereference-reads coexist correctly in the SAME
+        // program with zero cross-contamination -- `find_var()`'s new
+        // `is_char_ptr` field is looked up PER POINTER VARIABLE, so a bug
+        // that accidentally narrowed EVERY dereference (or narrowed
+        // NEITHER) would still pass CASE 100/101 in isolation but fails
+        // here: `*ip == 1000` is true only if `int *` dereference stayed
+        // full-width (1000's own low byte alone, sign-extended, is NOT
+        // 1000); `*cp == -56` is true only if `char *` dereference
+        // genuinely narrowed. The combined arithmetic result is only 11
+        // if BOTH are independently correct at once.
+        //   int main() {
+        //       int x; x = 1000;
+        //       int *ip = &x;
+        //       char c; c = 200;
+        //       char *cp = &c;
+        //       return (*ip == 1000) + (*cp == -56) * 10;
+        //   }
+        // Hand-computed: (1) + (1)*10 = 11.
+        // -------------------------------------------------------------
+        const SRC102: &[u8] = b"int main() { int x; x = 1000; int *ip = &x; char c; c = 200; char *cp = &c; return (*ip == 1000) + (*cp == -56) * 10; }";
+        let case102_result = compile_and_run_program_callable(SRC102.as_ptr() as u64, SRC102.len() as u64);
+        w(b"  case102 (int* and char* dereference-reads coexist with zero cross-contamination, in-process) returned=");
+        if let Some(r) = case102_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case102_ok = case102_result == Some(11);
+        write_check(b"case102_int_ptr_and_char_ptr_coexist_returns_11=", case102_ok);
+
+        w(b"\n");
+
+        let overall_m112 = case100_ok && case101_ok && case102_ok;
+        w(b"OVERALL_M112=");
+        w(if overall_m112 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 { 0 } else { 1 });
     }
 }
 

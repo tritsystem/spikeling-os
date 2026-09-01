@@ -8209,6 +8209,212 @@ self-test suite, genuinely open for a future pass.
       real subscriber (Milestone 106) all remain exactly as Milestone 110
       left them -- unrelated to this milestone.
 
+- [x] **Milestone 112**: real `char *` pointers -- declaration and a real
+      byte-narrowing dereference-READ (`tools/cc_src/main.rs`) -- the
+      OTHER candidate Milestone 110's own closing disclosure named
+      alongside the `arr = expr;` asymmetry Milestone 111 just resolved.
+      A deliberately narrow first slice, the same discipline every prior
+      array/pointer milestone (108 through 111) already used.
+
+      **Grammar delta**: none beyond one new lookahead branch -- `*`/`&`
+      already exist in every grammar position they need. `char`
+      immediately followed by `*` is now ALSO a pointer declarator
+      (`char *p ...;`), `parse_stmt()`'s `TOK_CHAR` arm gaining the exact
+      one-token-lookahead check `TOK_INT`'s arm already had for `int *`.
+      `parse_pointer_decl()` gains a new `is_char_pointee: bool`
+      parameter, threaded into the produced `STMT_DECL`'s own `expr`
+      field -- otherwise always dead for a pointer declarator (a
+      pointer's optional initializer is handled by a separately chained
+      `STMT_ASSIGN`, unchanged) -- so `collect_vars_rec()` can later
+      recover it into a new `VarSlot` field, `is_char_ptr`. `&c` already
+      worked unconditionally for any variable, `int` or `char` -- zero
+      change needed there.
+
+      **A genuinely separate property from `is_char`**: a `char *p;`'s
+      own slot still has `is_char == 0` (reading `p` ITSELF, e.g. `q =
+      p;`, must load the full 8-byte address unnarrowed -- a pointer's
+      own value is an address, never narrowed) and `is_char_ptr == 1`
+      (reading `*p` should narrow). Threaded out through `find_var()`'s
+      now-four-element return tuple to a genuinely NEW, seventh call
+      site -- `EXPR_UNARY`'s own `OP_DEREF` arm, which never called
+      `find_var()` at all before this milestone (`int *` dereference
+      never needed to distinguish anything about the pointee); all six
+      pre-existing call sites just ignore the new field.
+
+      **The one genuinely new x86_64 encoding**, unlike Milestone 109/110
+      (which needed zero new encodings, every capability built purely by
+      branching among sequences Milestone 108 already hand-verified):
+      `emit_movsx_rax_mem_rax_byte()` (`MOVSX RAX, BYTE PTR [RAX]`,
+      REX.W `0F BE` /r, ModRM `0x00`). Reasoning for why it's needed at
+      all: a `char` variable's own stack slot is STILL a full 8 bytes
+      (unchanged since Milestone 102 -- `char` never got a packed 1-byte
+      slot, only a narrower READ), so the pre-existing `int *`-style
+      `emit_mov_rax_mem_rax()` would read the pointee's RAW, un-narrowed
+      8-byte value -- wrong for `char *`, which must read back the low
+      byte, sign-extended, exactly like an ordinary `char` scalar's own
+      read already does. The new encoding is a real, deliberate
+      COMBINATION of two halves each already independently hand-verified
+      against the Intel SDM by an earlier milestone:
+      `emit_movsx_rax_rbp_off_byte()`'s own opcode bytes (Milestone 102)
+      and `emit_mov_rax_mem_rax()`'s own `[RAX]` register-indirect ModRM
+      byte (Milestone 108) -- neither half is new, but combining them
+      (byte-sized, sign-extending source, addressed through a register-
+      indirect operand instead of an rbp-relative one) is a real, checked
+      claim, not an assumption by analogy.
+
+      **The write side is deliberately UNCHANGED**: `*p = expr;`
+      (`STMT_ASSIGN_DEREF`) always does the ordinary full 8-byte store,
+      for both `int *` and `char *` alike, exactly matching the
+      convention an ordinary `char` SCALAR's own store already uses
+      (`char c = expr;` also always writes the full 8 bytes, narrowing
+      only ever happening on read, since Milestone 102). Since the
+      pointee, in every case this subset can reach, is always another
+      `VarSlot`'s own full 8-byte stack slot (no packed multi-char buffer
+      exists anywhere in this language -- no `char[]`, no `malloc`-backed
+      byte buffer), writing all 8 bytes through the pointer lands on the
+      identical bytes an ordinary direct write to that same variable
+      already would -- a real, deliberate design choice, not an
+      oversight, and it means this milestone needed zero new store-side
+      codegen at all.
+
+      **A real, deliberate, disclosed scope restriction**: `*p`'s
+      char-narrowing on the read side is only recognized when `p` is
+      syntactically a plain `EXPR_IDENT` (checked directly on `e.left`'s
+      own AST node kind before the new `find_var()` lookup runs) -- any
+      other shape (a nested dereference, a call result) falls through to
+      the ordinary full-width load, the same "resolved by operand SHAPE,
+      not attempted for every expression" precedent Milestone 109's own
+      `&` restriction already established for this exact operator
+      family. This costs nothing reachable in THIS milestone's own
+      scope: `char *` cannot cross a function-call boundary (no `char *`
+      parameters or return values, the same scope cut Milestone 109
+      itself used for `int *` before Milestone 110 later closed it),
+      there is no array-to-pointer decay to a `char *` (no `char[]`
+      exists to decay from), and there is no pointer arithmetic -- so a
+      local `char *` declaration, optionally initialized via `&c`, is
+      the ONLY way this milestone's own grammar can ever construct a
+      `char *` value, and every such value is always named by a plain
+      IDENT at its one real use site. Not independently self-tested for
+      that reason -- there is no reachable program in this milestone's
+      own grammar that would exercise the fallback branch, and a
+      fabricated one would test nothing real; honestly disclosed rather
+      than papered over with a synthetic case.
+
+      **New self-test cases**, all three run in-process
+      (`CodegenMode::Callable`), the same tier Milestone 107 through 111
+      all already used for their own new cases -- no new real
+      `fork()`/`exec()`/`wait()` cycle added: CASE 100 (`char c; c =
+      200; char *p = &c; return *p == -56;` -- the real, distinguishing
+      proof that `*p` genuinely narrows to a signed byte: a buggy
+      implementation reusing `int *`'s own full-width load would read
+      back the raw 200, making `*p == -56` false; expected `1`); CASE
+      101 (`char c; c = 5; char *p = &c; *p = 200; return c == -56;` --
+      the real, distinguishing proof that a write through `char *` is
+      genuine aliasing into the pointee's own real stack slot, combined
+      with proof the write side deliberately does not narrow, reading
+      `c` back through a DIFFERENT access path than the one that wrote
+      it -- the same distinguishing shape Milestone 109's own CASE 92
+      established for `int *` aliasing, now proven for `char *`;
+      expected `1`); CASE 102 (`int x; x = 1000; int *ip = &x; char c; c
+      = 200; char *cp = &c; return (*ip == 1000) + (*cp == -56) * 10;`
+      -- the real, distinguishing proof `int *` and `char *`
+      dereference-reads coexist in the SAME program with zero
+      cross-contamination: a bug that narrowed every dereference, or
+      neither, would still pass CASE 100/101 in isolation but fails
+      here, since the combined result is only correct if BOTH are
+      independently right at once; expected `11`).
+
+      **No SNN/evidence-gate work this milestone, and correctly so**:
+      this is a pure compiler-frontend milestone -- new grammar
+      positions, one new `VarSlot` field, one new x86_64 encoding, no
+      kernel-side subsystem decision anywhere in it for an
+      evidence-gated hysteresis gate to meaningfully subscribe to. The
+      same "pure compiler-frontend features legitimately don't need
+      this" carve-out Milestone 107 through 111 all already established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero warnings). `kernel/assets/cc.elf` rebuilt via the
+      project's own pinned-nightly `rustc` recipe (`tools/cc_src/
+      README.md`, unchanged) -- 95816 bytes, up from Milestone 111's
+      94032; the real `PT_LOAD` `p_memsz` via `readelf -l` is 79776
+      bytes, still 20 pages (the same page count as Milestone 111, just
+      more bytes within it) -- comfortably under the 64-page per-segment
+      cap and 128-page total cap, no cap change needed. The rebuilt
+      `cc.elf` was independently re-derived from the current `main.rs`
+      via a from-scratch invocation of the exact same recipe and diffed
+      byte-for-byte identical against the committed binary (`cmp`, not
+      eyeballed). **Zero new compiler warnings** -- verified the same way
+      Milestone 109/110 verified their own zero-new-warning result:
+      reproducing the standalone `rustc` invocation and diffing the
+      sorted warning list against Milestone 111's own recorded baseline
+      -- byte-for-byte identical 16-warning set (the same set Milestone
+      111 itself introduced its own new warning into; this milestone
+      adds none further).
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m112_fresh_boot.log`/`m112_reused_boot.log`),
+      no stray `qemu-system-x86_64.exe` process before or after either
+      boot (checked via `tasklist`). `OVERALL_M112=PASS` on both boots --
+      CASE 100 returns `1`, CASE 101 returns `1`, CASE 102 returns `11`,
+      identically on both boots. Every marker this kernel has ever
+      produced was independently re-confirmed `PASS` on both boots via a
+      real script (not sampled or eyeballed) that reconstructs the
+      actual WRITE-syscall payload stream from each raw serial log to
+      recover every `OVERALL`/`OVERALL_M*=` marker, plus a separate
+      raw-text scan for the kernel's own older `milestone NN: self-test
+      -- OVERALL: PASS` style -- 49 total distinct markers across both
+      styles (up from Milestone 111's 48, the one new name being
+      `OVERALL_M112` itself), all `PASS`, fresh and reused in exact
+      agreement, both boots' reconstructed marker sets identical to each
+      other. No regressions: the reused boot's own `fs self-test:
+      permissions`/`symlinks` FAIL-line set was diffed directly (`diff`,
+      not eyeballed) against Milestone 111's own reused boot's FAIL-line
+      set -- byte-for-byte identical, 54 lines, the same pre-existing,
+      already-disclosed Milestone 62-era fixture-cleanup artifact every
+      milestone since 70 has named; the fresh boot's own fs self-test
+      passes both suites cleanly (zero FAIL lines). `run_preemption_
+      demo()` ran to completion on BOTH boots (fresh: `task0=2680
+      task1=2487 task2=2750`; reused: `task0=2627 task1=2573
+      task2=2833` -- real inter-boot timing jitter, consistent with
+      every prior milestone's own two-boot pairs) -- zero
+      `run_preemption_demo() SKIPPED` lines on either boot. Milestone
+      104's own heap-pressure evidence-gate state came out
+      BYTE-IDENTICAL to Milestone 108 through 111's own recorded
+      baseline on both boots: `samples_taken=68 gate_trip_episodes=0
+      naive_instantaneous_hits=0 admissions_denied_so_far=0` -- zero
+      drift, consistent with this milestone being pure compiler-frontend
+      work with no new kernel allocation path. Zero `panicked at`/
+      `kernel panicked` and zero `DOUBLE FAULT`/`TRIPLE FAULT` in either
+      log (checked directly, `grep -c`, zero matches in both).
+
+      **Still genuinely open**: no `char **`/multi-level pointers of any
+      kind; no `char *` function parameters or return values (the exact
+      scope cut named above); no array-to-pointer decay to a `char *`
+      (no `char[]` exists anywhere in this subset); no pointer
+      arithmetic (the same standing gap `int *` has carried since
+      Milestone 109); `p[idx]` byte-scaled indexing through a `char *`
+      is a real, disclosed, NOT silently-corrected gap this milestone
+      leaves open -- `EXPR_INDEX`/`STMT_ASSIGN_INDEX` are UNTOUCHED, so
+      `char *cp; return cp[0];` would compile and run but still perform
+      the pre-existing `int`-style 8-byte-scaled index arithmetic and an
+      un-narrowed 8-byte load, a real asymmetry with `*p`'s own correct
+      narrowing, honestly named rather than papered over; no `*p += 1;`-
+      style compound assignment through a `char *` (the same standing
+      gap `int *` already has); no NULL-pointer concept and no
+      bounds/validity checking on any dereference. Everything Milestone
+      108/109/110/111 already disclosed that this milestone didn't touch
+      remains open: no `int **`, no `int name[]` bracket-array parameter
+      sugar, no `*p += 1;`/`arr[i] += 1;` compound assignment through an
+      `int *` dereference or index, no type system of any kind.
+      `MAX_PARAMS` (8), no `sizeof`, `char` as the only non-`int` scalar
+      TYPE (a `char *` is a pointer flavor, not a second scalar type --
+      this milestone doesn't change that count), the compiler self-test's
+      own per-compile leak, `heap_guard::admit()` covering only its
+      original two call sites, and `evidence_gate.rs` still having
+      exactly one real subscriber (Milestone 106) all remain exactly as
+      Milestone 111 left them -- unrelated to this milestone.
+
 ## Building and running
 
 Requires:

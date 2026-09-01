@@ -6480,6 +6480,49 @@ self-test suite, genuinely open for a future pass.
       self-test still leaks per-compile (bounded, not fixed); one 4 KiB
       stack page per process.
 
+- [x] **Milestone 95**: `0x`/`0X` hex and `0b`/`0B` binary integer
+      literals in the self-hosted subset-C compiler -- a **lexer-only**
+      change. A leading `0` immediately followed by `x`/`X` scans hex
+      digits (`0`-`9`, `a`-`f`, `A`-`F`); by `b`/`B` scans binary digits
+      (`0`/`1`). Both prefixes are unambiguous against every pre-existing
+      decimal literal (nothing valid starts `0x`/`0b`), so the decimal
+      scan below them is byte-for-byte unchanged. A prefix with no
+      following digit (`0x`, `0b`) is a real `LexError` pointing at the
+      offset where a digit was due. **Deliberate cuts**: no C octal (a
+      leading `0` with more digits stays decimal -- `010` is ten, not
+      eight); no digit separators; no `U`/`L` suffixes.
+
+      **Verified**: `cargo build` clean (kernel + `cc.elf`, now 72536
+      bytes). Two QEMU boots, fresh then reused. CASE 64 (in-process --
+      `0xFF + 0b1010 + 0x10`, all three bases in one expression) returns
+      `281`; CASE 65 exercises the empty-`0x` `LexError` path. Both
+      boots. `OVERALL_M95=PASS`. All `OVERALL_M68`..`M94` markers and
+      the CASE 60/61/62/63 checks are **byte-identical between the fresh
+      and reused boots** and unchanged from Milestone 94. `milestone
+      64`/`65` kernel self-tests PASS both boots.
+
+      **Pre-existing failure, newly identified this session (NOT caused
+      by Milestone 95)**: `OVERALL_M69=FAIL` because `case8` (the one
+      ELF-exec case that recompiles CASE 1's already-parsed `func1` AST
+      rather than re-parsing fresh source) now exits `0` instead of
+      `42`. Bisected to **Milestone 87**: that milestone's
+      `heap_reset()` (added on entry of the compile helpers to bound the
+      self-test's per-compile leak) rewinds the bump allocator to
+      `HEAP_START` between CASE 1 and CASE 8, so by the time `case8`
+      runs, the intervening CASE 4/5/6/7 compiles have overwritten
+      `func1`'s malloc'd AST nodes -- `gen_function` then codegens a
+      stale/empty function. `case9`/`case10` and every later ELF-exec
+      case (17/22/28/31/33/36/38/42/44/46/48/51/53/55/57/60) re-parse
+      fresh after each reset and all PASS, so the on-disk-ELF + real
+      `exec()`/`wait()` path itself is sound. Milestone 96 fixes
+      `case8` to re-parse rather than lean on a stale heap pointer.
+
+      **Still genuinely open**: `MAX_PARAMS` (4, needs stack-passed
+      arguments); no arrays/pointers; only the `int` type; the compiler
+      self-test still leaks per-compile (bounded, not fixed); one 4 KiB
+      stack page per process; `case8`/`OVERALL_M69` (fixed next
+      milestone).
+
 ## Building and running
 
 Requires:

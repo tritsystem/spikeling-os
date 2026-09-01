@@ -854,6 +854,23 @@
 // the compiler self-test still leaks per-compile (bounded, not fixed);
 // one 4 KiB stack page per process.
 //
+// MILESTONE 95 adds `0x`/`0X` hex and `0b`/`0B` binary integer
+// literals -- a lexer-only change. A leading `0` followed by `x`/`X`
+// scans hex digits (`0`-`9`, `a`-`f`, `A`-`F`); by `b`/`B` scans
+// binary digits (`0`/`1`). Both prefixes are unambiguous against every
+// pre-existing decimal literal, so the decimal scan is byte-for-byte
+// unchanged. A prefix with no following digit (`0x`, `0b`) is a real
+// LexError pointing where a digit was due. Deliberate cuts: NO C octal
+// (a leading `0` with more digits stays decimal -- `010` is ten), no
+// digit separators, no `U`/`L` suffixes. CASE 64 (in-process -- all
+// three bases in one expression: `0xFF + 0b1010 + 0x10` -> 281) and
+// CASE 65 (the empty-`0x` LexError path).
+//
+// Still genuinely open after Milestone 95: `MAX_PARAMS` (4, needs
+// stack-passed arguments); no arrays/pointers; only the `int` type;
+// the compiler self-test still leaks per-compile (bounded, not fixed);
+// one 4 KiB stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -1216,6 +1233,68 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
         }
         if b.is_ascii_digit() {
             let mut val: u64 = 0;
+            // MILESTONE 95: base prefixes. A leading '0' immediately
+            // followed by 'x'/'X' scans hex digits; by 'b'/'B' scans
+            // binary digits. Both prefixes are unambiguous -- no
+            // pre-existing decimal literal can start "0x"/"0b" -- so the
+            // decimal path below is byte-for-byte unchanged and every
+            // prior test stays green. Deliberate cuts: no C octal
+            // (a leading '0' with more digits stays decimal, e.g. `010`
+            // is ten, not eight), no digit separators, no U/L suffixes.
+            // "0x"/"0b" with no following digit is a real
+            // LexError::UnknownChar at the offset where a digit was due.
+            if b == b'0' && i + 1 < src_len {
+                let p = unsafe { core::ptr::read((src_ptr + i + 1) as *const u8) };
+                if p == b'x' || p == b'X' {
+                    i += 2;
+                    let digit_start = i;
+                    loop {
+                        if i >= src_len {
+                            break;
+                        }
+                        let c = unsafe { core::ptr::read((src_ptr + i) as *const u8) };
+                        let d = if c.is_ascii_digit() {
+                            (c - b'0') as u64
+                        } else if c >= b'a' && c <= b'f' {
+                            (c - b'a' + 10) as u64
+                        } else if c >= b'A' && c <= b'F' {
+                            (c - b'A' + 10) as u64
+                        } else {
+                            break;
+                        };
+                        val = val * 16 + d;
+                        i += 1;
+                    }
+                    if i == digit_start {
+                        return Err(LexError::UnknownChar(digit_start));
+                    }
+                    unsafe { tok_write(toks_ptr, n, Token { kind: TOK_INTLIT, int_val: val, ident_off: 0, ident_len: 0 }) };
+                    n += 1;
+                    continue;
+                }
+                if p == b'b' || p == b'B' {
+                    i += 2;
+                    let digit_start = i;
+                    loop {
+                        if i >= src_len {
+                            break;
+                        }
+                        let c = unsafe { core::ptr::read((src_ptr + i) as *const u8) };
+                        if c == b'0' || c == b'1' {
+                            val = val * 2 + (c - b'0') as u64;
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if i == digit_start {
+                        return Err(LexError::UnknownChar(digit_start));
+                    }
+                    unsafe { tok_write(toks_ptr, n, Token { kind: TOK_INTLIT, int_val: val, ident_off: 0, ident_len: 0 }) };
+                    n += 1;
+                    continue;
+                }
+            }
             loop {
                 if i >= src_len {
                     break;
@@ -7507,7 +7586,58 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m94 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 95: 0x/0X hex and 0b/0B binary integer literals
+        // (lexer only). CASE 64 (in-process Callable path): a program
+        // that mixes all three bases in one expression.
+        //   int main() {
+        //       int a = 0xFF;    // 255
+        //       int b = 0b1010;  //  10
+        //       int c = 0x10;    //  16
+        //       return a + b + c;
+        //   }
+        // Hand-computed: 255 + 10 + 16 = 281. A wrong base (e.g. hex
+        // parsed as decimal, or the 'b' eaten as an identifier) would
+        // fail to compile or return something other than 281.
+        // -------------------------------------------------------------
+        const SRC64: &[u8] = b"int main() { int a = 0xFF; int b = 0b1010; int c = 0x10; return a + b + c; }";
+        let case64_result = compile_and_run_program_callable(SRC64.as_ptr() as u64, SRC64.len() as u64);
+        w(b"  case64 (0x hex + 0b binary literals, in-process) returned=");
+        if let Some(r) = case64_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 281)\n");
+        let case64_ok = case64_result == Some(281);
+        write_check(b"case64_hex_and_binary_literals_return_281=", case64_ok);
+
+        w(b"\n");
+
+        // CASE 65: a bare "0x" with no hex digit is a real LexError,
+        // the same Err-path discipline CASE 3 / CASE 63 established.
+        //   int main() { return 0x; }
+        const SRC65: &[u8] = b"int main() { return 0x; }";
+        let case65_ok = match lex_and_parse(SRC65.as_ptr() as u64, SRC65.len() as u64) {
+            Err(_) => {
+                w(b"  case65 empty hex literal \"0x\" rejected, as expected\n");
+                true
+            }
+            Ok(_) => {
+                w(b"  case65 expected a LexError for \"0x\" with no digits, got Ok\n");
+                false
+            }
+        };
+        write_check(b"case65_empty_hex_literal_is_a_lex_error=", case65_ok);
+
+        w(b"\n");
+
+        let overall_m95 = case64_ok && case65_ok;
+        w(b"OVERALL_M95=");
+        w(if overall_m95 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 { 0 } else { 1 });
     }
 }
 

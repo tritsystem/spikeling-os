@@ -1084,6 +1084,59 @@
 // them came out right. CASE 87 proves the cap itself: a 9-parameter
 // function definition (MAX_PARAMS + 1) is still a real, disclosed
 // ParseError::TooManyParams -- the cap moved, it was not removed.
+//
+// MILESTONE 108: single-dimension fixed-size `int` array declarations,
+// indexed reads, and indexed writes -- a real, deliberately narrow first
+// slice of the longest-standing gap this file's own "still genuinely
+// open" disclosures have named in every compiler-frontend milestone
+// since Milestone 83 ("no arrays/pointers"), the same "narrow, honestly
+// scoped first slice, not the whole feature at once" discipline `char`
+// itself used across Milestone 102-105. Grammar delta:
+//   decl_stmt   := "int" IDENT ("[" INTLIT "]")? ";" | ... (unchanged otherwise)
+//   factor      := ... | IDENT "[" cond_expr "]"
+//   assign_stmt := IDENT "[" cond_expr "]" "=" cond_expr ";" | ... (unchanged otherwise)
+// `int arr[N];` (`N` a real positive INTLIT, not a general cond_expr --
+// real C requires a constant expression for a plain array declarator's
+// own bound too, so this is a genuine subset of real C grammar, not an
+// invented restriction) reserves `N` contiguous 8-byte stack slots
+// (collect_vars_rec()'s own new per-STMT_DECL branch, see its doc
+// comment for the full derivation); `arr[idx]` as an expression operand
+// (EXPR_INDEX, new) or as an assignment target (STMT_ASSIGN_INDEX, new
+// -- deliberately its own statement kind, not a flag on STMT_ASSIGN, the
+// same "new kind over a reused kind with a flag" choice STMT_DOWHILE
+// already made over a flag on STMT_WHILE) computes a real RUNTIME
+// address (`&arr[0] - idx*8`, four newly hand-verified CodeBuf
+// encodings: emit_lea_rax_rbp_off(), emit_shl_rcx_imm8(),
+// emit_mov_rax_mem_rax(), emit_mov_mem_rcx_rax() -- see each one's own
+// doc comment for the full Intel SDM derivation) rather than folding the
+// index into a compile-time-constant disp8 the way every scalar
+// variable access this codegen has ever emitted, since Milestone 68,
+// could. `idx` is any real cond_expr, not just a literal -- CASE 89
+// below indexes with a real `while`-loop counter, proving this is
+// genuine runtime addressing, not literal-index sugar. Scope,
+// deliberately real and disclosed: `int` arrays only (no `char[]`); no
+// array initializer lists (`int arr[3] = {1,2,3};` is not in this
+// grammar); no multi-dimensional arrays; no arrays as function
+// parameters or return values (no array-to-pointer decay exists in this
+// subset at all -- there being no pointer type yet either, the other
+// half of the "arrays/pointers" gap this milestone's own name still only
+// partially closes); no compound-assignment operators on an array target
+// (`arr[i] += 1;` is real, disclosed future work); no bounds checking
+// (an out-of-range index reads/writes whatever real stack memory the
+// computed address lands on, exactly the same real undefined behavior an
+// unchecked C array access already has on genuine hardware -- not a new
+// gap this codegen introduces, and consistent with this file's own
+// long-standing "no bounds-check panic path, so no core::fmt gets
+// pulled into this freestanding panic=abort binary" reason for never
+// having runtime bounds checks anywhere in this codegen); a bare array
+// name used as an expression with no index (`return arr;`) is not
+// rejected at parse or codegen time -- it silently reads whatever is at
+// the array's own element-0 slot as if it were an ordinary scalar, a
+// real, disclosed simplification of this first slice rather than a
+// hard error, since detecting it would need a real symbol table
+// tracking each name's own declared shape, which this codegen does not
+// build (find_var()'s own linear scan resolves a name to an offset only,
+// with no "is this an array" bit threaded back to either call site).
 #![no_std]
 #![no_main]
 
@@ -1290,6 +1343,15 @@ const TOK_DO: u8 = 54; // keyword "do"
 // "still genuinely open" note below for why that's a real, disclosed
 // scope cut rather than an oversight.
 const TOK_CHAR: u8 = 55; // keyword "char"
+
+// MILESTONE 108: `[` and `]` -- the one new lexer surface single-
+// dimension fixed-size `int` arrays need. Two ordinary single-char
+// tokens, lexed exactly like every other single-char punctuation this
+// lexer already recognizes (see the `match b { ... }` single-char arm
+// below); no lookahead, no ambiguity with any existing token (this
+// subset's lexer has never had any other use for either byte).
+const TOK_LBRACKET: u8 = 56; // "["
+const TOK_RBRACKET: u8 = 57; // "]"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1718,6 +1780,8 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             b'?' => TOK_QUESTION, // MILESTONE 90
             b':' => TOK_COLON,    // MILESTONE 90
             b'~' => TOK_TILDE,
+            b'[' => TOK_LBRACKET, // MILESTONE 108
+            b']' => TOK_RBRACKET, // MILESTONE 108
             // MILESTONE 83: lone '!' -- unreached for a genuine "!="
             // (that `continue`s above, before this match runs), so a
             // '!' followed by anything other than '=' correctly lands
@@ -1751,6 +1815,18 @@ const EXPR_BINARY: u8 = 3;
 const EXPR_CALL: u8 = 4; // MILESTONE 72: a function-call expression, IDENT "(" args? ")"
 const EXPR_UNARY: u8 = 5; // MILESTONE 76: a unary-minus expression, "-" unary -- only `left` is meaningful (the operand); `right` stays 0, the same "unused field stays 0" convention this AST already uses throughout
 const EXPR_TERNARY: u8 = 6; // MILESTONE 90: `cond ? then : else` -- `left` = cond, `right` = then, `call_args_ptr` (field-reused) = else. Codegen is if/else's exact jz/jmp/patch shape, into RAX.
+// MILESTONE 108: `IDENT "[" cond_expr "]"` -- a real array-element READ.
+// `ident_off`/`ident_len` name the array (the same fields EXPR_IDENT
+// already uses for a plain variable's name -- same field-reuse
+// discipline this AST already uses throughout, e.g. EXPR_CALL reusing
+// them for its own callee name); `left` (reused from EXPR_UNARY's own
+// "the one operand" role) holds the index sub-expression's own
+// ExprNode pointer, itself any real cond_expr (not just an INTLIT or
+// IDENT) -- `arr[i+1]`, `arr[f(x)]`, `arr[arr2[0]]` are all legal
+// parses. `right`/`call_args_ptr`/`call_argc` stay unused (0), the same
+// "unused field stays 0" convention every other EXPR kind already
+// follows.
+const EXPR_INDEX: u8 = 7;
 
 // MILESTONE 70: comparison-operator sentinels for ExprNode.op, deliberately
 // NOT reusing raw ASCII bytes the way the four arithmetic ops do (b'+' etc)
@@ -1834,6 +1910,23 @@ const STMT_CASE: u8 = 9; // MILESTONE 91: one `case INTLIT:` -- expr = an EXPR_I
 const STMT_LABEL: u8 = 10; // MILESTONE 92: `LABEL :` -- ident_off/ident_len name the label; no body (the following statement is a separate list node)
 const STMT_GOTO: u8 = 11; // MILESTONE 92: `goto LABEL ;` -- ident_off/ident_len name the target
 const STMT_DOWHILE: u8 = 12; // MILESTONE 99: `do { body } while (cond);` -- expr = cond, then_body = body list; body first, condition at the bottom
+// MILESTONE 108: `IDENT "[" cond_expr "]" "=" cond_expr ";"` -- a real
+// array-element WRITE. Deliberately a NEW statement kind rather than a
+// flag/variant bolted onto STMT_ASSIGN (the same "new kind, not a
+// reused kind with a flag" discipline STMT_DOWHILE above already chose
+// over a flag on STMT_WHILE): STMT_ASSIGN's own codegen and every one
+// of its existing callers stay completely untouched by this milestone,
+// zero regression risk to the plain-scalar-assignment path every prior
+// milestone already verified. `ident_off`/`ident_len` name the array
+// (same role as STMT_ASSIGN's own target-name fields); `expr` is the
+// RHS (same field, same role as STMT_ASSIGN); `then_body` is reused
+// (NOT a StmtNode list this time -- an ExprNode pointer, the index
+// sub-expression) for the one field this shape needs that STMT_ASSIGN
+// doesn't have, the same "reuse an existing dead field for a new
+// milestone's own data" discipline `then_body`'s own STMT_DECL role
+// (Milestone 102's `is_char` tag) already established; `else_body`
+// stays unused (0).
+const STMT_ASSIGN_INDEX: u8 = 13;
 
 #[repr(C)]
 struct StmtNode {
@@ -2069,6 +2162,16 @@ enum ParseError {
     /// definitions -- same "real but unexercised, honestly disclosed"
     /// status as TooManyParams/TooManyArgs above.
     TooManyFunctions,
+    /// MILESTONE 108: an array declarator's own `[` ... `]` did not
+    /// contain a real positive INTLIT (e.g. `int arr[0];` or
+    /// `int arr[];`) -- this subset's arrays are fixed-size, and a
+    /// zero-or-absent size has no real stack layout collect_vars_rec()
+    /// could allocate. This subset also deliberately does not accept a
+    /// general cond_expr here (real C doesn't either, for a plain array
+    /// declarator -- only a constant expression is legal), so this path
+    /// is reachable ONLY by a literal `0` or a missing/non-INTLIT size,
+    /// not by anything more elaborate.
+    BadArraySize,
 }
 
 struct Parser {
@@ -2182,6 +2285,40 @@ impl Parser {
                                 right: 0,
                                 call_args_ptr: args_ptr,
                                 call_argc: argc,
+                            },
+                        )
+                    };
+                    Ok(node)
+                // MILESTONE 108: IDENT "[" cond_expr "]" -- a real
+                // array-element read (EXPR_INDEX). The index itself is
+                // any real cond_expr (parse_ternary(), the same
+                // widened-through-`?:` production every other bracketed/
+                // parenthesized sub-expression in this grammar already
+                // recurses through -- see parse_factor()'s own
+                // TOK_LPAREN arm below), so `arr[i+1]`, `arr[f(x)]`,
+                // `arr[arr2[0]]` are all legal parses, not just a bare
+                // INTLIT/IDENT.
+                } else if unsafe { self.peek() }.kind == TOK_LBRACKET {
+                    unsafe { self.advance() }; // consume '['
+                    let idx = unsafe { self.parse_ternary() }?;
+                    unsafe { self.expect(TOK_RBRACKET) }?;
+                    let node = unsafe { alloc_expr() };
+                    if node == 0 {
+                        return Err(ParseError::OutOfMemory);
+                    }
+                    unsafe {
+                        core::ptr::write(
+                            node as *mut ExprNode,
+                            ExprNode {
+                                kind: EXPR_INDEX,
+                                int_val: 0,
+                                ident_off: name.ident_off,
+                                ident_len: name.ident_len,
+                                op: 0,
+                                left: idx,
+                                right: 0,
+                                call_args_ptr: 0,
+                                call_argc: 0,
                             },
                         )
                     };
@@ -2714,6 +2851,57 @@ impl Parser {
         Ok(head)
     }
 
+    /// MILESTONE 108: `"int" IDENT "[" INTLIT "]" ";"` -- a real, fixed-
+    /// size single-dimension `int` array declaration. `name` and the
+    /// leading `int` are already consumed by the caller (TOK_INT's own
+    /// arm in parse_stmt(), the same "IDENT already consumed before this
+    /// helper runs" shape make_decl() above already uses). Deliberately
+    /// its OWN standalone parse path, not folded into make_decl()'s own
+    /// comma-separated multi-declarator/initializer chain: this first
+    /// slice supports exactly `int arr[N];` as a complete statement --
+    /// no `=` initializer (an array initializer list is real, disclosed
+    /// future work, not attempted here), no mixing an array declarator
+    /// into an `int a, b[3], c;` list alongside plain scalars, no
+    /// `char` arrays (`char` stays a scalar-only type, exactly as
+    /// Milestone 102 left it) -- the same "narrow, real, honestly
+    /// scoped first slice" discipline `char` itself used across
+    /// Milestone 102-105 rather than attempting the whole feature at
+    /// once. The size must be a real INTLIT (a constant), not any
+    /// general cond_expr -- real C requires a constant expression for a
+    /// plain array declarator's own bound too, so this is a genuine
+    /// subset of real C grammar, not an invented restriction -- and
+    /// must be strictly positive (`int arr[0];` is a real, disclosed
+    /// ParseError::BadArraySize, not a silently-accepted zero-length
+    /// array). The one AST field this whole feature needs beyond an
+    /// ordinary scalar STMT_DECL is the element count, stored in
+    /// `else_body` (a u64, always 0/unused for every scalar STMT_DECL
+    /// before this milestone -- see StmtNode's own doc comment) --
+    /// `collect_vars_rec()` below reads it back out to reserve the real
+    /// contiguous stack slots this array needs. `is_char` is always
+    /// `false` here (only TOK_INT's own arm calls this; TOK_CHAR's arm
+    /// is completely untouched by this milestone).
+    unsafe fn parse_array_decl(&mut self, name: Token) -> Result<u64, ParseError> {
+        unsafe { self.expect(TOK_LBRACKET) }?;
+        let size_tok = unsafe { self.peek() };
+        if size_tok.kind != TOK_INTLIT || size_tok.int_val == 0 {
+            return Err(ParseError::BadArraySize);
+        }
+        unsafe { self.advance() };
+        unsafe { self.expect(TOK_RBRACKET) }?;
+        unsafe { self.expect(TOK_SEMI) }?;
+        let node = unsafe { alloc_stmt() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut StmtNode,
+                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 0, else_body: size_tok.int_val },
+            )
+        };
+        Ok(node)
+    }
+
     /// MILESTONE 84 logic, extracted at MILESTONE 86 so `for`'s init and
     /// step clauses can reuse it. `name` is the already-consumed IDENT;
     /// the next token is `=` or one of the nine compound-assignment
@@ -2799,7 +2987,20 @@ impl Parser {
                 // takes.
                 unsafe { self.advance() };
                 let name = unsafe { self.expect(TOK_IDENT) }?;
-                unsafe { self.make_decl(name, true, false) }
+                // MILESTONE 108: one token of lookahead after the IDENT
+                // decides between the pre-existing scalar declarator
+                // chain (make_decl(), completely unchanged -- every
+                // scalar `int` declaration this codegen has ever parsed
+                // still takes exactly that path) and a genuine array
+                // declarator (parse_array_decl(), new). The same
+                // "advance past the name, then peek to disambiguate"
+                // shape this file's own TOK_IDENT statement-dispatch
+                // arm below already uses for label-vs-assignment.
+                if unsafe { self.peek() }.kind == TOK_LBRACKET {
+                    unsafe { self.parse_array_decl(name) }
+                } else {
+                    unsafe { self.make_decl(name, true, false) }
+                }
             }
             // MILESTONE 102: `char IDENT ("=" logic_or)? ("," ...)* ";"`
             // -- the exact same grammar TOK_INT's arm just above parses,
@@ -2831,6 +3032,37 @@ impl Parser {
             }
             TOK_IDENT => {
                 let name = unsafe { self.advance() };
+                // MILESTONE 108: `IDENT "[" cond_expr "]" "=" cond_expr
+                // ";"` -- a real array-element write, checked BEFORE the
+                // label/plain-assignment disambiguation just below (a
+                // real array name can never legally be followed by `:`
+                // in this subset anyway, so the ordering is safe either
+                // way, but checking the newer, narrower case first keeps
+                // this dispatch reading top-to-bottom in the order each
+                // milestone added it). Only plain `=` is supported here
+                // -- `arr[i] += 1;` and friends are real, disclosed
+                // future work (Milestone 84's nine compound-assignment
+                // operators never reached array targets), not attempted
+                // in this first slice.
+                if unsafe { self.peek() }.kind == TOK_LBRACKET {
+                    unsafe { self.advance() }; // consume '['
+                    let idx = unsafe { self.parse_ternary() }?;
+                    unsafe { self.expect(TOK_RBRACKET) }?;
+                    unsafe { self.expect(TOK_ASSIGN) }?;
+                    let rhs = unsafe { self.parse_ternary() }?;
+                    unsafe { self.expect(TOK_SEMI) }?;
+                    let node = unsafe { alloc_stmt() };
+                    if node == 0 {
+                        return Err(ParseError::OutOfMemory);
+                    }
+                    unsafe {
+                        core::ptr::write(
+                            node as *mut StmtNode,
+                            StmtNode { kind: STMT_ASSIGN_INDEX, ident_off: name.ident_off, ident_len: name.ident_len, expr: rhs, next: 0, then_body: idx, else_body: 0 },
+                        )
+                    };
+                    return Ok(node);
+                }
                 // MILESTONE 92: `IDENT :` in statement position is a
                 // label, not an assignment -- one token of lookahead
                 // disambiguates. `L:` is a standalone STMT_LABEL node;
@@ -3733,7 +3965,13 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
     while cur != 0 {
         let s = unsafe { core::ptr::read(cur as *const StmtNode) };
         if s.kind == STMT_DECL {
-            if *n >= MAX_VARS {
+            // MILESTONE 108: `s.else_body` is 0 for an ordinary scalar
+            // declarator (every STMT_DECL before this milestone, and
+            // every `char` one still today -- TOK_CHAR's own arm never
+            // calls parse_array_decl()) and a real positive element
+            // count for an array declarator (parse_array_decl(), new).
+            let elem_count: u64 = if s.else_body == 0 { 1 } else { s.else_body };
+            if *n + elem_count > MAX_VARS {
                 return Err(CodeGenError::TooManyVars);
             }
             let off = -8 * (*n as i32 + 1);
@@ -3741,7 +3979,38 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // (see that function's own doc comment for why `then_body`,
             // otherwise dead for STMT_DECL, carries this).
             unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: s.then_body as u8 }) };
-            *n += 1;
+            // MILESTONE 108: an array of `elem_count` > 1 reserves
+            // `elem_count` contiguous 8-byte stack slots (element `i`
+            // lives at `off - 8*i`, i.e. progressively MORE negative as
+            // `i` grows -- the exact same "later slot, more negative
+            // offset" direction every OTHER slot in this flat allocator
+            // already grows in, just walked `elem_count` steps at once
+            // instead of one), but only the FIRST of them (element 0,
+            // this array's own base address, written just above) is a
+            // real NAMED entry find_var() can ever match. Elements
+            // 1..elem_count-1 get real, explicitly-written BLANK
+            // entries (name_len=0, unmatchable by any real identifier
+            // this lexer could ever produce) rather than being left as
+            // uninitialized malloc()ed memory -- find_var()'s own linear
+            // scan reads every entry up to `nvars` unconditionally, and
+            // reading a real uninitialized VarSlot there would be
+            // real, live undefined behavior, not merely untidy. Writing
+            // real blank filler entries, one per remaining element, is
+            // what keeps `*n` (== nvars, this function's own return
+            // value) an exactly accurate "how many 8-byte slots does
+            // this function's frame need" count -- the same count
+            // gen_function()/gen_program()'s own `frame_bytes =
+            // (nvars + 1) * 8` already uses UNCHANGED by this milestone
+            // to size `sub rsp, imm8` -- so a function that declares an
+            // array gets a correctly-sized real stack frame with ZERO
+            // changes to either of those two frame-sizing call sites.
+            let mut k: u64 = 1;
+            while k < elem_count {
+                let elem_off = off - 8 * (k as i32);
+                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0 }) };
+                k += 1;
+            }
+            *n += elem_count;
         } else if s.kind == STMT_IF {
             // Recurse into both branches (else_body is 0, a real no-op
             // walk, when the source had no `else`).
@@ -4364,6 +4633,104 @@ impl CodeBuf {
     unsafe fn emit_add_rsp_imm8(&mut self, bytes: u8) {
         unsafe { self.push_bytes(&[0x48, 0x83, 0xC4, bytes]) };
     }
+
+    // MILESTONE 108: the four real new encodings a single-dimension
+    // fixed-size `int` array's own indexed read/write needs, on top of
+    // everything Milestone 68-107 already built -- each individually
+    // hand-verified against the Intel SDM's own encoding tables before
+    // being written here, the same discipline every other CodeBuf
+    // method above already used. Every array-element access this
+    // codegen ever emits (EXPR_INDEX in gen_expr(), STMT_ASSIGN_INDEX in
+    // gen_stmt_list()) uses exactly these four in the exact same real
+    // stack-machine idiom every other node in this file already uses
+    // (evaluate into RAX, PUSH to save across a nested evaluation, POP
+    // into RCX, combine) -- no new persistent/callee-saved register is
+    // ever introduced, so this milestone needs no prologue/epilogue
+    // save-restore of anything beyond what already existed.
+
+    /// `LEA r64, [rbp+disp8]` (REX.W `8D` /r) -- computes the real
+    /// EFFECTIVE ADDRESS `rbp+off` into RAX, WITHOUT dereferencing it
+    /// (unlike emit_mov_rax_rbp_off()'s `8B` /r sibling just above,
+    /// which loads the 8 bytes AT that address). Exact same ModRM byte
+    /// (`0x45` = mod=01/reg=RAX(000)/rm=RBP(101), disp8 follows) as
+    /// emit_mov_rax_rbp_off() -- only the opcode differs (`8D` LEA vs.
+    /// `8B` MOV) -- because LEA and this MOV form share the identical
+    /// real x86 "compute memory operand" addressing-mode encoding; LEA
+    /// simply never issues the load MOV does. This is how an array
+    /// variable's own `find_var()`-returned `stack_off` (element 0's
+    /// offset -- see collect_vars_rec()'s own Milestone 108 doc comment)
+    /// becomes a real runtime BASE ADDRESS an index can be added to or
+    /// subtracted from, the one thing no encoding before this milestone
+    /// could do (every prior slot access was always a compile-time-
+    /// constant disp8 straight off `rbp`, since every prior variable was
+    /// exactly one slot).
+    unsafe fn emit_lea_rax_rbp_off(&mut self, off: i32) {
+        unsafe { self.push_bytes(&[0x48, 0x8D, 0x45, off as i8 as u8]) };
+    }
+    /// `SHL r/m64, imm8` (REX.W `C1` /4 ib) applied to RCX specifically
+    /// -- the SAME real "Shift Group 2" opcode family
+    /// emit_shl_rax_cl()/emit_sar_rax_cl() above already document in
+    /// full (opcode-extension digit 4 = SHL/SAL), just the IMMEDIATE-
+    /// count sibling (`C1`) of that pair's shift-by-CL form (`D3`)
+    /// instead, because this milestone's own shift count is always the
+    /// same compile-time constant 3 (every array element is a full
+    /// 8-byte slot, `x << 3 == x * 8`, the same real "scale by element
+    /// size" arithmetic a real SysV-ABI-targeting compiler emits for any
+    /// scaled-index addressing it cannot fold into a single SIB byte's
+    /// own 1/2/4/8 scale field -- this codegen never builds a SIB byte
+    /// at all, so the scale is done explicitly here instead), not a
+    /// runtime value the way `<<`'s own operator codegen needs CL for.
+    /// ModRM `0xE1` = mod=11 (register-direct) / reg=100 (SHL's own
+    /// opcode-extension digit) / rm=001 (RCX) -- the same "middle ModRM
+    /// bits pick which C1/D3/F7-family sub-opcode" shape
+    /// emit_neg_rax()/emit_shl_rax_cl() above both already rely on,
+    /// generalized past RAX-only (used everywhere else in this file) to
+    /// RCX specifically, since RCX is where this milestone's own index-
+    /// address codegen (see EXPR_INDEX/STMT_ASSIGN_INDEX below) already
+    /// leaves the popped-back-off index value.
+    unsafe fn emit_shl_rcx_imm8(&mut self, imm: u8) {
+        unsafe { self.push_bytes(&[0x48, 0xC1, 0xE1, imm]) };
+    }
+    /// `MOV RAX, [RAX]` (REX.W `8B` /r) -- a real array-element LOAD
+    /// through a runtime-computed address already sitting in RAX itself
+    /// (the exact address emit_lea_rax_rbp_off()+emit_shl_rcx_imm8()+
+    /// emit_sub_rax_rcx() -- the latter two both ALREADY EXISTING
+    /// encodings, reused unchanged -- leave there; see EXPR_INDEX's own
+    /// codegen below for the full sequence). ModRM `0x00` = mod=00
+    /// (no displacement) / reg=000 (RAX, the destination) / rm=000
+    /// (RAX, the address register) -- mod=00 with rm=000 is real plain
+    /// `[RAX]` register-indirect addressing, needing neither a SIB byte
+    /// (only rm=100/RSP does) nor a disp32 (only rm=101/RBP with mod=00
+    /// does, the real RIP-relative special case) -- individually
+    /// checked against the Intel SDM's own ModRM/SIB addressing-mode
+    /// table before picking RAX/RCX (not, say, RBX/RBP) as this
+    /// milestone's own two scratch registers specifically so this and
+    /// emit_mov_mem_rcx_rax() below both stay in this simplest real
+    /// addressing-mode class, no SIB byte ever needed anywhere in this
+    /// milestone's own new codegen.
+    unsafe fn emit_mov_rax_mem_rax(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x8B, 0x00]) };
+    }
+    /// `MOV [RCX], RAX` (REX.W `89` /r) -- the store-side sibling of
+    /// emit_mov_rax_mem_rax() above: writes RAX's own value to the real
+    /// runtime address already sitting in RCX (STMT_ASSIGN_INDEX's own
+    /// codegen below computes the target address into RAX, PUSHes it,
+    /// evaluates the RHS into RAX -- necessarily clobbering the address
+    /// register -- then POPs the saved address back into RCX
+    /// specifically so this final store has a value register (RAX) and
+    /// an address register (RCX) that are genuinely different
+    /// registers). ModRM `0x01` = mod=00 (no displacement) / reg=000
+    /// (RAX, the source) / rm=001 (RCX, the address register) -- same
+    /// real "mod=00, rm not 100/101" plain register-indirect addressing
+    /// class emit_mov_rax_mem_rax() above already uses, source and
+    /// destination roles swapped between the two (MOV's `89` opcode is
+    /// r/m,r -- register TO memory -- versus `8B`'s r,r/m -- memory TO
+    /// register -- the exact same opcode-direction pairing this file's
+    /// own emit_mov_rax_rbp_off()/emit_mov_rbp_off_rax() pair already
+    /// established for the rbp-relative case).
+    unsafe fn emit_mov_mem_rcx_rax(&mut self) {
+        unsafe { self.push_bytes(&[0x48, 0x89, 0x01]) };
+    }
 }
 
 // MILESTONE 72: the real x86_64 register-number encodings
@@ -4499,6 +4866,49 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 }
                 None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
             }
+        }
+        // MILESTONE 108: `arr[idx]` -- a real array-element READ. `find_var()`
+        // resolves the array's own NAME to its element-0 base offset
+        // (`o`, the same base_off collect_vars_rec()'s own Milestone 108
+        // doc comment derives; the `is_char` field it also returns is
+        // ignored here -- this first slice's arrays are `int`-only, see
+        // parse_array_decl()'s own doc comment) exactly like EXPR_IDENT
+        // above, then this arm does the one genuinely new thing no
+        // scalar variable ever needed: computes a REAL RUNTIME address
+        // instead of using `o` as an immediate disp8 directly.
+        //   <idx>                        (gen_expr, index into RAX)
+        //   push rax                     (save the index across the LEA)
+        //   lea rax, [rbp+o]             (RAX = &arr[0], element 0's real address)
+        //   pop rcx                      (RCX = the index)
+        //   shl rcx, 3                   (RCX = index * 8 -- 8 bytes/element)
+        //   sub rax, rcx                 (RAX = &arr[0] - index*8 = &arr[index] --
+        //                                 correct because collect_vars_rec()'s own
+        //                                 element layout grows MORE negative as the
+        //                                 index grows, the same direction subtracting
+        //                                 a larger index*8 already moves RAX)
+        //   mov rax, [rax]               (RAX = arr[index], the real load)
+        // Only RAX/RCX are ever touched -- see emit_lea_rax_rbp_off()'s
+        // own doc comment above for why no callee-saved register needed
+        // saving/restoring for this milestone. No bounds check is
+        // emitted (a real, disclosed simplification -- see this
+        // milestone's own README entry's "still genuinely open" note):
+        // an out-of-range `idx` reads whatever real stack memory sits at
+        // that computed address, exactly the same real undefined
+        // behavior an unchecked C array access already has on genuine
+        // hardware, not a new gap this codegen introduces.
+        EXPR_INDEX => {
+            let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
+            let base_off = match slot {
+                Some((o, _is_char)) => o,
+                None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
+            };
+            unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
+            unsafe { buf.emit_push_rax() };
+            unsafe { buf.emit_lea_rax_rbp_off(base_off) };
+            unsafe { buf.emit_pop_reg(REG_RCX) };
+            unsafe { buf.emit_shl_rcx_imm8(3) };
+            unsafe { buf.emit_sub_rax_rcx() };
+            unsafe { buf.emit_mov_rax_mem_rax() };
         }
         // MILESTONE 72: a call expression's own real codegen -- evaluate
         // every argument into RAX, PUSHing each one immediately after
@@ -4982,6 +5392,47 @@ unsafe fn gen_stmt_list(
                     Some((o, _is_char)) => unsafe { buf.emit_mov_rbp_off_rax(o) },
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 }
+            }
+            // MILESTONE 108: `arr[idx] = expr;` -- a real array-element
+            // WRITE, `s.then_body` (field-reused, see STMT_ASSIGN_INDEX's
+            // own const doc comment) holding the index sub-expression's
+            // ExprNode pointer. The address-computation half is exactly
+            // EXPR_INDEX's own real `lea`+`shl`+`sub` sequence above
+            // (gen_expr()'s own doc comment there has the full
+            // derivation) -- the one real difference is what happens
+            // once the address is known: EXPR_INDEX immediately
+            // dereferences it to READ; this arm instead PUSHes the
+            // computed address, evaluates the RHS expression into RAX
+            // (necessarily clobbering RAX/RCX again -- the RHS can be
+            // arbitrarily complex, e.g. another array read), then POPs
+            // the saved address back into RCX and stores.
+            //   <idx>                        (gen_expr, index into RAX)
+            //   push rax                     (save index)
+            //   lea rax, [rbp+o]             (RAX = &arr[0])
+            //   pop rcx                      (RCX = index)
+            //   shl rcx, 3                   (RCX = index * 8)
+            //   sub rax, rcx                 (RAX = &arr[index])
+            //   push rax                     (save the computed address)
+            //   <rhs>                        (gen_expr, value into RAX --
+            //                                 may itself use RAX/RCX freely)
+            //   pop rcx                      (RCX = &arr[index])
+            //   mov [rcx], rax               (arr[index] = value, the real store)
+            STMT_ASSIGN_INDEX => {
+                let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
+                let base_off = match slot {
+                    Some((o, _is_char)) => o,
+                    None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
+                };
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.then_body) }?;
+                unsafe { buf.emit_push_rax() };
+                unsafe { buf.emit_lea_rax_rbp_off(base_off) };
+                unsafe { buf.emit_pop_reg(REG_RCX) };
+                unsafe { buf.emit_shl_rcx_imm8(3) };
+                unsafe { buf.emit_sub_rax_rcx() };
+                unsafe { buf.emit_push_rax() };
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
+                unsafe { buf.emit_pop_reg(REG_RCX) };
+                unsafe { buf.emit_mov_mem_rcx_rax() };
             }
             STMT_RETURN => {
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
@@ -9025,7 +9476,124 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m107 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 108: single-dimension fixed-size `int` array
+        // declarations, indexed reads, and indexed writes -- see this
+        // file's own top Milestone 108 doc comment for the full grammar
+        // delta and codegen derivation.
+        //
+        // CASE 88: exactly MAX_VARS (8) elements, no other locals in the
+        // function -- both the real position-correctness proof (the
+        // same base-10-digit-weighted-return technique CASE 26's own
+        // `mix4` and CASE 86's own `mix8` already established, so a
+        // single scalar result proves EVERY element landed in its own
+        // correct slot, not just that some commutative combination came
+        // out right) AND the real MAX_VARS boundary-SUCCESS proof (one
+        // array using the entire real 8-slot vars-table budget by
+        // itself, the same cap collect_vars_rec()'s own new Milestone
+        // 108 branch enforces for every array, not a smaller,
+        // unrepresentative array size).
+        //   int main() {
+        //       int arr[8];
+        //       arr[0]=1; arr[1]=2; arr[2]=3; arr[3]=4;
+        //       arr[4]=5; arr[5]=6; arr[6]=7; arr[7]=8;
+        //       return arr[0]*10000000 + arr[1]*1000000 + arr[2]*100000
+        //            + arr[3]*10000 + arr[4]*1000 + arr[5]*100 + arr[6]*10 + arr[7];
+        //   }
+        // Hand-computed: 12345678.
+        // -------------------------------------------------------------
+        const SRC88: &[u8] = b"int main() { int arr[8]; arr[0] = 1; arr[1] = 2; arr[2] = 3; arr[3] = 4; arr[4] = 5; arr[5] = 6; arr[6] = 7; arr[7] = 8; return arr[0] * 10000000 + arr[1] * 1000000 + arr[2] * 100000 + arr[3] * 10000 + arr[4] * 1000 + arr[5] * 100 + arr[6] * 10 + arr[7]; }";
+        let case88_result = compile_and_run_program_callable(SRC88.as_ptr() as u64, SRC88.len() as u64);
+        w(b"  case88 (int arr[8], every element written and read back at its own position, in-process) returned=");
+        if let Some(r) = case88_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12345678)\n");
+        let case88_ok = case88_result == Some(12345678);
+        write_check(b"case88_eight_element_array_returns_12345678=", case88_ok);
+
+        w(b"\n");
+
+        // CASE 89: a REAL runtime variable index -- a `while`-loop
+        // counter, not a literal -- proving this codegen genuinely
+        // computes `&arr[0] - idx*8` at runtime (emit_lea_rax_rbp_off()/
+        // emit_shl_rcx_imm8()/emit_sub_rax_rcx()/emit_mov_rax_mem_rax())
+        // rather than folding a constant index at compile time; a
+        // literal-index-only implementation could pass CASE 88 above by
+        // accident (e.g. by mis-treating each `arr[K]` for constant K as
+        // an independent scalar slot named "arr_K") without ever
+        // exercising the real address arithmetic this milestone's own
+        // codegen adds. Also realistic array usage -- sum every element
+        // via a loop, the actual point of an indexable array over a
+        // named scalar.
+        //   int main() {
+        //       int arr[5]; int i; int sum;
+        //       arr[0]=10; arr[1]=20; arr[2]=30; arr[3]=40; arr[4]=50;
+        //       i = 0; sum = 0;
+        //       while (i < 5) { sum = sum + arr[i]; i = i + 1; }
+        //       return sum;
+        //   }
+        // Hand-computed: 10+20+30+40+50 = 150.
+        // -------------------------------------------------------------
+        const SRC89: &[u8] = b"int main() { int arr[5]; int i; int sum; arr[0] = 10; arr[1] = 20; arr[2] = 30; arr[3] = 40; arr[4] = 50; i = 0; sum = 0; while (i < 5) { sum = sum + arr[i]; i = i + 1; } return sum; }";
+        let case89_result = compile_and_run_program_callable(SRC89.as_ptr() as u64, SRC89.len() as u64);
+        w(b"  case89 (int arr[5] summed via a real while-loop counter as the index, in-process) returned=");
+        if let Some(r) = case89_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 150)\n");
+        let case89_ok = case89_result == Some(150);
+        write_check(b"case89_runtime_indexed_loop_sum_returns_150=", case89_ok);
+
+        w(b"\n");
+
+        // CASE 90: the real cap itself -- MAX_VARS (8) + 1 elements in a
+        // single array, and NOTHING else declared in the function (so
+        // this is genuinely the array alone exceeding the budget, not an
+        // array competing with other locals for it). The same "prove the
+        // cap moved/exists for real, don't just exercise the happy path"
+        // discipline CASE 87 already established for MAX_PARAMS, applied
+        // here to MAX_VARS -- CodeGenError::TooManyVars existed since
+        // Milestone 67/72 but (checked directly against this file's own
+        // history: grepping this file for "TooManyVars" before this
+        // milestone finds only its own definition and its two real throw
+        // sites, never a single self-test call site) had never once been
+        // exercised by any self-test case in this file until this one.
+        //   int main() { int arr[9]; return arr[0]; }
+        // -------------------------------------------------------------
+        const SRC90: &[u8] = b"int main() { int arr[9]; return arr[0]; }";
+        let case90_ok = match lex_and_parse_program(SRC90.as_ptr() as u64, SRC90.len() as u64) {
+            Ok(prog90) => match gen_program(SRC90.as_ptr() as u64, prog90, CodegenMode::Callable) {
+                Err(CodeGenError::TooManyVars) => {
+                    w(b"  case90 9-element array (MAX_VARS + 1) rejected (TooManyVars), as expected\n");
+                    true
+                }
+                _ => {
+                    w(b"  case90 expected Err(CodeGenError::TooManyVars) for a 9-element array, got something else\n");
+                    false
+                }
+            },
+            Err(_) => {
+                w(b"  case90 lex_and_parse_program() returned Err unexpectedly (source should lex+parse fine)\n");
+                false
+            }
+        };
+        write_check(b"case90_nine_element_array_is_too_many_vars=", case90_ok);
+
+        w(b"\n");
+
+        let overall_m108 = case88_ok && case89_ok && case90_ok;
+        w(b"OVERALL_M108=");
+        w(if overall_m108 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 { 0 } else { 1 });
     }
 }
 

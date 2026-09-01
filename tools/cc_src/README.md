@@ -277,3 +277,37 @@ bytes; the real `PT_LOAD` segment `p_memsz` is 69104 bytes, 17 pages --
 unchanged in practice from Milestone 103's own 17 pages, still
 comfortably under the 64-page per-segment cap and 128-page total cap, no
 cap change needed.
+
+**Milestone 108 addition**: single-dimension fixed-size `int` array
+declarations, indexed reads, and indexed writes (`EXPR_INDEX`/
+`STMT_ASSIGN_INDEX`/`parse_array_decl()` in `main.rs`) -- a real,
+deliberately narrow first slice of this file's own longest-standing
+disclosed gap ("no arrays/pointers", named in every compiler-frontend
+milestone's own "still genuinely open" section since Milestone 83). Two
+new lexer tokens (`[`/`]`); array element access computes a real RUNTIME
+address (`&arr[0] - idx*8`, four newly hand-verified `CodeBuf` encodings
+-- `emit_lea_rax_rbp_off()`/`emit_shl_rcx_imm8()`/`emit_mov_rax_mem_
+rax()`/`emit_mov_mem_rcx_rax()`) rather than folding the index into a
+compile-time-constant `disp8` the way every scalar variable access has
+since Milestone 68; `collect_vars_rec()`'s own stack-slot allocator now
+reserves N contiguous slots per array instead of always exactly one. See
+README.md's own Milestone 108 entry for the full design reasoning
+(including the real, deliberate scope cuts -- `int`-only, no
+initializer lists, no multi-dimensional arrays, no arrays as function
+parameters, no bounds checking) and the real, quoted serial-log evidence
+from both a fresh-disk and a reused-disk boot. Three new self-test
+cases: CASE 88 (`int arr[8]`, exactly `MAX_VARS`, a combined position-
+correctness + `MAX_VARS`-boundary-success proof, base-10-digit-weighted
+return `12345678`), CASE 89 (`int arr[5]` summed via a real `while`-loop
+counter as the index -- the real proof this is genuine runtime
+addressing, not literal-index sugar -- returns `150`), and CASE 90
+(`int arr[9]`, `MAX_VARS + 1`, a real `CodeGenError::TooManyVars` --
+the first time this file's self-test has ever exercised that error
+path). File size grew from Milestone 107's 84120 bytes (see README.md's
+own Milestone 107 entry -- this build-recipe file's own addenda skip
+straight from Milestone 76 to Milestone 105 to this entry, since not
+every milestone that touches `tools/cc_src` gets its own addendum here;
+Milestone 106/107 are documented in README.md alone) to 87808 bytes; the
+real `PT_LOAD` segment `p_memsz` is 73792 bytes, 19 pages, up from
+Milestone 107's own 17 -- still comfortably under the 64-page per-
+segment cap and 128-page total cap, no cap change needed.

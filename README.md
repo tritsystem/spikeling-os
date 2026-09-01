@@ -7405,6 +7405,197 @@ self-test suite, genuinely open for a future pass.
       real subscriber (Milestone 106) -- all unrelated to this milestone,
       all still open exactly as previously disclosed.
 
+- [x] **Milestone 108**: single-dimension fixed-size `int` array
+      declarations, indexed reads, and indexed writes (`tools/cc_src/
+      main.rs`) -- a real, deliberately narrow first slice of the
+      longest-standing gap this file's own "still genuinely open"
+      disclosures have named in every compiler-frontend milestone since
+      Milestone 83 ("no arrays/pointers"), the same "narrow, honestly
+      scoped first slice, not the whole feature at once" discipline
+      `char` itself used across Milestone 102-105.
+
+      **Grammar/AST**: two new lexer tokens (`TOK_LBRACKET`/
+      `TOK_RBRACKET`, "[" / "]"); a new `parse_array_decl()` parser
+      function for `"int" IDENT "[" INTLIT "]" ";"` (the size must be a
+      real positive INTLIT, not a general `cond_expr` -- real C requires
+      a constant expression for a plain array declarator's own bound
+      too, so this is a genuine subset of real C grammar, not an
+      invented restriction; `int arr[0];` is a new, real, disclosed
+      `ParseError::BadArraySize`), deliberately its OWN standalone parse
+      path rather than folded into `make_decl()`'s existing comma-
+      separated multi-declarator/initializer chain -- no array
+      initializer, no mixing an array declarator into an `int a, b[3],
+      c;` list, no `char` arrays (`char` stays scalar-only, unchanged);
+      a new `EXPR_INDEX` AST kind for `arr[idx]` as a read (parsed in
+      `parse_factor()`'s own `TOK_IDENT` arm, alongside the pre-existing
+      call-vs-plain-ident disambiguation, now three-way); and a new
+      `STMT_ASSIGN_INDEX` AST kind for `arr[idx] = expr;` as a write --
+      deliberately a NEW statement kind rather than a flag bolted onto
+      `STMT_ASSIGN` (the same "new kind, not a reused kind with a flag"
+      discipline Milestone 99's `STMT_DOWHILE` already chose over a flag
+      on `STMT_WHILE`), so `STMT_ASSIGN`'s own codegen and every one of
+      its existing callers stay completely untouched -- zero regression
+      risk to the plain-scalar-assignment path every prior milestone
+      already verified. `idx` is any real `cond_expr` in both positions,
+      not just a literal -- CASE 89 (below) indexes with a real
+      `while`-loop counter, the real proof this is genuine runtime
+      addressing, not literal-index sugar.
+
+      **Stack layout**: `collect_vars_rec()`'s own `STMT_DECL` branch now
+      reads a real element count out of the STMT_DECL's own `else_body`
+      field (0 for every scalar declarator, unchanged since Milestone 67
+      -- reused rather than growing `StmtNode` by a field, the same
+      discipline `then_body`'s own Milestone 102 `is_char` reuse already
+      established) and reserves that many CONTIGUOUS 8-byte stack slots
+      instead of one. Only the array's own first slot (element 0, its
+      real base address) becomes a real NAMED `VarSlot` entry
+      `find_var()` can match; elements 1..N-1 get real, explicitly-
+      written BLANK filler entries (`name_len=0`, unmatchable by any
+      real identifier this lexer could ever produce) rather than being
+      left as uninitialized `malloc()`ed memory `find_var()`'s own
+      linear scan would otherwise read -- real, live undefined behavior
+      this milestone deliberately avoids introducing. Writing real blank
+      fillers is what keeps `nvars` (this whole codegen's existing dual-
+      purpose count -- both "how many real `VarSlot` table entries
+      exist" AND "how many 8-byte stack slots this function's frame
+      needs", see `gen_function()`/`gen_program()`'s own `frame_bytes =
+      (nvars + 1) * 8`) an exactly accurate slot count for a function
+      that declares an array, with ZERO changes needed to either of
+      those two frame-sizing call sites. `MAX_VARS` (8) now caps total
+      SLOTS, not just named variables -- a single array can legally
+      consume the whole budget by itself (CASE 88 does, below).
+
+      **Runtime address codegen -- the one genuinely new machine-code
+      surface this milestone adds**: every prior variable access this
+      codegen has ever emitted, since Milestone 68, used a compile-time-
+      constant `disp8` straight off `rbp` (one variable, one fixed
+      offset). An array index is a real runtime value, so `EXPR_INDEX`/
+      `STMT_ASSIGN_INDEX` instead compute `&arr[0] - idx*8` at runtime
+      (element `i`'s real address, since `collect_vars_rec()`'s own
+      layout makes each successive element's offset MORE negative, the
+      same direction subtracting a larger `idx*8` already moves) via
+      four newly hand-verified `CodeBuf` encodings -- `emit_lea_rax_
+      rbp_off()` (`LEA r64,[rbp+disp8]`, computing the array's own base
+      ADDRESS rather than loading through it), `emit_shl_rcx_imm8()`
+      (`SHL r/m64,imm8` applied to RCX, `idx * 8`), `emit_mov_rax_mem_
+      rax()` (`MOV RAX,[RAX]`, the real load, reused by `EXPR_INDEX`),
+      and `emit_mov_mem_rcx_rax()` (`MOV [RCX],RAX`, the real store,
+      used by `STMT_ASSIGN_INDEX`) -- each individually checked against
+      the Intel SDM's own encoding tables, the same discipline every
+      `CodeBuf` method before it already used. The whole sequence uses
+      only RAX/RCX, both already this codegen's own ordinary scratch
+      registers (the same real stack-machine "push to save across a
+      nested evaluation, pop back into a scratch register" idiom every
+      other binary/call node already uses) -- no new callee-saved
+      register is introduced anywhere, so this milestone needed zero
+      prologue/epilogue changes.
+
+      **New self-test cases** (see `main.rs`'s own top Milestone 108 doc
+      comment for the full derivation): CASE 88 (`int arr[8]`, exactly
+      `MAX_VARS`, no other locals in the function -- simultaneously the
+      real position-correctness proof, the same base-10-digit-weighted-
+      return technique CASE 26's `mix4` and CASE 86's `mix8` already
+      established so a single scalar result proves every element landed
+      in its own correct slot, AND the real `MAX_VARS` boundary-SUCCESS
+      proof, one array alone using the entire real 8-slot budget)
+      returns `12345678`; CASE 89 (`int arr[5]`, summed via a real
+      `while`-loop counter as the index, realistic array usage and the
+      real runtime-addressing proof named above) returns `150`; CASE 90
+      (`int arr[9]`, `MAX_VARS + 1`, alone in its function) is a real,
+      disclosed `CodeGenError::TooManyVars` -- the same "prove the cap
+      is real, don't just exercise the happy path" discipline CASE 87
+      already established for `MAX_PARAMS`, applied here to `MAX_VARS`
+      for the first time ever: `TooManyVars` has existed since Milestone
+      67/72 but (checked directly by grepping this file's own history
+      for "TooManyVars" before this milestone) had never once been
+      exercised by any self-test case in this file until CASE 90.
+
+      **Scope, deliberately real and disclosed**: `int` arrays only (no
+      `char[]`); no array initializer lists (`int arr[3] = {1,2,3};` is
+      not in this grammar); no multi-dimensional arrays; no arrays as
+      function parameters or return values (no array-to-pointer decay
+      exists in this subset at all -- there being no pointer type yet
+      either, the other half of the "arrays/pointers" gap this
+      milestone's own name only partially closes); no compound-
+      assignment operators on an array target (`arr[i] += 1;` is real,
+      disclosed future work); no bounds checking (an out-of-range index
+      reads/writes whatever real stack memory the computed address
+      lands on, exactly the same real undefined behavior an unchecked C
+      array access already has on genuine hardware -- not a new gap this
+      codegen introduces, and consistent with this file's own long-
+      standing "no bounds-check panic path, so no `core::fmt` gets
+      pulled into this freestanding `panic=abort` binary" reason for
+      never having runtime bounds checks anywhere in this codegen); a
+      bare array name used as an expression with no index (`return
+      arr;`) is not rejected at parse or codegen time -- it silently
+      reads whatever is at the array's own element-0 slot as if it were
+      an ordinary scalar, a real, disclosed simplification rather than a
+      hard error, since detecting it would need a real symbol table
+      tracking each name's own declared shape, which this codegen does
+      not build (`find_var()`'s own linear scan resolves a name to an
+      offset only).
+
+      **No SNN/evidence-gate work this milestone, and correctly so**:
+      this is a pure compiler-frontend milestone -- new grammar, new AST
+      kinds, new machine-code encodings, no kernel-side subsystem
+      decision anywhere in it for an evidence-gated hysteresis gate to
+      meaningfully subscribe to. The same "pure compiler-frontend
+      features legitimately don't need this" carve-out Milestone 107's
+      own `MAX_PARAMS` fix already established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero new warnings -- the two pre-existing `dead_code`
+      field-never-read warnings on `CodeGenError::ArgCountMismatch(u64)`/
+      `UndefinedLabel(u64)` predate this milestone, unchanged, same as
+      every milestone since 107 disclosed). `kernel/assets/cc.elf`
+      rebuilt via the project's own pinned-nightly `rustc` recipe
+      (`tools/cc_src/README.md`, unchanged) -- 87808 bytes, up from
+      Milestone 107's 84120; the real `PT_LOAD` `p_memsz` via `readelf
+      -l` is 73792 bytes, 19 pages, up from Milestone 107's 17 --
+      comfortably under the 64-page per-segment and 128-page total caps,
+      no cap change needed. Two real QEMU boots against a genuinely
+      fresh disk (`target/persist.img`/`persist2.img` deleted first),
+      `cargo run -- bios`, fresh then reused (`m108_fresh_boot.log`/
+      `m108_reused_boot.log`), no stray `qemu-system-x86_64.exe`
+      process before or after either boot (checked via `tasklist`).
+      `OVERALL_M108=PASS` on both boots -- CASE 88 returns `12345678`,
+      CASE 89 returns `150`, CASE 90 correctly rejects the 9-element
+      array with `TooManyVars`, identically on both boots. Every
+      `OVERALL=`/`OVERALL_M*=` marker this kernel has ever produced (36
+      total, Milestones 1-66's four aggregate checks through
+      `OVERALL_M107` plus this milestone's own new `OVERALL_M108`)
+      independently re-confirmed `PASS` on both boots -- checked with a
+      script that extracts every real serial `WRITE` syscall's own
+      payload from both logs in order and diffs the resulting marker
+      list against Milestone 107's own fresh-boot marker list, not
+      sampled or eyeballed: all 36 markers matched, all `PASS`, fresh
+      and reused byte-identical. No regressions: the reused boot's own
+      `fs self-test: permissions`/`symlinks` `FAIL` lines were diffed
+      directly (`diff`, not eyeballed) against Milestone 107's own
+      reused boot's FAIL-line set -- byte-for-byte identical, the same
+      pre-existing, already-disclosed Milestone 62-era fixture-cleanup
+      artifact every milestone since 70 has named; the fresh boot's own
+      fs self-test passes both suites, matching every prior milestone's
+      fresh-boot pattern. Zero `panicked at`/`kernel panicked` and zero
+      `DOUBLE FAULT`/`TRIPLE FAULT` in either log (checked directly,
+      `grep -c`, zero matches in both).
+
+      **Still genuinely open**: the "arrays/pointers" gap is now only
+      HALF closed -- arrays exist, real pointers (declaration,
+      dereference, arithmetic) still do not, and neither does array-to-
+      pointer decay (so no arrays as function parameters or return
+      values yet either). Within arrays themselves: no `char[]`, no
+      initializer lists, no multi-dimensional arrays, no compound-
+      assignment on an array target, no bounds checking, and a bare
+      array name with no index is silently treated as a scalar rather
+      than rejected (see this entry's own "Scope" paragraph above for
+      the full reasoning on each). `MAX_PARAMS` (8), no `sizeof`, `char`
+      as the only non-`int` type, the compiler self-test's own per-
+      compile leak, `heap_guard::admit()` covering only its original two
+      call sites, and `evidence_gate.rs` still having exactly one real
+      subscriber (Milestone 106) all remain exactly as Milestone 107
+      left them -- unrelated to this milestone.
+
 ## Building and running
 
 Requires:

@@ -914,12 +914,26 @@
 // do-while, break/continue, switch/case/default, goto/labels, calls,
 // direct + mutual recursion.
 //
-// Still genuinely open after Milestone 99: `MAX_PARAMS` (4, needs
+// MILESTONE 100 (kernel, not this file): the per-process user stack
+// grew from one 4 KiB page to eight (32 KiB) -- this compiler's
+// recursive-descent parser had run the single page off the bottom.
+//
+// MILESTONE 101 adds multiple comma-separated declarators after one
+// `int` -- parser-only. `int a, b = 2, c;` desugars to the flat chain
+// `DECL(a) -> DECL(b) -> ASSIGN(b = 2) -> DECL(c)`; each declarator may
+// carry its own `= <ternary>` initializer, and a later one may
+// reference an earlier declarator in the same list. Statement level and
+// `for` init clause. No new AST kind, no new codegen. A dangling `,` is
+// a real ParseError. CASE 73 (mixed init -> 8), CASE 74 (sequential
+// dependency -> 11), CASE 75 (dangling-comma error). This is also the
+// end-to-end proof of Milestone 100: this exact change overflowed the
+// old single stack page and now runs with room to spare.
+//
+// Still genuinely open after Milestone 101: `MAX_PARAMS` (4, needs
 // stack-passed arguments); no arrays/pointers; only the `int` type
 // (a `char` literal is just an int, there is still no `char` type or
 // any width tracking); the compiler self-test still leaks per-compile
-// (bounded by `heap_reset()`, not eliminated); one 4 KiB stack page
-// per process.
+// (bounded by `heap_reset()`, not eliminated).
 //
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
@@ -2419,30 +2433,71 @@ impl Parser {
     /// MILESTONE 88: build a STMT_DECL for `name`, and -- if the next
     /// token is `=` -- a combined initializer, desugared to a
     /// STMT_ASSIGN chained right after the decl (`decl.next = assign`).
-    /// Returns the decl (the head of the chain). `consume_semi` is true
-    /// at statement level (`int i = e;` ends in `;`), false for a `for`
-    /// init clause (the `for` parser consumes the `;`). Only plain `=`
-    /// starts an initializer -- a compound op after `int i` would be
-    /// reading an uninitialized variable, so it is left to fall through
-    /// as a parse error rather than silently accepted.
+    /// `consume_semi` is true at statement level (`int i = e;` ends in
+    /// `;`), false for a `for` init clause (the `for` parser consumes
+    /// the `;`). Only plain `=` starts an initializer -- a compound op
+    /// after `int i` would be reading an uninitialized variable, so it
+    /// is left to fall through as a parse error.
+    ///
+    /// MILESTONE 101: one or more comma-separated declarators after a
+    /// single `int`. `int a, b = 2, c;` desugars to the flat statement
+    /// chain `DECL(a) -> DECL(b) -> ASSIGN(b = 2) -> DECL(c)`. Each
+    /// declarator independently may carry its own `= <ternary>`
+    /// initializer (`finish_ident_assign` with `consume_semi = false`,
+    /// so it stops before the `,` or `;`), and a later initializer may
+    /// reference an earlier declarator in the same list (the chain is
+    /// sequential DECL/ASSIGN pairs). Works at statement level and as a
+    /// `for` init clause. No new AST kind, no new codegen: `STMT_DECL`
+    /// is already a codegen no-op and `collect_vars_rec` already
+    /// registers every `STMT_DECL` it walks. A dangling `,` with no
+    /// following declarator is a real ParseError.
+    ///
+    /// The declarator-node creation is inlined per iteration (no helper
+    /// call): even with Milestone 100's 32 KiB stack, this is the hot
+    /// path for every `int` declaration and there is no reason to spend
+    /// a frame on it.
     unsafe fn make_decl(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
-        let decl = unsafe { alloc_stmt() };
-        if decl == 0 {
+        let head = unsafe { alloc_stmt() };
+        if head == 0 {
             return Err(ParseError::OutOfMemory);
         }
         unsafe {
             core::ptr::write(
-                decl as *mut StmtNode,
+                head as *mut StmtNode,
                 StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
             )
         };
+        let mut tail = head;
         if unsafe { self.peek() }.kind == TOK_ASSIGN {
-            let assign = unsafe { self.finish_ident_assign(name, consume_semi) }?;
-            unsafe { (*(decl as *mut StmtNode)).next = assign };
-        } else if consume_semi {
+            let assign = unsafe { self.finish_ident_assign(name, false) }?;
+            unsafe { (*(tail as *mut StmtNode)).next = assign };
+            tail = assign;
+        }
+        while unsafe { self.peek() }.kind == TOK_COMMA {
+            unsafe { self.advance() }; // ','
+            let nm = unsafe { self.expect(TOK_IDENT) }?;
+            let d = unsafe { alloc_stmt() };
+            if d == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    d as *mut StmtNode,
+                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: 0, else_body: 0 },
+                )
+            };
+            unsafe { (*(tail as *mut StmtNode)).next = d };
+            tail = d;
+            if unsafe { self.peek() }.kind == TOK_ASSIGN {
+                let assign = unsafe { self.finish_ident_assign(nm, false) }?;
+                unsafe { (*(tail as *mut StmtNode)).next = assign };
+                tail = assign;
+            }
+        }
+        if consume_semi {
             unsafe { self.expect(TOK_SEMI) }?;
         }
-        Ok(decl)
+        Ok(head)
     }
 
     /// MILESTONE 84 logic, extracted at MILESTONE 86 so `for`'s init and
@@ -8080,7 +8135,74 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m99 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 101: multiple comma-separated declarators after one
+        // `int` (parser-only). This is also the end-to-end proof that
+        // Milestone 100's extra stack pages are real and usable -- this
+        // exact change stack-overflowed cc.elf's single 4 KiB page on
+        // its first attempt (the reverted "M100"); it now compiles and
+        // runs inside the 32 KiB stack with room to spare.
+        // CASE 73 (in-process): a mix of initialized and uninitialized
+        // declarators.
+        //   int main() { int a = 1, b, c = 3; b = a + c; return a + b + c; }
+        // Hand-computed: a = 1, c = 3, b = 4; 1 + 4 + 3 = 8.
+        // -------------------------------------------------------------
+        const SRC73: &[u8] = b"int main() { int a = 1, b, c = 3; b = a + c; return a + b + c; }";
+        let case73_result = compile_and_run_program_callable(SRC73.as_ptr() as u64, SRC73.len() as u64);
+        w(b"  case73 (mixed multi-declarator, in-process) returned=");
+        if let Some(r) = case73_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 8)\n");
+        let case73_ok = case73_result == Some(8);
+        write_check(b"case73_multi_declarator_mixed_init_returns_8=", case73_ok);
+
+        w(b"\n");
+
+        // CASE 74: a later declarator's initializer refers to an earlier
+        // declarator in the SAME list.
+        //   int main() { int x = 5, y = x * 2, z = y + 1; return z; }
+        // Hand-computed: x = 5, y = 10, z = 11.
+        const SRC74: &[u8] = b"int main() { int x = 5, y = x * 2, z = y + 1; return z; }";
+        let case74_result = compile_and_run_program_callable(SRC74.as_ptr() as u64, SRC74.len() as u64);
+        w(b"  case74 (declarator initializer uses earlier declarator) returned=");
+        if let Some(r) = case74_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case74_ok = case74_result == Some(11);
+        write_check(b"case74_multi_declarator_sequential_dependency_returns_11=", case74_ok);
+
+        w(b"\n");
+
+        // CASE 75: a trailing comma with no declarator after it is a
+        // real ParseError (the `expect(TOK_IDENT)` after the `,` fails).
+        //   int main() { int a, ; return a; }
+        const SRC75: &[u8] = b"int main() { int a, ; return a; }";
+        let case75_ok = match lex_and_parse(SRC75.as_ptr() as u64, SRC75.len() as u64) {
+            Err(_) => {
+                w(b"  case75 dangling comma in declarator list rejected, as expected\n");
+                true
+            }
+            Ok(_) => {
+                w(b"  case75 expected a ParseError for the dangling `,` in `int a, ;`, got Ok\n");
+                false
+            }
+        };
+        write_check(b"case75_dangling_declarator_comma_is_a_parse_error=", case75_ok);
+
+        w(b"\n");
+
+        let overall_m101 = case73_ok && case74_ok && case75_ok;
+        w(b"OVERALL_M101=");
+        w(if overall_m101 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 { 0 } else { 1 });
     }
 }
 

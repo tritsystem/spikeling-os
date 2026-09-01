@@ -605,6 +605,42 @@
 // arrays/pointers, no additional C types; one 4 KiB stack page per
 // process.
 //
+// MILESTONE 86 adds `for` loops, the cleaner of Milestone 85's two
+// named grammar candidates:
+//   for_stmt := "for" "(" for_clause? ";" logic_or? ";" for_clause? ")"
+//               "{" stmt* "}"
+//   for_clause := IDENT ("=" | "+=" | ... | ">>=") logic_or
+// `for (init; cond; step) { body }` is DESUGARED at parse time to
+// `init; while (cond) { body step; }` -- Milestone 71's `STMT_WHILE`
+// (and therefore all of its codegen) is reused verbatim, so this is a
+// pure parser milestone: ZERO new codegen, one new keyword token, one
+// new `parse_stmt` arm. `init` and `step` are ordinary IDENT-assignments
+// (plain `=` or any Milestone-84 compound form), parsed by the SAME
+// `finish_ident_assign()` the plain assignment statement uses (extracted
+// into its own method this milestone for exactly that reuse), with
+// `consume_semi = false`. `init`, `cond`, and `step` are each optional;
+// an absent `cond` becomes a synthesized `EXPR_INTLIT(1)`. The loop
+// variable must be declared before the loop -- this subset has no
+// combined `int i = 0` decl-init anywhere, an unchanged scope cut.
+//
+// The one real structural subtlety: `parse_stmt()` can now return a
+// two-node CHAIN (`init -> while`), not always a single node, so
+// `parse_stmt_list_until_rbrace()` now advances its `tail` cursor to the
+// real end of whatever `parse_stmt()` returned before linking the next
+// statement -- a small, general fix, not `for`-specific.
+//
+// Two new self-test cases: CASE 45 (in-process Callable path -- a
+// counting loop, `for (i=1; i<5; i+=1) s += i` -> 10) and CASE 46 (real
+// on-disk-ELF + kernel exec()+wait() path -- factorial via `for`, built
+// so a wrong desugar order gives 720 or 24 instead of 120).
+//
+// Still genuinely open after Milestone 86: `MAX_FUNCS`/`MAX_PARAMS`
+// (4 each); `break`/`continue` (open since Milestone 71, now the leading
+// grammar candidate -- needs a loop-context stack so a `break` forward-
+// patches to the loop exit and a `continue` to the step); no
+// combined decl-init; no arrays/pointers, no additional C types; one
+// 4 KiB stack page per process.
+//
 // Every byte access below goes through raw core::ptr::read/write on
 // u64 addresses rather than `[]` slice/array indexing wherever the
 // index is runtime-variable -- proactively following the SAME
@@ -764,6 +800,15 @@ const TOK_PIPEEQ: u8 = 39;  // "|="
 const TOK_CARETEQ: u8 = 40; // "^="
 const TOK_SHLEQ: u8 = 41;   // "<<="
 const TOK_SHREQ: u8 = 42;   // ">>="
+// MILESTONE 86: keyword "for". `for (init; cond; step) { body }` is
+// desugared at parse time to `init; while (cond) { body step; }` --
+// reuses Milestone 71's while codegen wholesale, ZERO new codegen. `init`
+// and `step` are ordinary assignment statements (plain `=` or any M84
+// compound form), each optional; `cond` is optional (absent == an
+// always-true `1`). The loop variable must be declared before the loop
+// (`int i = 0` combined decl-init is not in this subset's grammar
+// anywhere -- a real, disclosed scope cut, not new here).
+const TOK_FOR: u8 = 43; // keyword "for"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -849,6 +894,9 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
             } else if unsafe { word_is(src_ptr, start, wlen, b"while") } {
                 // MILESTONE 71
                 TOK_WHILE
+            } else if unsafe { word_is(src_ptr, start, wlen, b"for") } {
+                // MILESTONE 86
+                TOK_FOR
             } else {
                 TOK_IDENT
             };
@@ -1811,6 +1859,74 @@ impl Parser {
         Ok(left)
     }
 
+    /// MILESTONE 84 logic, extracted at MILESTONE 86 so `for`'s init and
+    /// step clauses can reuse it. `name` is the already-consumed IDENT;
+    /// the next token is `=` or one of the nine compound-assignment
+    /// operators. `x OP= e` is desugared to `x = (x OP e)` -- a
+    /// synthesized EXPR_BINARY over a fresh EXPR_IDENT reference to
+    /// `name` and the parsed RHS. Returns a STMT_ASSIGN node. `consume_
+    /// semi` is true for a plain assignment statement (which ends in
+    /// `;`), false for a `for` init/step clause (which ends in `;`/`)`
+    /// consumed by the `for` parser itself).
+    unsafe fn finish_ident_assign(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
+        let opk = unsafe { self.peek() }.kind;
+        let binop: Option<u8> = if opk == TOK_PLUSEQ { Some(b'+') }
+            else if opk == TOK_MINUSEQ { Some(b'-') }
+            else if opk == TOK_STAREQ { Some(b'*') }
+            else if opk == TOK_SLASHEQ { Some(b'/') }
+            else if opk == TOK_AMPEQ { Some(OP_BITAND) }
+            else if opk == TOK_PIPEEQ { Some(OP_BITOR) }
+            else if opk == TOK_CARETEQ { Some(OP_BITXOR) }
+            else if opk == TOK_SHLEQ { Some(OP_SHL) }
+            else if opk == TOK_SHREQ { Some(OP_SHR) }
+            else { None };
+        if binop.is_none() {
+            unsafe { self.expect(TOK_ASSIGN) }?;
+        } else {
+            unsafe { self.advance() };
+        }
+        let rhs = unsafe { self.parse_logic_or() }?;
+        if consume_semi {
+            unsafe { self.expect(TOK_SEMI) }?;
+        }
+        let expr = if let Some(op) = binop {
+            let lhs_ref = unsafe { alloc_expr() };
+            if lhs_ref == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    lhs_ref as *mut ExprNode,
+                    ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            let bin = unsafe { alloc_expr() };
+            if bin == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    bin as *mut ExprNode,
+                    ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: lhs_ref, right: rhs, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            bin
+        } else {
+            rhs
+        };
+        let node = unsafe { alloc_stmt() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut StmtNode,
+                StmtNode { kind: STMT_ASSIGN, ident_off: name.ident_off, ident_len: name.ident_len, expr, next: 0, then_body: 0, else_body: 0 },
+            )
+        };
+        Ok(node)
+    }
+
     unsafe fn parse_stmt(&mut self) -> Result<u64, ParseError> {
         let t = unsafe { self.peek() };
         match t.kind {
@@ -1856,79 +1972,88 @@ impl Parser {
             }
             TOK_IDENT => {
                 let name = unsafe { self.advance() };
-                // MILESTONE 84: plain "=" OR one of the nine compound
-                // assignment operators. `x OP= e` is desugared to
-                // `x = (x OP e)` right here: a synthesized EXPR_BINARY
-                // node with the matching op, over a fresh EXPR_IDENT
-                // reference to `name` and the parsed RHS. No new codegen
-                // -- STMT_ASSIGN + gen_expr() already handle every shape
-                // this produces. Evaluating `x` twice is exact here
-                // because `x` is always a simple IDENT in this subset
-                // (no arrays, no calls as lvalues), so the "lvalue
-                // evaluated once" rule real C needs is satisfied for
-                // free.
-                let opk = unsafe { self.peek() }.kind;
-                let binop: Option<u8> = if opk == TOK_PLUSEQ { Some(b'+') }
-                    else if opk == TOK_MINUSEQ { Some(b'-') }
-                    else if opk == TOK_STAREQ { Some(b'*') }
-                    else if opk == TOK_SLASHEQ { Some(b'/') }
-                    else if opk == TOK_AMPEQ { Some(OP_BITAND) }
-                    else if opk == TOK_PIPEEQ { Some(OP_BITOR) }
-                    else if opk == TOK_CARETEQ { Some(OP_BITXOR) }
-                    else if opk == TOK_SHLEQ { Some(OP_SHL) }
-                    else if opk == TOK_SHREQ { Some(OP_SHR) }
-                    else { None };
-                if binop.is_none() {
-                    unsafe { self.expect(TOK_ASSIGN) }?;
+                unsafe { self.finish_ident_assign(name, true) }
+            }
+            // MILESTONE 86: `for (init; cond; step) { body }` -- desugared
+            // to `init; while (cond) { body step; }`. Reuses Milestone
+            // 71's STMT_WHILE (and therefore its codegen) verbatim; the
+            // only new AST work is chaining `init` in front of the while
+            // and appending `step` to the tail of the while body. `init`
+            // and `step` are ordinary IDENT-assignments (plain `=` or any
+            // Milestone-84 compound form), parsed by the SAME
+            // `finish_ident_assign()` the plain assign-statement uses,
+            // with `consume_semi = false`; each is optional. An absent
+            // `cond` becomes a synthesized `EXPR_INTLIT(1)` (always
+            // true). The loop variable must be declared before the loop
+            // -- this subset has no combined `int i = 0` decl-init
+            // anywhere, a real disclosed scope cut, not introduced here.
+            TOK_FOR => {
+                unsafe { self.advance() };
+                unsafe { self.expect(TOK_LPAREN) }?;
+                // init (optional)
+                let init: u64 = if unsafe { self.peek() }.kind == TOK_SEMI {
+                    0
                 } else {
-                    unsafe { self.advance() };
-                }
-                let rhs = unsafe { self.parse_logic_or() }?;
-                unsafe { self.expect(TOK_SEMI) }?;
-                let expr = if let Some(op) = binop {
-                    let lhs_ref = unsafe { alloc_expr() };
-                    if lhs_ref == 0 {
-                        return Err(ParseError::OutOfMemory);
-                    }
-                    unsafe {
-                        core::ptr::write(
-                            lhs_ref as *mut ExprNode,
-                            ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
-                        )
-                    };
-                    let bin = unsafe { alloc_expr() };
-                    if bin == 0 {
-                        return Err(ParseError::OutOfMemory);
-                    }
-                    unsafe {
-                        core::ptr::write(
-                            bin as *mut ExprNode,
-                            ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: lhs_ref, right: rhs, call_args_ptr: 0, call_argc: 0 },
-                        )
-                    };
-                    bin
-                } else {
-                    rhs
+                    let n = unsafe { self.expect(TOK_IDENT) }?;
+                    unsafe { self.finish_ident_assign(n, false) }?
                 };
-                let node = unsafe { alloc_stmt() };
-                if node == 0 {
+                unsafe { self.expect(TOK_SEMI) }?;
+                // cond (optional -- absent == always-true 1)
+                let cond: u64 = if unsafe { self.peek() }.kind == TOK_SEMI {
+                    let one = unsafe { alloc_expr() };
+                    if one == 0 {
+                        return Err(ParseError::OutOfMemory);
+                    }
+                    unsafe {
+                        core::ptr::write(
+                            one as *mut ExprNode,
+                            ExprNode { kind: EXPR_INTLIT, int_val: 1, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+                        )
+                    };
+                    one
+                } else {
+                    unsafe { self.parse_logic_or() }?
+                };
+                unsafe { self.expect(TOK_SEMI) }?;
+                // step (optional)
+                let step: u64 = if unsafe { self.peek() }.kind == TOK_RPAREN {
+                    0
+                } else {
+                    let n = unsafe { self.expect(TOK_IDENT) }?;
+                    unsafe { self.finish_ident_assign(n, false) }?
+                };
+                unsafe { self.expect(TOK_RPAREN) }?;
+                unsafe { self.expect(TOK_LBRACE) }?;
+                let body = unsafe { self.parse_stmt_list_until_rbrace() }?;
+                // while_body = body ++ [step]
+                let while_body: u64 = if step == 0 {
+                    body
+                } else if body == 0 {
+                    step
+                } else {
+                    let mut t = body;
+                    while unsafe { (*(t as *const StmtNode)).next } != 0 {
+                        t = unsafe { (*(t as *const StmtNode)).next };
+                    }
+                    unsafe { (*(t as *mut StmtNode)).next = step };
+                    body
+                };
+                let while_node = unsafe { alloc_stmt() };
+                if while_node == 0 {
                     return Err(ParseError::OutOfMemory);
                 }
                 unsafe {
                     core::ptr::write(
-                        node as *mut StmtNode,
-                        StmtNode {
-                            kind: STMT_ASSIGN,
-                            ident_off: name.ident_off,
-                            ident_len: name.ident_len,
-                            expr,
-                            next: 0,
-                            then_body: 0,
-                            else_body: 0,
-                        },
+                        while_node as *mut StmtNode,
+                        StmtNode { kind: STMT_WHILE, ident_off: 0, ident_len: 0, expr: cond, next: 0, then_body: while_body, else_body: 0 },
                     )
                 };
-                Ok(node)
+                if init == 0 {
+                    Ok(while_node)
+                } else {
+                    unsafe { (*(init as *mut StmtNode)).next = while_node };
+                    Ok(init)
+                }
             }
             TOK_IF => {
                 unsafe { self.advance() };
@@ -2017,7 +2142,14 @@ impl Parser {
             } else {
                 unsafe { (*(tail as *mut StmtNode)).next = stmt };
             }
+            // MILESTONE 86: parse_stmt() may now return a SHORT CHAIN, not
+            // a single node -- `for` returns `init -> while`. Advance
+            // `tail` to the real end of whatever came back so the next
+            // statement links after the whole thing, not after its head.
             tail = stmt;
+            while unsafe { (*(tail as *const StmtNode)).next } != 0 {
+                tail = unsafe { (*(tail as *const StmtNode)).next };
+            }
         }
         unsafe { self.expect(TOK_RBRACE) }?;
         Ok(head)
@@ -5740,7 +5872,75 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m85 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 86: `for` loops, desugared to `init; while (cond) {
+        // body step; }`. No new codegen -- Milestone 71's STMT_WHILE is
+        // reused verbatim.
+        //
+        // CASE 45 (in-process Callable path): a real counting loop whose
+        // init, condition, step, and body all matter.
+        //   int main() {
+        //       int s; s = 0;
+        //       int i;
+        //       for (i = 1; i < 5; i += 1) { s += i; }
+        //       return s;
+        //   }
+        // Hand-computed: i = 1,2,3,4 (stops at 5), s = 1+2+3+4 = 10. An
+        // off-by-one in the desugared condition or a dropped step gives a
+        // different sum.
+        // -------------------------------------------------------------
+        const SRC45: &[u8] = b"int main() { int s; s = 0; int i; for (i = 1; i < 5; i += 1) { s += i; } return s; }";
+        let case45_result = compile_and_run_program_callable(SRC45.as_ptr() as u64, SRC45.len() as u64);
+        w(b"  case45 (for loop sum 1..4, in-process) returned=");
+        if let Some(r) = case45_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 10)\n");
+        let case45_ok = case45_result == Some(10);
+        write_check(b"case45_for_loop_sum_returns_10=", case45_ok);
+
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // CASE 46 (real on-disk-ELF + kernel exec()+wait() path -- this
+        // milestone's strongest tier): factorial via a `for` loop whose
+        // step is a Milestone-84 compound assignment and whose body
+        // mutates a second variable, so the desugar order (body BEFORE
+        // step, step INSIDE the while body not after it) is what makes
+        // the number come out right.
+        //   int main() {
+        //       int p; p = 1;
+        //       int i;
+        //       for (i = 1; i < 6; i += 1) { p *= i; }
+        //       return p;
+        //   }
+        // Hand-computed: p = 1*1*2*3*4*5 = 120. If `step` ran before the
+        // body, p would be 2*3*4*5*6 = 720 (low 8 bits 0xD0 = 208, not
+        // 120); a dropped final iteration gives 24. 120 is reachable only
+        // with the correct `body then step` desugar.
+        // -------------------------------------------------------------
+        const SRC46: &[u8] =
+            b"int main() { int p; p = 1; int i; for (i = 1; i < 6; i += 1) { p *= i; } return p; }";
+        const PATH46: &[u8] = PATH8;
+        let (elf46_ptr, elf46_len) = compile_program_standalone_elf(SRC46.as_ptr() as u64, SRC46.len() as u64);
+        let case46_ok = if elf46_ptr == 0 {
+            w(b"  case46 compile_program_standalone_elf failed\n");
+            false
+        } else {
+            write_exec_and_check!(PATH46, elf46_ptr, elf46_len, 120)
+        };
+        write_check(b"case46_real_elf_exec_for_loop_factorial_returns_120=", case46_ok);
+
+        w(b"\n");
+
+        let overall_m86 = case45_ok && case46_ok;
+        w(b"OVERALL_M86=");
+        w(if overall_m86 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 { 0 } else { 1 });
     }
 }
 

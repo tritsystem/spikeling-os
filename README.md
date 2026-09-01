@@ -6146,6 +6146,45 @@ self-test suite, genuinely open for a future pass.
       -- `break`/`continue` open since Milestone 71); no arrays/pointers,
       no additional C types; one 4 KiB stack page per process.
 
+- [x] **Milestone 86**: `for` loops in the self-hosted subset-C
+      compiler -- the cleaner of Milestone 85's two named grammar
+      candidates.
+      `for (init; cond; step) { body }` is **desugared at parse time**
+      to `init; while (cond) { body step; }`, so Milestone 71's
+      `STMT_WHILE` (and all of its codegen) is reused verbatim: **zero
+      new codegen**, one new keyword token, one new `parse_stmt` arm.
+      `init` and `step` are ordinary IDENT-assignments (plain `=` or any
+      Milestone-84 compound form), parsed by the same
+      `finish_ident_assign()` the plain assignment statement uses --
+      extracted into its own method this milestone for exactly that
+      reuse. `init`, `cond`, and `step` are each optional; an absent
+      `cond` becomes a synthesized `1`. The loop variable must be
+      declared before the loop (this subset has no combined `int i = 0`
+      decl-init anywhere -- an unchanged scope cut).
+
+      One real structural change: `parse_stmt()` can now return a
+      two-node chain (`init -> while`), so
+      `parse_stmt_list_until_rbrace()` advances its tail cursor to the
+      real end of whatever `parse_stmt()` returned before linking the
+      next statement. Small and general, not `for`-specific.
+
+      **Verified**: `cargo build` clean, no warnings; `cc.elf` rebuilt.
+      Two QEMU boots, fresh then reused. CASE 45 (in-process --
+      `for (i=1; i<5; i+=1) s += i`) returns `10`; CASE 46 (real
+      on-disk-ELF + kernel `exec()`+`wait()` -- factorial via `for`,
+      built so a wrong desugar order gives `720` or `24`) returns `120`.
+      Both boots. `OVERALL_M86=PASS`, `OVERALL_M68`..`M85` all still
+      PASS, `milestone 64`/`65`/`stdiotest` all still PASS, fresh vs.
+      reused OVERALL markers byte-identical, only the disclosed `FAIL`
+      set remains. No regressions.
+
+      **Still genuinely open**: `MAX_FUNCS`/`MAX_PARAMS` (4 each);
+      `break`/`continue` (open since Milestone 71 -- now the leading
+      grammar candidate, needs a loop-context stack so `break`
+      forward-patches to the loop exit and `continue` to the step); no
+      combined decl-init; no arrays/pointers, no additional C types; one
+      4 KiB stack page per process.
+
 ## Building and running
 
 Requires:

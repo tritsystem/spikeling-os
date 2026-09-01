@@ -40,13 +40,26 @@
 //! smaller `Vec`/`Box` allocation sites -- a much larger undertaking (a
 //! real fallible-allocation API this kernel has nowhere yet) explicitly
 //! out of scope here.
+//!
+//! **MILESTONE 106 update**: this module's own bespoke `PressureGate`
+//! struct and its private copy of the "EMA then hysteresis then count
+//! transitions" state machine have been migrated onto the new
+//! `evidence_gate` module -- a real generalization of this exact
+//! mechanism into a subsystem other kernel decisions can subscribe to
+//! (see `evidence_gate.rs`'s own module doc for the full rationale).
+//! This file's own tuning constants below (`HIGH_WATER_FRACTION`,
+//! `GATE_ON_THRESHOLD`, `GATE_OFF_THRESHOLD`, `FAST_TAU_SAMPLES`,
+//! `SAFETY_MARGIN_BYTES`) are byte-for-byte unchanged from Milestone
+//! 104 -- only WHERE the evidence/conservative/sample_count state lives
+//! moved, not any of the numbers that drive it. Verified behavior-
+//! preserving: see README.md's own Milestone 106 entry for the
+//! byte-identical counter comparison against Milestone 105's baseline.
 
 use crate::allocator;
-use crate::network;
+use crate::evidence_gate::{self, GateConfig, GateKind, GateTransition};
 use crate::serial;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
 
 /// MILESTONE 104: a sample counts as a pressure "hit" once the kernel
 /// heap is more than 3/4 full -- a real, chosen threshold, not tuned to
@@ -83,24 +96,25 @@ const FAST_TAU_SAMPLES: u64 = 1;
 /// another spinlocked kernel-heap path.
 const SAFETY_MARGIN_BYTES: usize = 4096;
 
-struct PressureGate {
-    evidence: f32,
-    conservative: bool,
-    sample_count: u64,
-}
-
-static GATE: Mutex<PressureGate> = Mutex::new(PressureGate {
-    evidence: 0.0,
-    conservative: false,
-    sample_count: 0,
-});
+/// MILESTONE 106: this heap-pressure gate's own tuning, unchanged from
+/// Milestone 104, now passed BY VALUE into the shared `evidence_gate`
+/// state machine on every call instead of living inside a bespoke local
+/// struct -- see this file's own module doc and `evidence_gate.rs`'s.
+const HEAP_GATE_CONFIG: GateConfig = GateConfig {
+    gate_on_threshold: GATE_ON_THRESHOLD,
+    gate_off_threshold: GATE_OFF_THRESHOLD,
+    fast_tau: FAST_TAU_SAMPLES,
+};
 
 // MILESTONE 104: real, measured counters for this milestone's own
 // honest evidence-gated-vs-naive benchmark (see `stats()` below and the
 // new `heap_guard::self_test_heap_pressure()` boot-time self-test) --
 // never reset mid-boot, so they reflect the WHOLE real boot's history.
-static SAMPLES_TAKEN: AtomicU64 = AtomicU64::new(0);
-static GATE_TRIP_EPISODES: AtomicU64 = AtomicU64::new(0);
+// MILESTONE 106: `samples_taken`/`gate_trip_episodes` moved into
+// `evidence_gate`'s own shared `GateState` (they're part of the
+// generalized state machine, not heap-specific); only the two genuinely
+// heap-specific counters -- the naive-baseline comparison and the real
+// admission-denial count -- stay local here.
 static NAIVE_INSTANTANEOUS_HITS: AtomicU64 = AtomicU64::new(0);
 static ADMISSIONS_DENIED: AtomicU64 = AtomicU64::new(0);
 
@@ -108,53 +122,43 @@ static ADMISSIONS_DENIED: AtomicU64 = AtomicU64::new(0);
 /// -- the real, natural per-process-teardown checkpoint -- with the
 /// kernel heap's own real `allocator::heap_used()` byte count
 /// immediately after that specific teardown finished (frames freed,
-/// `Process` fully dropped). Updates the fast EMA every call
-/// (`network::update_evidence()`'s exact tritkit-ported formula, reused
-/// verbatim), and re-evaluates the hysteretic gate every
-/// `network::golden_period(FAST_TAU_SAMPLES)`-th call -- exactly
-/// Milestone 39's own fast/slow-clock structure, applied to a different
-/// real signal. Also updates the SEPARATE, purely-observational
-/// naive-baseline counter (an instantaneous, un-smoothed check against
-/// the same `HIGH_WATER_FRACTION`) for this milestone's own benchmark --
-/// never consulted by `admit()` itself.
+/// `Process` fully dropped). MILESTONE 106: the fast-EMA-then-hysteresis
+/// state machine itself now lives in `evidence_gate::record_sample()`
+/// (shared code -- see that module's own doc); this function's job is
+/// just converting a real heap-used byte count into a hit/miss bool,
+/// feeding it in, and logging its OWN domain-specific detail (used
+/// bytes / budget) on a real transition. Also updates the SEPARATE,
+/// purely-observational naive-baseline counter (an instantaneous,
+/// un-smoothed check against the same `HIGH_WATER_FRACTION`) for this
+/// milestone's own benchmark -- never consulted by `admit()` itself.
 pub fn record_teardown_sample(used_after: usize) {
     let fraction = used_after as f32 / allocator::HEAP_SIZE as f32;
     let hit = fraction > HIGH_WATER_FRACTION;
 
-    SAMPLES_TAKEN.fetch_add(1, Ordering::Relaxed);
     if hit {
         NAIVE_INSTANTANEOUS_HITS.fetch_add(1, Ordering::Relaxed);
     }
 
-    let mut gate = GATE.lock();
-    network::update_evidence(&mut gate.evidence, hit);
-    gate.sample_count += 1;
+    let (transition, evidence) = evidence_gate::record_sample(GateKind::KernelHeapPressure, &HEAP_GATE_CONFIG, hit);
 
-    if gate.sample_count % network::golden_period(FAST_TAU_SAMPLES) == 0 {
-        let was_conservative = gate.conservative;
-        if gate.conservative {
-            if gate.evidence < GATE_OFF_THRESHOLD {
-                gate.conservative = false;
-            }
-        } else if gate.evidence > GATE_ON_THRESHOLD {
-            gate.conservative = true;
-        }
-        if gate.conservative && !was_conservative {
-            GATE_TRIP_EPISODES.fetch_add(1, Ordering::Relaxed);
+    match transition {
+        GateTransition::Entered => {
             let _ = writeln!(
                 serial(),
                 "milestone 104: heap-pressure gate -- entering CONSERVATIVE mode (evidence={:.3}, used={} bytes of {} KiB budget)",
-                gate.evidence,
+                evidence,
                 used_after,
                 allocator::HEAP_SIZE / 1024
             );
-        } else if was_conservative && !gate.conservative {
+        }
+        GateTransition::Left => {
             let _ = writeln!(
                 serial(),
                 "milestone 104: heap-pressure gate -- leaving CONSERVATIVE mode (evidence={:.3})",
-                gate.evidence
+                evidence
             );
         }
+        GateTransition::Unchanged => {}
     }
 }
 
@@ -180,7 +184,7 @@ pub fn admit(bytes_needed: usize) -> bool {
         ADMISSIONS_DENIED.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if GATE.lock().conservative {
+    if evidence_gate::is_conservative(GateKind::KernelHeapPressure) {
         ADMISSIONS_DENIED.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -200,10 +204,13 @@ pub fn naive_admit(bytes_needed: usize) -> bool {
 
 /// Real, measured counters as of right now: `(samples_taken,
 /// gate_trip_episodes, naive_instantaneous_hits, admissions_denied)`.
+/// MILESTONE 106: the first two now come from `evidence_gate`'s own
+/// shared counters rather than this file's own atomics.
 pub fn stats() -> (u64, u64, u64, u64) {
+    let (samples_taken, gate_trip_episodes) = evidence_gate::stats(GateKind::KernelHeapPressure);
     (
-        SAMPLES_TAKEN.load(Ordering::Relaxed),
-        GATE_TRIP_EPISODES.load(Ordering::Relaxed),
+        samples_taken,
+        gate_trip_episodes,
         NAIVE_INSTANTANEOUS_HITS.load(Ordering::Relaxed),
         ADMISSIONS_DENIED.load(Ordering::Relaxed),
     )

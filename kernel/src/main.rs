@@ -18,6 +18,7 @@ mod fs;
 mod console;
 mod elf;
 mod errno;
+mod evidence_gate;
 mod gdt;
 mod heap_guard;
 mod hetero_ensemble;

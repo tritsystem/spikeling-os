@@ -7145,6 +7145,152 @@ self-test suite, genuinely open for a future pass.
       (CASE 79's verification tier) and deliberately does not attempt
       anything broader.
 
+- [x] **Milestone 106**: a real, reusable, multi-subscriber kernel
+      subsystem for evidence-gated self-healing (new `kernel/src/
+      evidence_gate.rs`) -- Tier 13's own roadmap item, named verbatim in
+      this README: "generalize Milestone 39's evidence-gated topology
+      from its toy 3-neuron demo network into a real subsystem other
+      kernel decisions can subscribe to." Before this milestone,
+      Milestone 39's fast-EMA-then-hysteresis state machine existed in
+      exactly two places: `network.rs`'s own per-synapse `evaluate_gates()`
+      (the original), and `heap_guard.rs`'s bespoke `PressureGate` struct
+      (Milestone 104's own hand-copy of the same dynamics onto a
+      different signal). That is precisely the "two independently-
+      implemented copies of the same dynamics silently drifting out of
+      sync" failure mode `network.rs`'s own module doc names as a hard-
+      won Milestone 21 lesson -- one level up from where Milestone 78/104
+      already fixed it at the FORMULA level (`network::update_evidence()`/
+      `network::golden_period()`, both already `pub(crate)` and shared).
+      This milestone fixes it at the STATE-MACHINE level: `evidence_gate::
+      record_sample()` now owns the "update the EMA every call,
+      re-evaluate ON/OFF hysteresis only every `golden_period()`-th call,
+      count real trip episodes, report what changed" logic as shared
+      code, built on the exact same `network::update_evidence()`/
+      `network::golden_period()` primitives underneath.
+
+      **What's shared and what deliberately isn't**: only the mechanism
+      moved. Each subscriber's own tuning (`GATE_ON_THRESHOLD`/
+      `GATE_OFF_THRESHOLD`/`fast_tau`) and its own metric-to-hit
+      conversion (`heap_guard.rs`'s `HIGH_WATER_FRACTION` fraction check
+      against real `allocator::heap_used()`) stay owned by the subscriber
+      and are passed into `record_sample()` by value on every call, via a
+      new `GateConfig` struct, rather than becoming shared/global
+      constants -- the same "the mechanism is common, the judgment call
+      about what counts as pressure isn't" boundary `network.rs`'s own
+      tuning already drew relative to `heap_guard.rs`'s separate tuning
+      before this milestone, now made structural instead of implicit. A
+      real, closed `GateKind` enum (one variant: `KernelHeapPressure`)
+      lists subscribers at compile time rather than a runtime string
+      registry -- a deliberate choice: this kernel has a small,
+      statically-known set of subsystems that could ever plausibly
+      subscribe, so a runtime registry (with its own "registry full"
+      failure mode, for zero real benefit here) would be more machinery
+      than the actual problem calls for. Any future subscriber adds one
+      enum variant and one array slot; nothing about the shared state
+      machine is heap-specific.
+
+      **The actual migration**: `heap_guard.rs`'s `PressureGate` struct
+      and its private `GATE: Mutex<PressureGate>` are gone. `record_
+      teardown_sample()` now converts a real heap-used byte count into a
+      hit/miss bool (unchanged logic) and calls `evidence_gate::
+      record_sample(GateKind::KernelHeapPressure, &HEAP_GATE_CONFIG, hit)`,
+      which returns a `GateTransition` (`Entered`/`Left`/`Unchanged`) plus
+      the current evidence value -- `heap_guard.rs` logs its OWN
+      domain-specific detail (used bytes / KiB budget) only on a real
+      transition, matching Milestone 104's exact log wording, without
+      `evidence_gate.rs` needing to know what that detail is. `admit()`
+      now calls `evidence_gate::is_conservative(GateKind::
+      KernelHeapPressure)` instead of locking its own struct. `stats()`
+      now pulls `samples_taken`/`gate_trip_episodes` from `evidence_gate::
+      stats()` -- only the two genuinely heap-specific counters
+      (`NAIVE_INSTANTANEOUS_HITS`, `ADMISSIONS_DENIED`) stay as local
+      atomics in `heap_guard.rs`, since they're about the naive-baseline
+      comparison and the real admission-denial count, not part of the
+      generalized gate mechanism. `HEAP_GATE_CONFIG` is a `const
+      GateConfig` built from the exact same `GATE_ON_THRESHOLD=0.5`/
+      `GATE_OFF_THRESHOLD=0.2`/`FAST_TAU_SAMPLES=1` numbers Milestone 104
+      chose -- zero tuning change, only where the numbers get consumed.
+
+      **Verified**: `cargo build` clean, zero warnings (kernel + host
+      runner; `cc.elf` untouched by this kernel-only milestone --
+      confirmed unchanged at 82480 bytes, byte-identical to Milestone
+      105's own build, since nothing in `tools/cc_src/` was touched or
+      rebuilt). Two real QEMU boots against a genuinely fresh disk
+      (`target/persist.img`/`persist2.img` deleted first), fresh then
+      reused (`m106_fresh_boot.log` / `m106_reused_boot.log`). The real
+      regression test this milestone's own refactor calls for --
+      Milestone 104's self-test counters, unchanged in every input, must
+      come out byte-identical to Milestone 105's own baseline now that
+      they're computed through the new shared state machine instead of
+      the old bespoke one: quoted directly from both new logs, `milestone
+      104: self-test -- real evidence-gate state: samples_taken=68
+      gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0` and `evidence_gated_admit=true
+      naive_admit=true`, `OVERALL_M104=PASS` -- comparing directly against
+      `m105_fresh_boot.log`'s own recorded `samples_taken=68
+      gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0`, an exact match, on both the fresh and
+      the reused boot. No `run_preemption_demo() SKIPPED` line and no
+      kernel `PANIC` on either boot -- the gate never needed to trip, the
+      same real "thin budget, not a leak" state Milestone 104/105 already
+      established, now reproduced through entirely different code that
+      computes it. `OVERALL_M101`/`OVERALL_M102` (all four of CASE 76-79,
+      including CASE 79 still on the real `exec()` path Milestone 105
+      moved it to -- `milestone 43: syscall WAIT ... reaped child pid 14,
+      exited normally with code 55` present on both boots, matching
+      exactly)/`OVERALL_M103` all still PASS. No regressions: the reused
+      boot's own `fs self-test: permissions`/`symlinks` FAIL-line set was
+      diffed directly (not eyeballed) against `m105_reused_boot.log`'s
+      own FAIL-line set -- byte-for-byte identical, the same pre-existing
+      disk-state artifact Milestone 100 first disclosed (second boot
+      finds `permtestdir` already created by the first); the fresh boot's
+      own fs self-test PASSES both suites on this milestone's own run,
+      matching every prior milestone's fresh-boot pattern. `milestone 54`
+      (frame reclaim)/`64`/`65` (mmap) self-tests all still present and
+      passing in both logs.
+
+      **A real, pre-existing discrepancy found while verifying, honestly
+      disclosed, NOT fixed here** (unrelated to this milestone's own
+      change, `src/main.rs` rather than anything in `kernel/`): this
+      README's own "Building and running" section says `cargo run #
+      defaults to BIOS boot`, but `src/main.rs`'s actual argument parsing
+      (`args.get(1)` matched against `"uefi"`/`"bios"`/`-h`/`--help`, with
+      every other case -- including no argument at all -- falling to the
+      `_` arm) prints a `Usage: ... [uefi|bios]` message and exits 1 on a
+      bare `cargo run` with no arguments; only `cargo run -- bios` (used
+      for both of this milestone's own verification boots above) or
+      `cargo run -- uefi` actually boots. Confirmed directly, not
+      guessed: a bare `cargo run` in this milestone's own verification
+      session reproduced exactly that usage-and-exit-1 behavior. Out of
+      scope for this milestone (a kernel-subsystem-generalization
+      milestone, not a host-runner-argument-parsing one) to silently
+      patch either the code or the doc without deciding which one is
+      actually the intended default -- left open, named plainly, for
+      whoever next touches `src/main.rs` or this README's own "Building
+      and running" section.
+
+      **Still genuinely open**: exactly one real subscriber
+      (`heap_guard.rs`) uses `evidence_gate.rs` as of this milestone. A
+      second real subscriber -- Tier 13's own suggested "flaky driver's
+      error-recovery policy," or SNN-driven page eviction, or scheduler
+      priority -- was deliberately NOT invented here just to prove the
+      API works with two callers: this kernel has no currently-observed
+      real driver flakiness (`nic.rs`'s real `Result`-returning error
+      paths have never actually been seen to fail against QEMU's e1000
+      emulation) and no realistic physical-frame pressure (process
+      footprints are tiny relative to typical QEMU RAM) to honestly gate
+      on right now. Fabricating scarcity to exercise a second gate would
+      be exactly the kind of manufactured-problem dishonesty this
+      project's own verification discipline exists to avoid -- so this
+      stays a real, disclosed one-subscriber generalization, structurally
+      ready for a second real subscriber the moment this kernel has one,
+      rather than a padded-out two-subscriber demo. Everything Milestone
+      102/103/104/105 already left open (`MAX_PARAMS`, no
+      arrays/pointers, no `sizeof`, `char` as the only non-`int` type, the
+      compiler self-test's own per-compile leak, `heap_guard::admit()`
+      covering only its original two call sites) remains open --
+      unrelated to this kernel-only milestone.
+
 ## Building and running
 
 Requires:

@@ -7823,6 +7823,214 @@ self-test suite, genuinely open for a future pass.
       having exactly one real subscriber (Milestone 106) all remain
       exactly as Milestone 108 left them -- unrelated to this milestone.
 
+- [x] **Milestone 110**: real array-to-pointer decay, and pointers --
+      and, through decay, arrays -- crossing a real function-call
+      boundary for the first time (`tools/cc_src/main.rs`) -- picking up
+      exactly where Milestone 109's own closing disclosure left off ("no
+      array-to-pointer decay ... no pointers as function parameters or
+      return values either"), and directly following this project's own
+      standing candidate list, which named this ordering explicitly
+      ("likely depends on #1 [pointers] existing first").
+
+      **Grammar delta**: `int *p` is now a legal parameter declarator
+      (`parse_params()`) and `int *` is now a legal function return type
+      (`parse_function()`) -- both accept a single optional `*` right
+      after `int` (never after `char`, matching every other `char`-
+      pointer restriction this file already carries). Neither needs a
+      new `ParamInfo`/`FuncDef` field or any codegen change at all: a
+      pointer value is register/stack-passed and returned exactly like
+      an ordinary `int` (Milestone 109's own "a pointer's runtime value
+      is just another 8-byte value" design point, now reaching two more
+      real call sites), so accepting the grammar IS the complete feature
+      on both sides.
+
+      **The real new codegen -- a single new `VarSlot` field**:
+      `is_array`, set by `collect_vars_rec()`'s own Milestone 108 branch
+      (1 for an array's element-0 slot, 0 for every scalar, pointer,
+      parameter, and array filler entry), threaded through `find_var()`'s
+      now-three-element return tuple to all six of its call sites. Two
+      real behavior changes follow: **(1) `EXPR_IDENT` now DECAYS a bare
+      array name** -- computes the slot's own ADDRESS
+      (`emit_lea_rax_rbp_off()`, Milestone 108's own array-base
+      encoding, reused unchanged) instead of loading the 8-byte VALUE
+      sitting in element 0. Since `EXPR_CALL`'s own argument codegen is
+      ordinary `gen_expr()` recursion with zero special-casing, `foo(arr)`
+      now passes a real address automatically -- no new call-site
+      codegen needed anywhere. This closes, as a genuine side effect
+      rather than a second deliberate change, Milestone 108's own
+      disclosed "a bare array name silently reads its own element-0 slot
+      as an ordinary scalar" simplification. **(2) `EXPR_INDEX`/
+      `STMT_ASSIGN_INDEX` (`p[idx]`/`p[idx] = expr;`) now compute their
+      base address two different ways**: an ARRAY's base is the slot's
+      own address (`emit_lea_rax_rbp_off()`, unchanged from Milestone
+      108); a POINTER's base is the slot's own VALUE
+      (`emit_mov_rax_rbp_off()`, an ordinary scalar read, reused
+      unchanged) -- real C's own `p[idx] == *(p+idx)` rule, now
+      genuinely true here for a pointer variable too, not only a
+      declared array, which is what lets a callee subscript a decayed
+      array argument with ordinary `p[idx]` syntax. **Zero new x86_64
+      encodings**: the fourth milestone in a row (108, 109, now 110) to
+      add real new capability purely by branching among machine-code
+      sequences Milestone 108 already hand-verified against the Intel
+      SDM.
+
+      **A subtlety worth naming plainly**: both index-arithmetic
+      sequences still SUBTRACT `idx*8` from the base, unchanged from
+      Milestone 108. This is not an oversight carried over by inertia --
+      Milestone 108's own array layout grows toward LOWER real addresses
+      as the index grows (a direct, already-disclosed consequence of
+      this codegen's downward-growing stack frame, not real C's usual
+      "addresses increase with index" convention), and since the ONLY
+      real source of a multi-element address this subset can ever
+      produce is exactly such a stack array (no heap/`malloc`-backed
+      array exists anywhere in this language), a pointer's own value --
+      whenever obtained by decaying a real array argument -- already
+      points at memory obeying that same "index grows, address shrinks"
+      layout. Subscripting through the pointer with the identical
+      subtract-based arithmetic is therefore what makes `p[idx]` inside
+      a callee land on the EXACT same bytes `arr[idx]` occupies inside
+      the caller -- the two conventions made to agree by construction,
+      not a coincidental reuse of convenient code.
+
+      **New self-test cases**, all three run in-process
+      (`CodegenMode::Callable`), the same verification tier Milestone
+      107/108/109 all already used for their own new cases -- no new
+      real `fork()`/`exec()`/`wait()` cycle is added by this milestone:
+      CASE 95 (`sum3(arr)` -- a declared array decays to a real address
+      at the call site, and the callee subscripts through the resulting
+      pointer parameter with ordinary `p[idx]` reads, proving both
+      halves of this milestone at once, expected `60`); CASE 96
+      (`zero_out(arr)` writes through `p[idx]` inside the callee -- the
+      real, distinguishing proof that decay hands the callee a genuine
+      address into the CALLER's own stack frame, real aliasing across a
+      function-call boundary rather than a copy: a shallow/buggy
+      implementation could still pass CASE 95's read-only sum but would
+      fail this one, since the caller's own array would stay unchanged
+      if the callee's writes did not really land at its real addresses,
+      expected `0`); CASE 97 (`*identity(&x)` -- a real pointer
+      parameter passed straight through and handed back as a real
+      pointer RETURN type, `int *identity(int *p) { return p; }`, then
+      dereferenced directly off the call expression's own result,
+      expected `42`).
+
+      **A real, honest process note**: this milestone's own first draft
+      of CASE 96 called `zero_out(arr);` as a bare statement, ignoring
+      its return value -- and hit a real, pre-existing, already-
+      disclosed limitation of this subset-C head-on: this grammar has
+      never had an "expression statement" production at all (quoted
+      directly from this file's own top doc comment, present since
+      Milestone 67: "no function may be called as a bare expression-
+      statement ... an existing gap since Milestone 67, unwidened
+      here"), so `lex_and_parse_program()` correctly rejected it. Not a
+      new finding and not a bug this milestone introduced -- fixed by
+      capturing the call's result into an unused local (`r =
+      zero_out(arr);`), exactly the same pattern every prior milestone's
+      own call-expression self-test cases already use, and disclosed
+      here rather than silently patched around without comment.
+
+      **Scope, deliberately real and disclosed**: `int` only (no `char *`
+      parameters/returns); a pointer parameter's own declarator is
+      `int *name` only, no `int name[]` bracket-array parameter sugar
+      (real C treats the two as equivalent; this subset accepts only the
+      pointer spelling, a genuine, deliberate narrowing); no multi-level
+      pointer parameters/returns (`int **`, unreachable anyway --
+      Milestone 109 never added `int **` either); still no pointer
+      arithmetic, so passing a partial array (e.g. `&arr[2]`, to start a
+      callee midway through) is not reachable (`&arr[2]` itself remains
+      real, disclosed non-grammar, Milestone 109's own `&` restriction,
+      untouched here); no new error path this milestone adds (this
+      codegen still has no type system of any kind, so passing a plain
+      `int` where a pointer is semantically expected, or vice versa, is
+      compiled without complaint exactly as it already silently was --
+      the same "no shape-tracking, so no shape-aware rejection"
+      limitation Milestone 108/109 both already disclosed, not new
+      here); and a real, newly-disclosed ASYMMETRY this milestone did
+      NOT resolve -- `arr = expr;` (assigning directly to a bare array
+      name, always silently legal since Milestone 108, since
+      `STMT_ASSIGN`'s own codegen never consults `is_array`) still
+      overwrites element 0's raw VALUE unchanged, even though READING
+      `arr` now decays to its address -- a real, honest gap for a future
+      milestone to either reject at codegen time or otherwise address,
+      not silently smoothed over here.
+
+      **No SNN/evidence-gate work this milestone, and correctly so**:
+      this is a pure compiler-frontend milestone -- new grammar
+      positions, one new `VarSlot` field, new branching among already-
+      hand-verified machine-code sequences, no kernel-side subsystem
+      decision anywhere in it for an evidence-gated hysteresis gate to
+      meaningfully subscribe to. The same "pure compiler-frontend
+      features legitimately don't need this" carve-out Milestone
+      107/108/109 all already established.
+
+      **Verified**: `cargo build` clean from the repo root (kernel + host
+      runner, zero warnings). `kernel/assets/cc.elf` rebuilt via the
+      project's own pinned-nightly `rustc` recipe (`tools/cc_src/
+      README.md`, unchanged) -- 92720 bytes, up from Milestone 109's
+      91104; the real `PT_LOAD` `p_memsz` via `readelf -l` is 78264
+      bytes, 20 pages, up from Milestone 109's own 19 -- comfortably
+      under the 64-page per-segment cap and 128-page total cap, no cap
+      change needed. The rebuilt `cc.elf` was independently re-derived
+      from the current `main.rs` via a from-scratch invocation of the
+      exact same recipe and diffed byte-for-byte identical against the
+      committed binary (`cmp`, not eyeballed). Zero new compiler
+      warnings: verified the same way Milestone 109 verified its own --
+      reproducing the standalone `rustc` invocation against a `git
+      stash` of this milestone's own changes (a real, clean Milestone
+      109 checkout) and diffing the sorted warning list against this
+      milestone's own build -- byte-for-byte identical 15-warning set.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m110_fresh_boot.log`/`m110_reused_boot.log`),
+      no stray `qemu-system-x86_64.exe` process before or after either
+      boot (checked via `tasklist`). `OVERALL_M110=PASS` on both boots --
+      CASE 95 returns `60`, CASE 96 returns `0`, CASE 97 returns `42`,
+      identically on both boots. Every marker this kernel has ever
+      produced was independently re-confirmed `PASS` on both boots via
+      the same real script Milestone 109 introduced (reconstructs the
+      actual WRITE-syscall payload stream from each raw serial log to
+      recover every `OVERALL`/`OVERALL_M*=` marker, plus a separate raw-
+      text scan for the kernel's own older `milestone NN: self-test --
+      OVERALL: PASS` style) -- 47 total distinct markers across both
+      styles, all `PASS`, fresh and reused in exact agreement. No
+      regressions: the reused boot's own `fs self-test: permissions`/
+      `symlinks` FAIL-line set was diffed directly against Milestone
+      109's own reused boot's FAIL-line set -- byte-for-byte identical,
+      54 lines, the same pre-existing, already-disclosed Milestone
+      62-era fixture-cleanup artifact every milestone since 70 has
+      named; the fresh boot's own fs self-test passes both suites
+      cleanly (zero FAIL lines). `run_preemption_demo()` ran to
+      completion on BOTH boots (fresh: `task0=2600 task1=2402
+      task2=2846`; reused: `task0=2646 task1=2505 task2=2769` -- real
+      inter-boot timing jitter, consistent with every prior milestone's
+      own two-boot pairs) -- zero `run_preemption_demo() SKIPPED` lines
+      on either boot. Milestone 104's own heap-pressure evidence-gate
+      state came out BYTE-IDENTICAL to Milestone 108/109's own recorded
+      baseline on both boots: `samples_taken=68 gate_trip_episodes=0
+      naive_instantaneous_hits=0 admissions_denied_so_far=0` -- zero
+      drift, consistent with this milestone being pure compiler-frontend
+      work with no new kernel allocation path. Zero `panicked at`/
+      `kernel panicked` and zero `DOUBLE FAULT`/`TRIPLE FAULT` in either
+      log (checked directly, `grep -c`, zero matches in both).
+
+      **Still genuinely open**: no `char *` parameters/returns; no
+      `int name[]` bracket-array parameter sugar (pointer spelling
+      only); no multi-level pointers anywhere (`int **`); still no
+      pointer arithmetic (so no partial-array arguments like `&arr[2]`);
+      no type system of any kind, so no shape-aware rejection of a
+      mismatched argument/return; and the real, newly-disclosed `arr =
+      expr;` read/write asymmetry named above (reading decays, writing
+      still overwrites element 0 directly). Everything Milestone 108/109
+      already disclosed that this milestone didn't touch remains open:
+      no `char[]`, no array initializer lists, no multi-dimensional
+      arrays, no bounds checking, no `*p += 1;`/`arr[i] += 1;` compound
+      assignment, no NULL-pointer concept. `MAX_PARAMS` (8), no
+      `sizeof`, `char` as the only non-`int` scalar type, the compiler
+      self-test's own per-compile leak, `heap_guard::admit()` covering
+      only its original two call sites, and `evidence_gate.rs` still
+      having exactly one real subscriber (Milestone 106) all remain
+      exactly as Milestone 109 left them -- unrelated to this milestone.
+
 ## Building and running
 
 Requires:

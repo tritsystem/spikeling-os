@@ -355,3 +355,43 @@ size grew from Milestone 108's 87808 bytes to 91104 bytes; the real
 count as Milestone 108, just more bytes within it) -- still comfortably
 under the 64-page per-segment cap and 128-page total cap, no cap change
 needed.
+
+**Milestone 110 addition**: real array-to-pointer decay, and pointers
+(and, through decay, arrays) crossing a real function-call boundary for
+the first time -- `int *p` as a parameter, `int *` as a return type,
+both accepted with zero new `ParamInfo`/`FuncDef` fields and zero
+codegen change (a pointer is register/stack-passed exactly like an
+ordinary `int`). The real new codegen is a single new `VarSlot` field,
+`is_array` (`collect_vars_rec()`'s own Milestone 108 branch sets it),
+threaded through `find_var()`'s now-three-element return tuple to all
+six of its call sites: `EXPR_IDENT` now DECAYS a bare array name to its
+own address (`emit_lea_rax_rbp_off()`, Milestone 108's own encoding,
+reused unchanged) instead of loading its element-0 value, which is what
+makes `foo(arr)` pass a real address with zero new `EXPR_CALL` codegen;
+`EXPR_INDEX`/`STMT_ASSIGN_INDEX` now branch their own base-address
+computation on `is_array` (array: LEA the slot's address, unchanged from
+Milestone 108; pointer: MOV-load the slot's own value,
+`emit_mov_rax_rbp_off()`, reused unchanged), which is what makes
+`p[idx]` genuinely work through a pointer parameter -- real C's own
+`p[idx] == *(p+idx)` rule, true here for the first time for a pointer,
+not only a declared array. Zero new x86_64 encodings -- the fourth
+milestone running (108, 109, 110) to add real capability purely by
+branching among machine-code sequences Milestone 108 already hand-
+verified against the Intel SDM. See README.md's own Milestone 110 entry
+for the full design reasoning (including why the subtract-based index
+arithmetic is correct, not merely reused, for a decayed pointer too) and
+the real, quoted serial-log evidence from both a fresh-disk and a
+reused-disk boot. Three new self-test cases, all run in-process (no new
+real `fork()`/`exec()`/`wait()` cycle, the same tier Milestone
+107/108/109 all already used): CASE 95 (`sum3(arr)` -- array decays to a
+pointer argument, callee subscripts via `p[idx]`, proving both halves at
+once, returns `60`), CASE 96 (`zero_out(arr)` writes through `p[idx]` --
+the real, distinguishing proof that decay hands the callee a genuine
+address into the caller's own frame, real aliasing across a function
+call, returns `0`), and CASE 97 (`*identity(&x)` -- a pointer parameter
+passed straight through and returned as a real pointer return type, then
+dereferenced off the call expression's own result directly, returns
+`42`). File size grew from Milestone 109's 91104 bytes to 92720 bytes;
+the real `PT_LOAD` segment `p_memsz` is 78264 bytes, 20 pages, up from
+Milestone 109's own 19 -- still comfortably under the 64-page per-
+segment cap and 128-page total cap, no cap change needed.

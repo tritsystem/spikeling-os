@@ -1203,6 +1203,80 @@
 // into this freestanding panic=abort binary" reason for never having any
 // runtime safety check anywhere in this codegen, Milestone 108's own
 // array-bounds disclosure being the most recent precedent).
+//
+// MILESTONE 110: real array-to-pointer decay, and pointers -- and,
+// through decay, arrays -- crossing a real function-call boundary for
+// the first time. Grammar delta:
+//   param       := ("int" "*"? | "char") IDENT | ... (unchanged otherwise)
+//   function    := ("int" "*"? | "char") IDENT "(" params? ")" "{" stmt* "}"
+// (both `*`s optional, `char *`/`char` return unaffected). `int *p` as a
+// parameter (`parse_params()`) and `int *` as a return type
+// (`parse_function()`) both need NO new `ParamInfo`/`FuncDef` field and
+// NO codegen change -- a pointer value is register/stack-passed and
+// returned exactly like an ordinary `int` (Milestone 109's own design
+// point), so accepting the grammar IS the complete feature on both
+// sides.
+//
+// The real new codegen is a single new `VarSlot` field, `is_array`
+// (`collect_vars_rec()`'s own array-declarator branch sets it 1 for an
+// array's element-0 slot, 0 for everything else -- every scalar,
+// pointer, and parameter, plus an array's own blank filler elements),
+// threaded through `find_var()`'s now-three-element return tuple to
+// every one of its six call sites. Two real behavior changes follow
+// from it: (1) `EXPR_IDENT`'s own read of a bare array name now DECAYS
+// -- computes the slot's own ADDRESS (`emit_lea_rax_rbp_off()`,
+// Milestone 108's own array-base encoding, reused unchanged) instead of
+// loading the 8-byte VALUE sitting in element 0, closing Milestone
+// 108's own disclosed "a bare array name silently reads its own
+// element-0 slot as an ordinary scalar" simplification as a real side
+// effect, not a second deliberate change -- and since `EXPR_CALL`'s own
+// argument codegen is ordinary `gen_expr()` recursion with zero
+// special-casing, `foo(arr)` now passes a real address automatically,
+// no new call-site codegen needed at all; (2) `EXPR_INDEX`/
+// `STMT_ASSIGN_INDEX` (`p[idx]`/`p[idx] = expr;`) now compute their own
+// base address two different ways depending on `is_array`: an ARRAY's
+// base is the slot's own address (`emit_lea_rax_rbp_off()`, unchanged
+// from Milestone 108); a POINTER's base is the slot's own VALUE
+// (`emit_mov_rax_rbp_off()`, an ordinary scalar read, reused unchanged)
+// -- real C's own `p[idx] == *(p+idx)` rule, now genuinely true here
+// for a pointer variable too, not only a declared array. Both
+// subtract-based index arithmetic sequences are otherwise UNCHANGED
+// from Milestone 108 -- see `EXPR_INDEX`'s own doc comment (below) for
+// why reusing the identical subtract direction for a decayed pointer is
+// not a coincidence but a structural consequence of this codegen's own
+// downward-growing array layout. **Zero new x86_64 encodings**: every
+// instruction this milestone's new codegen paths emit
+// (`emit_lea_rax_rbp_off()`/`emit_mov_rax_rbp_off()`/`emit_mov_rax_
+// mem_rax()`/`emit_mov_mem_rcx_rax()`) already existed before Milestone
+// 108 finished, the fourth milestone in a row (108, 109, now 110) to
+// add real new capability purely by branching among machine-code
+// sequences Milestone 108 already hand-verified against the Intel SDM.
+//
+// Scope, deliberately real and disclosed: `int` only (no `char *`
+// parameters/returns, matching every other `char`-pointer restriction
+// this file already carries); a pointer parameter's own declarator is
+// `int *name` only, no `int name[]` bracket-array parameter sugar (real
+// C treats the two as equivalent; this subset accepts only the pointer
+// spelling, a genuine, deliberate narrowing); no multi-level pointer
+// parameters/returns (`int **`, unreachable anyway -- see Milestone
+// 109's own scope); STILL no pointer arithmetic, so an array/pointer
+// argument beyond simple whole-array decay (e.g. passing `&arr[2]` to
+// start a callee partway through) is not reachable (`&arr[2]` itself
+// remains real, disclosed non-grammar -- Milestone 109's own `&`
+// restriction, untouched here); no new error path this milestone adds
+// (this codegen still has no type system of any kind, so passing a
+// plain `int` where a pointer is semantically expected, or vice versa,
+// is compiled without complaint exactly as it already silently was --
+// the same "no shape-tracking, so no shape-aware rejection" limitation
+// Milestone 108/109 both already disclosed, not new here); `arr = expr;`
+// (assigning directly to a bare array name, always silently legal since
+// Milestone 108, since STMT_ASSIGN's own codegen never consulted
+// `is_array`) is now a genuine, disclosed ASYMMETRY with the read side
+// this milestone did not resolve -- reading `arr` decays to its
+// address, but writing to `arr` directly still overwrites element 0's
+// raw VALUE, unchanged from Milestone 108's own original codegen; a
+// real, honest gap for a future milestone to either reject at codegen
+// time or otherwise address, not silently smoothed over here.
 #![no_std]
 #![no_main]
 
@@ -3745,6 +3819,23 @@ impl Parser {
                 unsafe { self.expect(TOK_INT) }?;
                 false
             };
+            // MILESTONE 110: an optional `*` right after `int` (never
+            // after `char` -- pointers to `char` are out of scope, the
+            // same restriction every other `char` limitation in this
+            // file already carries) marks a POINTER parameter --
+            // `int *p`. This needs no new `ParamInfo` field and no
+            // codegen change of any kind: a pointer parameter is
+            // register/stack-passed exactly like an ordinary scalar
+            // `int` (Milestone 109's own "a pointer's runtime value is
+            // just another 8-byte value" design point, now reaching one
+            // more real call site) -- `collect_vars_for_function()`'s
+            // own Milestone 110 doc comment has the full reasoning for
+            // why its resulting `VarSlot` is `is_array: 0` either way.
+            // The token is simply consumed; nothing downstream needs to
+            // know it was there.
+            if !is_char && unsafe { self.peek() }.kind == TOK_STAR {
+                unsafe { self.advance() };
+            }
             let name = unsafe { self.expect(TOK_IDENT) }?;
             if count as u64 >= MAX_PARAMS {
                 return Err(ParseError::TooManyParams);
@@ -3783,6 +3874,21 @@ impl Parser {
             true
         } else {
             unsafe { self.expect(TOK_INT) }?;
+            // MILESTONE 110: an optional `*` right after `int` (before
+            // the function's own name) marks a POINTER return type --
+            // `int *f(...)`. This needs no new `FuncDef` field and no
+            // codegen change at all: `STMT_RETURN`'s own codegen already
+            // just evaluates the return expression into RAX and, ONLY
+            // when `is_char_return` is set, narrows it -- a pointer
+            // return needs exactly the same "no narrowing, RAX already
+            // holds the right 8-byte value" treatment an ordinary `int`
+            // return already gets, so leaving `is_char_return` false
+            // here (this branch's existing value) after consuming the
+            // token is the complete, correct implementation -- accepting
+            // the grammar is the entire feature.
+            if unsafe { self.peek() }.kind == TOK_STAR {
+                unsafe { self.advance() };
+            }
             false
         };
         let name = unsafe { self.expect(TOK_IDENT) }?;
@@ -4166,6 +4272,24 @@ struct VarSlot {
     // real 1-byte-narrower load, not a narrower slot, is the whole
     // feature.
     is_char: u8,
+    // MILESTONE 110: 1 for the one real NAMED entry an array declarator
+    // produces (collect_vars_rec()'s own Milestone 108 branch, element
+    // 0 -- the array's own base slot), 0 for every scalar/pointer
+    // variable, every parameter, and every array's own BLANK filler
+    // entry (elements 1..N-1, already unmatchable by name so this flag
+    // never actually gets read for them). This is what makes real
+    // array-to-pointer DECAY possible: gen_expr()'s own EXPR_IDENT arm
+    // now checks this flag to decide whether reading a bare name means
+    // "load the 8-byte VALUE stored there" (an ordinary scalar or
+    // pointer) or "compute the 8-byte ADDRESS of the slot itself" (an
+    // array, which decays to a pointer to its own element 0 in every
+    // expression context real C allows this subset to reach) -- see
+    // that arm's own doc comment for the full derivation. Also closes,
+    // as a real side effect rather than a second deliberate change, the
+    // "a bare array name silently reads its own element-0 VALUE instead
+    // of decaying" simplification Milestone 108's own closing disclosure
+    // named honestly at the time.
+    is_array: u8,
 }
 
 unsafe fn var_write(vars_ptr: u64, idx: u64, v: VarSlot) {
@@ -4236,7 +4360,14 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // MILESTONE 102: `s.then_body` is 0/1, written by make_decl()
             // (see that function's own doc comment for why `then_body`,
             // otherwise dead for STMT_DECL, carries this).
-            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: s.then_body as u8 }) };
+            // MILESTONE 110: `is_array` is real (1) exactly when this
+            // declarator reserved more than one element (`elem_count >
+            // 1`, i.e. an array declarator, never a scalar one -- a
+            // scalar `int`/`char`/pointer declaration always has
+            // `elem_count == 1`) -- computed straight from the same
+            // `elem_count` this branch already derived above, not a
+            // second independent check.
+            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: s.then_body as u8, is_array: if elem_count > 1 { 1 } else { 0 } }) };
             // MILESTONE 108: an array of `elem_count` > 1 reserves
             // `elem_count` contiguous 8-byte stack slots (element `i`
             // lives at `off - 8*i`, i.e. progressively MORE negative as
@@ -4265,7 +4396,7 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             let mut k: u64 = 1;
             while k < elem_count {
                 let elem_off = off - 8 * (k as i32);
-                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0 }) };
+                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0, is_array: 0 }) };
                 k += 1;
             }
             *n += elem_count;
@@ -4334,7 +4465,19 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // through into its VarSlot -- a `char` parameter narrows on
         // read exactly like a `char` local. Before this milestone this
         // was unconditionally 0 (char wasn't a parameter type yet).
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char }) };
+        // MILESTONE 110: a parameter's own `is_array` is always 0, even
+        // for a pointer parameter (`int *p`) -- a POINTER parameter's
+        // own slot holds a VALUE (whatever address the caller passed,
+        // e.g. a just-decayed array argument), not an in-place array
+        // base the way a real local array declarator's own element-0
+        // slot does; EXPR_INDEX/STMT_ASSIGN_INDEX's own Milestone 110
+        // `is_array`-gated codegen relies on exactly this distinction to
+        // correctly subscript THROUGH a pointer parameter (read its
+        // VALUE first) rather than treating the parameter's own stack
+        // slot as if it WERE the array (which would be wrong -- see
+        // those two codegen arms' own doc comments for the full
+        // derivation).
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0 }) };
         n += 1;
         pi += 1;
     }
@@ -4348,12 +4491,20 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
 /// regardless of type, see emit_mov_rbp_off_rax()'s call site) uses the
 /// second field to choose a real narrower load. Both existing call
 /// sites updated; STMT_ASSIGN's just ignores the new field.
-unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8)> {
+/// MILESTONE 110: now returns `(stack_off, is_char, is_array)` -- the
+/// third field is what makes real array-to-pointer decay (EXPR_IDENT)
+/// and real pointer-vs-array subscripting (EXPR_INDEX/
+/// STMT_ASSIGN_INDEX) possible; every call site updated, the ones that
+/// don't need it (STMT_ASSIGN's store, EXPR_UNARY's OP_ADDR) just ignore
+/// it, the same "ignore the field you don't need" precedent
+/// Milestone 102's own `is_char` addition already established for
+/// STMT_ASSIGN.
+unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8, u8)> {
     let mut i: u64 = 0;
     while i < nvars {
         let v = unsafe { var_read(vars_ptr, i) };
         if unsafe { same_span(src_ptr, v.name_off as u64, v.name_len as u64, ident_off, ident_len) } {
-            return Some((v.stack_off, v.is_char));
+            return Some((v.stack_off, v.is_char, v.is_array));
         }
         i += 1;
     }
@@ -5115,8 +5266,27 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 // variable (and every variable before this milestone)
                 // still uses. See emit_movsx_rax_rbp_off_byte()'s own
                 // doc comment for the full reasoning.
-                Some((o, is_char)) => {
-                    if is_char != 0 {
+                // MILESTONE 110: real array-to-pointer DECAY. If this
+                // name is an array (`is_array != 0` -- collect_vars_rec()'s
+                // own Milestone 110 tag), reading it as a bare expression
+                // no longer loads the 8-byte VALUE sitting in its own
+                // element-0 slot (Milestone 108's own disclosed
+                // simplification); it computes that slot's own ADDRESS
+                // instead, via `emit_lea_rax_rbp_off()` -- Milestone
+                // 108's own array-base-address encoding, reused
+                // unchanged, the exact same instruction OP_ADDR
+                // (Milestone 109) already uses for `&x`. This is real C's
+                // own decay rule (an array used as an ordinary
+                // expression yields a pointer to its first element) and
+                // is what makes `foo(arr)` at a call site pass a real
+                // address -- no special-casing anywhere in EXPR_CALL's
+                // own codegen is needed, since EXPR_CALL evaluates each
+                // argument through this same gen_expr()/EXPR_IDENT path
+                // like any other expression.
+                Some((o, is_char, is_array)) => {
+                    if is_array != 0 {
+                        unsafe { buf.emit_lea_rax_rbp_off(o) };
+                    } else if is_char != 0 {
                         unsafe { buf.emit_movsx_rax_rbp_off_byte(o) };
                     } else {
                         unsafe { buf.emit_mov_rax_rbp_off(o) };
@@ -5154,15 +5324,56 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         // that computed address, exactly the same real undefined
         // behavior an unchecked C array access already has on genuine
         // hardware, not a new gap this codegen introduces.
+        // MILESTONE 110: `p[idx]` now works for a POINTER variable too
+        // (a pointer parameter, or a plain local `int *p`), not only a
+        // real declared array -- real C itself defines `p[idx]` as
+        // `*(p + idx)` regardless of whether `p` is an array or a
+        // pointer, and this codegen now genuinely matches that: the base
+        // address computation branches on `is_array` (find_var()'s own
+        // Milestone 110 third field). For an ARRAY (`is_array != 0`,
+        // unchanged from Milestone 108), the base is the slot's own
+        // ADDRESS (`emit_lea_rax_rbp_off()`, computed in place -- the
+        // array's own storage IS the element data). For a POINTER
+        // (`is_array == 0`), the base is the slot's own VALUE
+        // (`emit_mov_rax_rbp_off()`, an ordinary scalar read, reused
+        // unchanged from every plain EXPR_IDENT read this codegen has
+        // ever emitted) -- the pointer variable does not itself hold
+        // any element data, it holds the ADDRESS of element 0 somewhere
+        // else (typically a caller's own decayed array argument). Once
+        // the correct base is in RAX, every remaining step (index-scale-
+        // subtract-load) is IDENTICAL to Milestone 108's own original
+        // sequence, unchanged -- INCLUDING the subtract direction.
+        // This deserves its own note: Milestone 108's own array layout
+        // grows toward LOWER real addresses as the index grows (element
+        // `k` sits at `off - 8*k` relative to `rbp`), a direct,
+        // already-disclosed consequence of this codegen's own downward-
+        // growing stack frame, not real C's usual "addresses increase
+        // with index" convention. Since the ONLY real source of a
+        // multi-element address this subset can ever produce is exactly
+        // such a stack array (there is no heap/malloc-backed array
+        // anywhere in this language), a pointer's own VALUE -- whenever
+        // it was obtained by decaying a real array argument (this
+        // milestone's own EXPR_IDENT arm, above) -- points at memory
+        // that ALREADY obeys that same "index grows, address shrinks"
+        // layout. Subscripting through the pointer with the SAME
+        // subtract-based arithmetic the array case already uses is
+        // therefore not an arbitrary reuse of convenient code -- it is
+        // what makes `p[idx]` inside the callee land on the EXACT same
+        // bytes `arr[idx]` would inside the caller, the two conventions
+        // made to agree by construction.
         EXPR_INDEX => {
             let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
-            let base_off = match slot {
-                Some((o, _is_char)) => o,
+            let (base_off, is_array) = match slot {
+                Some((o, _is_char, is_array)) => (o, is_array),
                 None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
             };
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
             unsafe { buf.emit_push_rax() };
-            unsafe { buf.emit_lea_rax_rbp_off(base_off) };
+            if is_array != 0 {
+                unsafe { buf.emit_lea_rax_rbp_off(base_off) };
+            } else {
+                unsafe { buf.emit_mov_rax_rbp_off(base_off) };
+            }
             unsafe { buf.emit_pop_reg(REG_RCX) };
             unsafe { buf.emit_shl_rcx_imm8(3) };
             unsafe { buf.emit_sub_rax_rcx() };
@@ -5335,7 +5546,14 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
             let operand = unsafe { core::ptr::read(e.left as *const ExprNode) };
             let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, operand.ident_off as u64, operand.ident_len as u64) };
             match slot {
-                Some((o, _is_char)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
+                // MILESTONE 110: `_is_array` is ignored here exactly like
+                // `_is_char` already was -- `&arr` (an array's own bare
+                // name) and `&arr[0]` compute the SAME real numeric
+                // address either way (this arm's own `emit_lea_rax_
+                // rbp_off()` call already matches real C's own `&arr`
+                // rule for that reason, needing no is_array branch of
+                // its own, unlike EXPR_IDENT's plain read above it).
+                Some((o, _is_char, _is_array)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
                 None => return Err(CodeGenError::UndeclaredVariable(operand.ident_off as u64)),
             }
         }
@@ -5694,7 +5912,7 @@ unsafe fn gen_stmt_list(
                 // narrowing only on read is correct, not a shortcut.
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 match slot {
-                    Some((o, _is_char)) => unsafe { buf.emit_mov_rbp_off_rax(o) },
+                    Some((o, _is_char, _is_array)) => unsafe { buf.emit_mov_rbp_off_rax(o) },
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 }
             }
@@ -5722,15 +5940,31 @@ unsafe fn gen_stmt_list(
             //                                 may itself use RAX/RCX freely)
             //   pop rcx                      (RCX = &arr[index])
             //   mov [rcx], rax               (arr[index] = value, the real store)
+            // MILESTONE 110: exactly like EXPR_INDEX's own read side, the
+            // base-address computation now branches on `is_array` so
+            // `p[idx] = expr;` works correctly through a POINTER
+            // variable too (base = the pointer's own VALUE,
+            // `emit_mov_rax_rbp_off()`), not only through a real
+            // declared array (base = the slot's own address,
+            // `emit_lea_rax_rbp_off()`, unchanged) -- see EXPR_INDEX's
+            // own doc comment above for the full derivation, including
+            // why reusing the same subtract-based index arithmetic for
+            // both cases is what makes a callee's `p[idx] = ...` write
+            // land on the exact same bytes a caller's own `arr[idx]`
+            // occupies.
             STMT_ASSIGN_INDEX => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
-                let base_off = match slot {
-                    Some((o, _is_char)) => o,
+                let (base_off, is_array) = match slot {
+                    Some((o, _is_char, is_array)) => (o, is_array),
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.then_body) }?;
                 unsafe { buf.emit_push_rax() };
-                unsafe { buf.emit_lea_rax_rbp_off(base_off) };
+                if is_array != 0 {
+                    unsafe { buf.emit_lea_rax_rbp_off(base_off) };
+                } else {
+                    unsafe { buf.emit_mov_rax_rbp_off(base_off) };
+                }
                 unsafe { buf.emit_pop_reg(REG_RCX) };
                 unsafe { buf.emit_shl_rcx_imm8(3) };
                 unsafe { buf.emit_sub_rax_rcx() };
@@ -5762,7 +5996,7 @@ unsafe fn gen_stmt_list(
             STMT_ASSIGN_DEREF => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 match slot {
-                    Some((o, _is_char)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
+                    Some((o, _is_char, _is_array)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 }
                 unsafe { buf.emit_push_rax() };
@@ -10059,7 +10293,127 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m109 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 110: real array-to-pointer decay, and pointers (and,
+        // through decay, arrays) crossing a real function-call boundary
+        // -- see this file's own top Milestone 110 doc comment for the
+        // full grammar delta and codegen derivation. All three cases run
+        // in-process (CodegenMode::Callable), the same verification tier
+        // Milestone 107/108/109 all already used for their own new
+        // cases -- no new real fork()/exec()/wait() cycle is added by
+        // this milestone.
+        //
+        // CASE 95: a declared array decays to a real address when passed
+        // as a call argument, and the callee subscripts THROUGH the
+        // resulting pointer parameter with ordinary `p[idx]` syntax --
+        // proves both halves at once (decay at the call site, and the
+        // new is_array-aware EXPR_INDEX codegen correctly reading a
+        // pointer's own VALUE as the base instead of the slot's own
+        // address).
+        //   int sum3(int *p) { return p[0] + p[1] + p[2]; }
+        //   int main() {
+        //       int arr[3];
+        //       arr[0] = 10; arr[1] = 20; arr[2] = 30;
+        //       return sum3(arr);
+        //   }
+        // Hand-computed: 10+20+30 = 60.
+        // -------------------------------------------------------------
+        const SRC95: &[u8] = b"int sum3(int *p) { return p[0] + p[1] + p[2]; } int main() { int arr[3]; arr[0] = 10; arr[1] = 20; arr[2] = 30; return sum3(arr); }";
+        let case95_result = compile_and_run_program_callable(SRC95.as_ptr() as u64, SRC95.len() as u64);
+        w(b"  case95 (sum3(arr) -- array decays to pointer argument, callee subscripts via p[idx], in-process) returned=");
+        if let Some(r) = case95_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 60)\n");
+        let case95_ok = case95_result == Some(60);
+        write_check(b"case95_array_decay_call_arg_returns_60=", case95_ok);
+
+        w(b"\n");
+
+        // CASE 96: the real, distinguishing proof that decay hands the
+        // callee a genuine address into the CALLER's own stack frame --
+        // real aliasing across a function-call boundary, not a copy. A
+        // shallow/buggy implementation (e.g. one that accidentally
+        // passed each array element by value, or decayed to a fresh
+        // scratch copy) could still pass CASE 95 above (a read-only
+        // sum) but would fail this one, since the caller's own `arr`
+        // would stay `5, 7` if the callee's writes did not really land
+        // at `arr`'s own real addresses. `zero_out(arr)`'s own result is
+        // captured into `r` rather than called as a bare statement -- a
+        // real, pre-existing, already-disclosed limitation this
+        // milestone's own first draft ran straight into (not a new
+        // finding): this subset-C has never had an "expression
+        // statement" production at all (see this file's own top doc
+        // comment, "no function may be called as a bare expression-
+        // statement ... an existing gap since Milestone 67, unwidened
+        // here"), so a call can only appear where an EXPRESSION is
+        // legal -- an assignment RHS here, exactly like every prior
+        // milestone's own call-expression self-test cases already do.
+        //   int zero_out(int *p) { p[0] = 0; p[1] = 0; return 0; }
+        //   int main() {
+        //       int arr[2]; int r;
+        //       arr[0] = 5; arr[1] = 7;
+        //       r = zero_out(arr);
+        //       return arr[0] * 100 + arr[1];
+        //   }
+        // Hand-computed: 0.
+        // -------------------------------------------------------------
+        const SRC96: &[u8] = b"int zero_out(int *p) { p[0] = 0; p[1] = 0; return 0; } int main() { int arr[2]; int r; arr[0] = 5; arr[1] = 7; r = zero_out(arr); return arr[0] * 100 + arr[1]; }";
+        let case96_result = compile_and_run_program_callable(SRC96.as_ptr() as u64, SRC96.len() as u64);
+        w(b"  case96 (zero_out(arr) writes through p[idx] -- real cross-call aliasing proof, in-process) returned=");
+        if let Some(r) = case96_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 0)\n");
+        let case96_ok = case96_result == Some(0);
+        write_check(b"case96_pointer_param_write_aliases_caller_array_returns_0=", case96_ok);
+
+        w(b"\n");
+
+        // CASE 97: a real pointer RETURN type (`int *identity(int *p)`),
+        // proving both new grammar positions at once -- a pointer
+        // parameter passed straight through and handed back as a
+        // pointer return value (RAX pass-through, zero narrowing, the
+        // exact same codegen an ordinary `int` return already used) --
+        // and that the CALLER can dereference a call expression's own
+        // result directly (`*identity(&x)`, OP_DEREF's own operand
+        // recursing straight into an EXPR_CALL, exactly as Milestone
+        // 109's own parse_unary() doc comment already described as
+        // legal).
+        //   int *identity(int *p) { return p; }
+        //   int main() {
+        //       int x;
+        //       x = 42;
+        //       return *identity(&x);
+        //   }
+        // Hand-computed: 42.
+        // -------------------------------------------------------------
+        const SRC97: &[u8] = b"int *identity(int *p) { return p; } int main() { int x; x = 42; return *identity(&x); }";
+        let case97_result = compile_and_run_program_callable(SRC97.as_ptr() as u64, SRC97.len() as u64);
+        w(b"  case97 (*identity(&x) -- pointer parameter AND pointer return type, in-process) returned=");
+        if let Some(r) = case97_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 42)\n");
+        let case97_ok = case97_result == Some(42);
+        write_check(b"case97_pointer_param_and_return_type_returns_42=", case97_ok);
+
+        w(b"\n");
+
+        let overall_m110 = case95_ok && case96_ok && case97_ok;
+        w(b"OVERALL_M110=");
+        w(if overall_m110 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 { 0 } else { 1 });
     }
 }
 

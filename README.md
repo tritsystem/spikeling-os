@@ -9510,6 +9510,124 @@ self-test suite, genuinely open for a future pass.
       `heap_guard::admit()` covering only its original two call sites,
       `evidence_gate.rs` still having exactly two real subscribers)
       remains unchanged, unrelated to this milestone.
+- [x] **Milestone 119**: real two-level `int` pointers (Milestone 118) now
+      cross a real function-call boundary -- an `int **` PARAMETER is
+      recognized by `parse_params()`/`collect_vars_for_function()` too,
+      closing the exact gap Milestone 118's own closing disclosure named
+      ("no `int **` PARAMETER or return value").
+
+      **The fix is a real, disciplined mirror of Milestone 113/116's own
+      identical fix for `is_char_ptr`/`is_int_ptr`**: a new
+      `ParamInfo::is_int_ptr_ptr` field, set by `parse_params()`'s own
+      extended lookahead -- a SECOND immediate `*` after the pre-existing
+      single-`*` check (mirrored directly from `parse_stmt()`'s own
+      identical declaration-site extension, Milestone 118), never checked
+      after `char *` (there is no `char **` in this subset, mirroring
+      `parse_double_pointer_decl()`'s own `int`-only restriction) --
+      threaded into the parameter's own `VarSlot.is_int_ptr_ptr` by
+      `collect_vars_for_function()`, previously hardcoded `0` per
+      Milestone 118's own explicit scope cut, now genuinely variable.
+      `EXPR_UNARY`'s own `OP_DEREF` arm and `STMT_ASSIGN_DEREF2` (both
+      Milestone 118) need -- and receive -- ZERO code change: neither one
+      has ever cared whether the `VarSlot` it resolves came from a
+      parameter or a local declaration, the same "accepting the grammar
+      plus threading the one flag IS the complete feature" shape
+      Milestone 110/113/116 all already established. Zero new x86_64
+      encodings.
+
+      **New self-test cases**, all three run in-process
+      (`CodegenMode::Callable`), the same tier Milestone 107 through 118
+      all already used for their own new cases -- no new real
+      `fork()`/`exec()`/`wait()` cycle is added by this milestone: CASE 120
+      (`int read_through(int **pp) { return **pp; }`, called with `&p`
+      where `p` is a real local `int *` -- the real, distinguishing proof
+      `**pp` correctly reaches the CALLER's own real value THROUGH BOTH
+      real levels of indirection from inside the callee, the same real
+      cross-function aliasing Milestone 96/104/114 each already
+      established for one level, now proven for two; expected `1`); CASE
+      121 (`int write_through(int **pp) { **pp = 88; return 0; }` -- the
+      write-side mirror, the new `STMT_ASSIGN_DEREF2`'s own first real
+      exercise through a function-call boundary, proving it reaches
+      THROUGH both levels and lands on the CALLER's own real stack slot,
+      not merely inside the callee's own copy of the address; expected
+      `88`); CASE 122 (`int combo(int *p, int **pp) { return *p + **pp; }`
+      -- a real, deliberate VERIFICATION case, not a new fix, declaring
+      BOTH a single-level `int *` parameter and a two-level `int **`
+      parameter in the SAME function signature and using both in one
+      expression, proving `parse_params()`'s own extended two-star
+      lookahead did not regress the pre-existing single-star `int *`
+      parameter path (Milestone 116) or leak state across iterations of
+      the comma-separated parameter loop; expected `30`).
+
+      **`cargo build` clean from the repo root (kernel + host runner, zero
+      warnings)**. `kernel/assets/cc.elf` rebuilt via the project's own
+      pinned-nightly `rustc` recipe (`tools/cc_src/README.md`, unchanged)
+      -- 106784 bytes, up from Milestone 118's 105352; the real `PT_LOAD`
+      `p_memsz` via `readelf -l` is 91704 bytes, still 23 pages (the same
+      page count as Milestone 118, just more bytes within it) --
+      comfortably under the 64-page per-segment cap and 128-page total
+      cap, no cap change needed. The rebuilt `cc.elf` was independently
+      re-derived from the current `main.rs` via a from-scratch invocation
+      of the exact same recipe and diffed byte-for-byte identical against
+      the committed binary (`cmp`, not eyeballed). **Zero new compiler
+      warnings** -- verified the same way Milestone 109 through 118
+      verified their own: reproducing the standalone `rustc` invocation
+      against the project's own pre-Milestone-118 committed baseline and
+      diffing the sorted warning list against this milestone's own build
+      -- byte-for-byte identical 16-warning set.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m119_fresh_boot.log`/`m119_reused_boot.log`), no
+      stray `qemu-system-x86_64.exe` process before or after either boot
+      (checked via `tasklist`). Every marker was verified via the same
+      real reconstruction script this session wrote for Milestone 118
+      (not committed, matching every prior session's own disclosed
+      practice) -- byte-precise WRITE-syscall payload concatenation using
+      each write's own declared length. Fresh boot: 304 total distinct
+      markers, every one `PASS`, zero `FAIL`. Reused boot: the identical
+      53-line `fs self-test` FAIL set every milestone since 70 has
+      recorded (the Milestone-62-era fixture-cleanup artifact),
+      byte-for-byte identical in NAME and VALUE to this session's own
+      committed `m118_reused_boot.log` when diffed directly through the
+      same script -- zero markers missing, zero newly failing anywhere
+      else. Diffing this milestone's own fresh/reused boots against this
+      session's own committed Milestone 118 fresh/reused logs through the
+      same script shows the ONLY difference on either boot is the addition
+      of `OVERALL_M119=PASS` plus the three new case markers (300 -> 304
+      fresh, exactly +4) -- a real, precise regression check, not
+      eyeballed. Milestone 104/106's own heap-pressure gate and Milestone
+      117's own scheduler-fairness gate both came out byte-identical to
+      their own recorded baselines on both boots (`samples_taken=68
+      gate_trip_episodes=0 naive_instantaneous_hits=0
+      admissions_denied_so_far=0`; `samples_taken=2400 trip_episodes=1`).
+      `run_preemption_demo()` completed on both boots with all three real
+      task counters > 0 (fresh: `task0=2446 task1=2518 task2=2876`;
+      reused: `task0=2507 task1=2489 task2=2778` -- real inter-boot timing
+      jitter, consistent with every prior milestone's own two-boot pairs),
+      zero `SKIPPED` lines on either boot. Zero real `panicked at`/`kernel
+      panicked`/`DOUBLE FAULT`/`TRIPLE FAULT` in either log -- the four
+      literal substring matches per log are, as in Milestone 118, all
+      pre-existing "no panic, no double fault" self-test confirmation
+      lines (Milestone 51/58/61/67), confirmed by inspecting each match
+      directly and excluding them, not merely counting raw hits.
+
+      **Still genuinely open**: no `char **` (only `int **`, PARAMETER
+      included -- `parse_params()`'s own new lookahead is deliberately
+      never checked after `char *`); no `int ***` or deeper, as a
+      parameter or otherwise; no `int **` RETURN value -- this compiler's
+      return type is still exactly `int`/`char`, unrelated to and
+      untouched by this milestone's own parameter-only fix; no pointer
+      arithmetic on an `int **` itself, as a parameter or a local (`p + 1`
+      where `p` is `int **` is still not recognized by
+      `ptr_operand_scale()`, the exact same real, disclosed gap Milestone
+      118 named, now also true of the parameter case this milestone adds);
+      no `int **p, *q;`-style mixed-declarator list; no `p++`/`p--`;
+      pointer-pointer subtraction still not implemented. Everything else
+      Milestone 118 disclosed as open (no `char **`, no `int ***`, no
+      `MAX_PARAMS`/`sizeof`/self-test-leak items, `evidence_gate.rs` still
+      having exactly two real subscribers) remains unchanged, unrelated to
+      this milestone.
 
 ## Building and running
 

@@ -1724,6 +1724,43 @@
 // `int *` address into the pointee) is not a new code path at all -- the
 // pre-existing `STMT_ASSIGN_DEREF` already handles it correctly with zero
 // changes, since that arm has never cared what type the pointee is.
+//
+// MILESTONE 119: real two-level `int` pointers now cross a real
+// function-call boundary -- an `int **` PARAMETER is recognized by
+// `parse_params()`/`collect_vars_for_function()` too, closing the exact
+// gap this milestone's own "Scope" paragraph above just named ("no `int
+// **` PARAMETER or return value"). The fix is a real, disciplined mirror
+// of Milestone 113/116's own identical fix for `is_char_ptr`/`is_int_ptr`:
+// a new `ParamInfo::is_int_ptr_ptr` field, set by `parse_params()`'s own
+// extended lookahead (a SECOND immediate `*` after the pre-existing
+// single-`*` check, mirrored from `parse_stmt()`'s own identical
+// declaration-site extension), threaded into the parameter's own
+// `VarSlot.is_int_ptr_ptr` by `collect_vars_for_function()` -- previously
+// hardcoded 0, per this milestone's own "Scope" paragraph above, now
+// genuinely variable. `EXPR_UNARY`'s own `OP_DEREF` arm and
+// `STMT_ASSIGN_DEREF2` (both Milestone 118) need -- and receive -- ZERO
+// code change: neither one has ever cared whether the `VarSlot` it
+// resolves came from a parameter or a local declaration, the same
+// "accepting the grammar plus threading the one flag IS the complete
+// feature" shape Milestone 110/113/116 all already established. Zero new
+// x86_64 encodings.
+//
+// New self-test cases CASE 120 (an `int **` parameter, `**pp` as an
+// RVALUE, real cross-function aliasing) and CASE 121 (the same shape,
+// `**pp = expr;` as an LVALUE) hand-verify the real fix; CASE 122 (a
+// single-level `int *` parameter AND a two-level `int **` parameter in
+// the SAME function signature) is a real, deliberate VERIFICATION-only
+// case, not a new fix -- proving `parse_params()`'s own extended
+// lookahead did not regress the pre-existing single-star path or leak
+// state across the comma-separated parameter loop.
+//
+// Still genuinely open after this milestone: everything Milestone 118's
+// own "Scope" paragraph above named MINUS the one item this milestone
+// closes (the `int **`-parameter/no-return-value gap, and even then only
+// the PARAMETER half -- an `int **` RETURN value is still not
+// implemented, this compiler's return type still being exactly `int`/
+// `char`) -- see this file's own top-level Milestone 119 disclosure in
+// `README.md` for the complete, current list.
 #![no_std]
 #![no_main]
 
@@ -2626,6 +2663,26 @@ struct ParamInfo {
     // Milestone 110/113 both already established for the analogous `int
     // *`/`char *` cases.
     is_int_ptr: u8,
+    // MILESTONE 119: 1 if this parameter was declared `int **`, 0
+    // otherwise -- the real "declared-parameter-type bit" Milestone 118's
+    // own closing disclosure named as the missing piece for extending
+    // real two-level `int` pointers across a function-call boundary
+    // (`is_int_ptr_ptr` existed on `VarSlot` since that milestone, but
+    // `ParamInfo` had no equivalent, the exact same real, disclosed scope
+    // cut `is_char_ptr` (112) and `is_int_ptr` (115) each carried for
+    // exactly one milestone before the very next one closed it here).
+    // `collect_vars_for_function()` copies this straight into the
+    // parameter's own `VarSlot.is_int_ptr_ptr`, so `EXPR_UNARY`'s
+    // `OP_DEREF` arm and the new `STMT_ASSIGN_DEREF2` codegen -- both of
+    // which already resolve a pointer operand through the ordinary
+    // `stack_off` field, with zero awareness of whether a given slot came
+    // from a parameter or a local declaration -- correctly reach an
+    // `int **` PARAMETER's own real value with NO codegen change at
+    // either call site at all, the same "accepting the grammar plus
+    // threading the one flag IS the complete feature" shape Milestone
+    // 110/113/116 all already established for the analogous single-level
+    // cases.
+    is_int_ptr_ptr: u8,
 }
 
 /// MILESTONE 72: the maximum number of parameters a single function may
@@ -4473,6 +4530,21 @@ impl Parser {
             // missing. Mirrors the `char *` branch's own `is_char_ptr`
             // exactly, just for the opposite leading keyword.
             let mut is_int_ptr = false;
+            // MILESTONE 119: a SECOND immediate `*` right after `int *`
+            // (never after `char *` -- there is no `char **` in this
+            // subset, mirroring `parse_double_pointer_decl()`'s own
+            // `int`-only restriction at declaration sites) marks an
+            // `int **p` TWO-LEVEL pointer parameter, the exact "declared-
+            // parameter-type bit through `ParamInfo`" Milestone 118's own
+            // closing disclosure named as the missing piece for crossing
+            // this milestone's own new feature over a function-call
+            // boundary. Mirrors the `char *`/`int *` branches' own shape
+            // exactly: `is_int_ptr` is reset to `false` the moment a
+            // second `*` is seen (an `int **` parameter's own resulting
+            // `VarSlot` must have `is_int_ptr == 0`, `is_int_ptr_ptr == 1`
+            // -- genuinely different from a single-level `int *`
+            // parameter, not a combination of both).
+            let mut is_int_ptr_ptr = false;
             if unsafe { self.peek() }.kind == TOK_STAR {
                 unsafe { self.advance() };
                 if is_char {
@@ -4480,13 +4552,18 @@ impl Parser {
                     is_char_ptr = true;
                 } else {
                     is_int_ptr = true;
+                    if unsafe { self.peek() }.kind == TOK_STAR {
+                        unsafe { self.advance() };
+                        is_int_ptr = false;
+                        is_int_ptr_ptr = true;
+                    }
                 }
             }
             let name = unsafe { self.expect(TOK_IDENT) }?;
             if count as u64 >= MAX_PARAMS {
                 return Err(ParseError::TooManyParams);
             }
-            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 }, is_char_ptr: if is_char_ptr { 1 } else { 0 }, is_int_ptr: if is_int_ptr { 1 } else { 0 } }) };
+            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 }, is_char_ptr: if is_char_ptr { 1 } else { 0 }, is_int_ptr: if is_int_ptr { 1 } else { 0 }, is_int_ptr_ptr: if is_int_ptr_ptr { 1 } else { 0 } }) };
             count += 1;
             if unsafe { self.peek() }.kind == TOK_COMMA {
                 unsafe { self.advance() };
@@ -5049,6 +5126,12 @@ struct VarSlot {
     // **` PARAMETER is real, disclosed future work, the same one-
     // milestone-then-close-it shape `is_char_ptr` (112->113) and
     // `is_int_ptr` (115->116) each already went through.
+    // MILESTONE 119: also 1 for an `int **p` PARAMETER's own named slot --
+    // `collect_vars_for_function()` below now threads `ParamInfo::is_int_
+    // ptr_ptr` straight through, the exact same real, disclosed
+    // scope-closing step Milestone 113/116 already took for
+    // `is_char_ptr`/`is_int_ptr`. See that function's own updated doc
+    // comment.
     is_int_ptr_ptr: u8,
 }
 
@@ -5325,16 +5408,31 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // same "accepting the grammar plus threading the one flag IS the
         // complete feature" shape Milestone 110/113 both already
         // established.
-        // MILESTONE 118: `is_int_ptr_ptr` is unconditionally 0 for every
-        // parameter -- `ParamInfo` has no equivalent bit, and this
-        // milestone deliberately does not extend `int **` across a
-        // function-call boundary (see this file's own top Milestone 118
-        // doc comment's "Scope" paragraph). The same real, disclosed
-        // scope cut `is_char_ptr` (112) and `is_int_ptr` (115) each
-        // carried for exactly one milestone before the next one closed
-        // it -- a real, disclosed candidate for Milestone 119, not
-        // attempted here.
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: p.is_int_ptr, is_int_ptr_ptr: 0 }) };
+        // MILESTONE 118 (superseded by 119 below): `is_int_ptr_ptr` was
+        // unconditionally 0 for every parameter -- `ParamInfo` had no
+        // equivalent bit, and that milestone deliberately did not extend
+        // `int **` across a function-call boundary, the same real,
+        // disclosed scope cut `is_char_ptr` (112) and `is_int_ptr` (115)
+        // each carried for exactly one milestone before the next one
+        // closed it.
+        // MILESTONE 119: `is_int_ptr_ptr` now carries straight through
+        // from `p.is_int_ptr_ptr` (the real declared-parameter-type bit
+        // `parse_params()` now records -- see `ParamInfo::is_int_ptr_ptr`'s
+        // own doc comment), the exact "thread a real declared-parameter-
+        // type bit through `ParamInfo`" step Milestone 118's own closing
+        // disclosure named as the missing piece, mirroring Milestone
+        // 113/116's own identical fix for `is_char_ptr`/`is_int_ptr`. An
+        // `int **p` parameter's own `VarSlot` now correctly ends up with
+        // `is_int_ptr: 0, is_int_ptr_ptr: 1`, so `EXPR_UNARY`'s own
+        // `OP_DEREF` arm and `STMT_ASSIGN_DEREF2` -- both of which already
+        // resolve a pointer operand through the ordinary `stack_off`
+        // field, with zero awareness of whether a given slot came from a
+        // parameter or a local declaration -- read/write through a
+        // parameter's own `int **` correctly with NO codegen change at
+        // either call site at all, the same "accepting the grammar plus
+        // threading the one flag IS the complete feature" shape Milestone
+        // 110/113/116 all already established.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: p.is_int_ptr, is_int_ptr_ptr: p.is_int_ptr_ptr }) };
         n += 1;
         pi += 1;
     }
@@ -12678,7 +12776,144 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m118 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 119: real two-level `int` pointers (Milestone 118) now
+        // cross a real function-call boundary -- an `int **` PARAMETER is
+        // recognized by `parse_params()`/`collect_vars_for_function()`
+        // too, closing the exact gap Milestone 118's own closing
+        // disclosure named ("no `int **` PARAMETER or return value"). The
+        // fix is a real, disciplined mirror of Milestone 113/116's own
+        // identical fix for `is_char_ptr`/`is_int_ptr`: a new
+        // `ParamInfo::is_int_ptr_ptr` field, set by `parse_params()`'s own
+        // extended `int *`/`int **` lookahead (one more token of
+        // lookahead past the pre-existing single-`*` check), threaded into
+        // the parameter's own `VarSlot.is_int_ptr_ptr` by
+        // `collect_vars_for_function()` -- previously hardcoded 0, per
+        // Milestone 118's own explicit scope cut, now genuinely variable.
+        // `EXPR_UNARY`'s own `OP_DEREF` arm and `STMT_ASSIGN_DEREF2` need
+        // -- and receive -- ZERO code change: both already resolve a
+        // pointer operand through the ordinary `stack_off` field with no
+        // awareness of whether a given `VarSlot` came from a parameter or
+        // a local declaration, the same "accepting the grammar plus
+        // threading the one flag IS the complete feature" shape Milestone
+        // 110/113/116 all already established. Zero new x86_64 encodings.
+        // All three cases run in-process (`CodegenMode::Callable`), the
+        // same tier Milestone 107 through 118 all already used for their
+        // own new cases -- no new real `fork()`/`exec()`/`wait()` cycle is
+        // added by this milestone.
+        //
+        // CASE 120: the real, distinguishing proof that `**pp` (double
+        // dereference, RVALUE) correctly reaches the CALLER's own real
+        // stack slot when `pp` is an `int **` PARAMETER, not only a local
+        // variable (CASE 117's own scope) -- `read_through()`'s own `pp`
+        // holds the exact SAME real runtime address `main()`'s own `&p`
+        // computed, an ordinary pass-by-value copy of an address,
+        // unchanged since Milestone 72 -- so `**pp` inside the CALLEE must
+        // reach `x`'s own real value THROUGH `p`'s own real value in the
+        // CALLER's frame, the same real cross-function aliasing Milestone
+        // 96/104/114 each already established for one level of
+        // indirection, now proven for two.
+        //   int read_through(int **pp) { return **pp; }
+        //   int main() {
+        //       int x; int *p;
+        //       x = 55;
+        //       p = &x;
+        //       return read_through(&p) == 55;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC120: &[u8] = b"int read_through(int **pp) { return **pp; } int main() { int x; int *p; x = 55; p = &x; return read_through(&p) == 55; }";
+        let case120_result = compile_and_run_program_callable(SRC120.as_ptr() as u64, SRC120.len() as u64);
+        w(b"  case120 (int** double-dereference READ **pp through a PARAMETER, real cross-function aliasing, in-process) returned=");
+        if let Some(r) = case120_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case120_ok = case120_result == Some(1);
+        write_check(b"case120_int_ptr_ptr_double_deref_read_through_param_returns_1=", case120_ok);
+
+        w(b"\n");
+
+        // CASE 121: the write-side mirror of CASE 120 -- `**pp = 88;`
+        // (the new `STMT_ASSIGN_DEREF2`, Milestone 118) through an `int **`
+        // PARAMETER must reach THROUGH both real levels of indirection and
+        // land on `x`'s own real stack slot in the CALLER's frame, not
+        // merely inside the callee's own copy of the address. `dummy`
+        // exists only because this subset's statement grammar has no bare
+        // call-as-a-statement form (every `TOK_IDENT` statement needs an
+        // `=`/`[`/`:` to disambiguate, the same restriction Milestone 92's
+        // own label-vs-assignment lookahead already established) -- an
+        // ordinary, disclosed grammar shape, not new to this milestone.
+        //   int write_through(int **pp) { **pp = 88; return 0; }
+        //   int main() {
+        //       int x; int *p; int dummy;
+        //       x = 5;
+        //       p = &x;
+        //       dummy = write_through(&p);
+        //       return x;
+        //   }
+        // Hand-computed: 88.
+        // -------------------------------------------------------------
+        const SRC121: &[u8] = b"int write_through(int **pp) { **pp = 88; return 0; } int main() { int x; int *p; int dummy; x = 5; p = &x; dummy = write_through(&p); return x; }";
+        let case121_result = compile_and_run_program_callable(SRC121.as_ptr() as u64, SRC121.len() as u64);
+        w(b"  case121 (int** double-dereference WRITE **pp = expr; through a PARAMETER reaches the real caller slot, in-process) returned=");
+        if let Some(r) = case121_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 88)\n");
+        let case121_ok = case121_result == Some(88);
+        write_check(b"case121_int_ptr_ptr_double_deref_write_through_param_returns_88=", case121_ok);
+
+        w(b"\n");
+
+        // CASE 122: a real, deliberate VERIFICATION case, not a new fix --
+        // proves `parse_params()`'s own extended two-star lookahead did
+        // NOT regress the pre-existing single-star `int *` parameter path
+        // (Milestone 116), by declaring BOTH a single-level `int *`
+        // parameter and a two-level `int **` parameter in the SAME
+        // function signature and using both in one expression. A
+        // plausible bug shape this case would catch: `is_int_ptr`/
+        // `is_int_ptr_ptr` state leaking across iterations of
+        // `parse_params()`'s own comma-separated loop (it does not --
+        // both flags are freshly declared inside the loop body each
+        // iteration -- but this case proves it empirically rather than by
+        // inspection alone), or the two-star lookahead accidentally
+        // consuming a token that belonged to the NEXT parameter.
+        //   int combo(int *p, int **pp) { return *p + **pp; }
+        //   int main() {
+        //       int a; int b; int *bp;
+        //       a = 10; b = 20;
+        //       bp = &b;
+        //       return combo(&a, &bp);
+        //   }
+        // Hand-computed: 30.
+        // -------------------------------------------------------------
+        const SRC122: &[u8] = b"int combo(int *p, int **pp) { return *p + **pp; } int main() { int a; int b; int *bp; a = 10; b = 20; bp = &b; return combo(&a, &bp); }";
+        let case122_result = compile_and_run_program_callable(SRC122.as_ptr() as u64, SRC122.len() as u64);
+        w(b"  case122 (a single-level int* param AND a two-level int** param coexist correctly in one signature, verification only, in-process) returned=");
+        if let Some(r) = case122_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 30)\n");
+        let case122_ok = case122_result == Some(30);
+        write_check(b"case122_int_ptr_and_int_ptr_ptr_params_coexist_returns_30=", case122_ok);
+
+        w(b"\n");
+
+        let overall_m119 = case120_ok && case121_ok && case122_ok;
+        w(b"OVERALL_M119=");
+        w(if overall_m119 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 { 0 } else { 1 });
     }
 }
 

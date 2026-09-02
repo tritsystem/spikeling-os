@@ -408,7 +408,13 @@ pub fn timer_tick_switch() {
         return; // neither the bounded demo nor Milestone 25 background mode is active
     }
 
-    let next = SCHED.lock().as_mut().and_then(|s| s.step());
+    // MILESTONE 117: real production scheduling now goes through
+    // step_fairness_gated() -- the evidence-gated fairness intervention
+    // (scheduler.rs's own module doc has the full mechanism and the
+    // real, measured before/after numbers) -- not the plain step() this
+    // call used since Milestone 5c. step() itself is unchanged and still
+    // exercised directly by main.rs's own deterministic boot-time trial.
+    let next = SCHED.lock().as_mut().and_then(|s| s.step_fairness_gated());
     if let Some(next_idx) = next {
         if current != next_idx {
             let old_rsp_ptr = current_rsp_ptr(current);

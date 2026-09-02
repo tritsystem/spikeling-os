@@ -32,23 +32,30 @@
 //! judgment calls about what counts as pressure stay with whoever is
 //! actually watching that resource.
 //!
-//! **Real subscriber roster, honestly disclosed.** As of this milestone,
-//! ONE real kernel decision subscribes: `heap_guard.rs`'s kernel-heap-
+//! **Real subscriber roster, honestly disclosed.** As of Milestone 106,
+//! ONE real kernel decision subscribed: `heap_guard.rs`'s kernel-heap-
 //! pressure admission gate, migrated onto this module with byte-for-byte
 //! identical tuning (`GATE_ON_THRESHOLD`/`GATE_OFF_THRESHOLD`/
 //! `FAST_TAU_SAMPLES`/`HIGH_WATER_FRACTION` all unchanged, still owned by
-//! `heap_guard.rs`) and, per this milestone's own verification below,
-//! byte-identical measured counters. A second real subscriber (a flaky-
-//! driver recovery policy, per-Tier-13's own suggestion, or SNN-driven
-//! page eviction) is deliberately NOT invented here just to prove the
-//! API works with two callers -- this kernel has no currently-observed
-//! real flakiness or real memory pressure outside the kernel heap to
-//! honestly gate on (physical frame counts are generously large relative
-//! to this OS's tiny process footprints; inventing scarcity to exercise
-//! a second gate would be exactly the kind of fabricated-problem
-//! dishonesty this project's whole verification discipline exists to
-//! avoid). Left open, named plainly, for the next real subsystem that
-//! actually needs it.
+//! `heap_guard.rs`) and, per that milestone's own verification, byte-
+//! identical measured counters. A second real subscriber was
+//! deliberately NOT invented at the time just to prove the API works
+//! with two callers -- Milestone 106 found no currently-observed real
+//! flakiness or real memory pressure outside the kernel heap to honestly
+//! gate on, and said so plainly rather than fabricate scarcity to
+//! exercise a second gate.
+//!
+//! **MILESTONE 117 update**: a second real subscriber now exists --
+//! `scheduler.rs`'s task-selection fairness gate (`GateKind::
+//! SchedulerFairness`). It was found, not invented: `scheduler.rs`'s own
+//! SSH-bond-coupled task-slot bank has a REAL, pre-existing structural
+//! asymmetry (boundary slots have only one neighbor; a killed slot
+//! reshapes its surviving neighbors' coupling) that measurably grows
+//! fire-count unfairness over time even with no artificial pressure
+//! injected -- see `scheduler.rs`'s own module doc for the real, honestly
+//! measured numbers (with and without a defect). This is exactly the
+//! kind of real, already-observable condition Milestone 106 declined to
+//! fabricate a stand-in for.
 //!
 //! **A real, closed enum, not a runtime registry.** `GateKind` lists
 //! every subscriber at compile time rather than supporting dynamic
@@ -68,15 +75,22 @@ use spin::Mutex;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum GateKind {
     /// `heap_guard.rs`'s kernel-heap-pressure admission gate, migrated
-    /// here this milestone. The only real subscriber so far.
+    /// here at Milestone 106. The only real subscriber through
+    /// Milestone 116.
     KernelHeapPressure,
+    /// MILESTONE 117: `scheduler.rs`'s task-selection fairness gate --
+    /// the second real subscriber. See this module's own doc and
+    /// `scheduler.rs`'s for the real, measured structural-unfairness
+    /// signal it gates on.
+    SchedulerFairness,
 }
 
-const GATE_COUNT: usize = 1;
+const GATE_COUNT: usize = 2;
 
 fn index(kind: GateKind) -> usize {
     match kind {
         GateKind::KernelHeapPressure => 0,
+        GateKind::SchedulerFairness => 1,
     }
 }
 
@@ -124,7 +138,7 @@ impl GateState {
     }
 }
 
-static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new()]);
+static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new(), GateState::new()]);
 
 /// Feed one real sample into `kind`'s gate: updates the fast EMA every
 /// call (`network::update_evidence()`, the exact same formula Milestone

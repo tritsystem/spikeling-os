@@ -679,6 +679,93 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     )
     .unwrap();
 
+    // MILESTONE 117: evidence_gate.rs's SECOND real subscriber --
+    // scheduler.rs's own evidence-gated fairness intervention
+    // (step_fairness_gated(), now what tasks.rs's REAL timer-driven
+    // scheduling calls instead of plain step() -- see scheduler.rs's own
+    // module doc for the full mechanism and the real numbers this
+    // milestone's own host-side simulation found before any kernel code
+    // was written). Reuses the EXACT same scenario milestone 4's own
+    // run_trial() just ran above -- same N_SLOTS/DEFECT_SLOT/
+    // WARMUP_TICKS/POST_DEFECT_TICKS, same g=0.6 -- so (min_t, max_t)
+    // above already IS this milestone's real, honest "conventional,
+    // ungated" baseline; no second baseline run needed.
+    fn run_trial_gated(g: f32) -> (u32, u32, usize, u64, u64) {
+        let mut sched = scheduler::TopologicalScheduler::new(N_SLOTS, g);
+        for _ in 0..WARMUP_TICKS {
+            sched.step_fairness_gated();
+        }
+        sched.kill(DEFECT_SLOT);
+        for _ in 0..POST_DEFECT_TICKS {
+            sched.step_fairness_gated();
+        }
+        let counts: Vec<u32> = sched.slots.iter().filter(|s| s.alive).map(|s| s.fire_count).collect();
+        let min = *counts.iter().min().unwrap();
+        let max = *counts.iter().max().unwrap();
+        let (samples_taken, trip_episodes) = evidence_gate::stats(evidence_gate::GateKind::SchedulerFairness);
+        (min, max, counts.len(), samples_taken, trip_episodes)
+    }
+
+    let (min_g, max_g, n_alive_g, samples_g, trip_episodes_g) = run_trial_gated(0.6);
+    let fairness_t = min_t as f32 / max_t as f32;
+    let fairness_g = min_g as f32 / max_g as f32;
+
+    writeln!(
+        port,
+        "milestone 117: same post-defect scenario as milestone 4's own topological (g=+0.6) trial above -- evidence-gated fairness intervention: fire counts min={min_g} max={max_g} fairness={fairness_g:.4} ({n_alive_g} slots alive)"
+    )
+    .unwrap();
+    writeln!(
+        port,
+        "milestone 117: evidence gate real state -- samples_taken={samples_g} trip_episodes={trip_episodes_g} (expected samples_taken={})",
+        WARMUP_TICKS as u64 + POST_DEFECT_TICKS as u64
+    )
+    .unwrap();
+    let gate_fairer = fairness_g > fairness_t;
+    let gate_equal = (fairness_g - fairness_t).abs() < 1e-6;
+    writeln!(
+        port,
+        "milestone 117: result -- ungated fairness={fairness_t:.4} (milestone 4's own min={min_t}/max={max_t} above), gated fairness={fairness_g:.4} -- {}",
+        if gate_equal {
+            "no measurable fairness difference here -- a real neutral result, not an assumed win"
+        } else if gate_fairer {
+            "the evidence-gated fairness intervention measurably improved post-defect fire-count fairness over the conventional (ungated) baseline"
+        } else {
+            "the evidence-gated fairness intervention did NOT measurably improve fairness here -- reporting honestly, not the assumed outcome, same discipline as milestone 4/48's own findings"
+        }
+    )
+    .unwrap();
+
+    // MILESTONE 117: real, deterministic correctness self-test -- NOT
+    // gated on which way the fairness comparison above came out (that's
+    // an honest empirical finding, reported either way, exactly like
+    // milestone 4/48's own trials; correctness is a separate question).
+    // Three real, independently meaningful checks:
+    //   1. every one of this trial's WARMUP_TICKS+POST_DEFECT_TICKS real
+    //      ticks genuinely fed evidence_gate's shared SchedulerFairness
+    //      counters (samples_taken matches exactly) -- proves
+    //      step_fairness_gated() samples every tick, not just some.
+    //   2. the gate actually transitioned to CONSERVATIVE at least once
+    //      (trip_episodes >= 1) -- proves the mechanism is real and
+    //      reachable under this real scenario, not dead code that never
+    //      engages.
+    //   3. the same DEFECT_SLOT kill left the same number of slots alive
+    //      as milestone 4's own ungated trial (n_alive_g == n_alive) --
+    //      proves step_fairness_gated()'s real accumulate/select/
+    //      fire_count bookkeeping stayed correct under the gate, not
+    //      just under step().
+    let expected_samples = WARMUP_TICKS as u64 + POST_DEFECT_TICKS as u64;
+    let samples_correct = samples_g == expected_samples;
+    let gate_engaged = trip_episodes_g >= 1;
+    let alive_correct = n_alive_g == n_alive;
+    let m117_ok = samples_correct && gate_engaged && alive_correct;
+    writeln!(
+        port,
+        "milestone 117: self-test -- samples_correct={samples_correct} gate_engaged={gate_engaged} alive_correct={alive_correct}"
+    )
+    .unwrap();
+    writeln!(port, "milestone 117: self-test -- OVERALL_M117={}", if m117_ok { "PASS" } else { "FAIL" }).unwrap();
+
     // MILESTONE 5, STAGE A: GDT+TSS (needed first: the double-fault
     // handler's separate IST stack) and a real IDT with CPU exception
     // handlers. Verified with an actual int3 breakpoint, not just "it

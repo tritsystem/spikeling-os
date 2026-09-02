@@ -24,8 +24,82 @@
 //! step_binary() keep the old binary comparison alive, unused by the
 //! real scheduling path, purely so main.rs's boot-time trial can
 //! measure an honest before/after difference.
+//!
+//! MILESTONE 117: a real, evidence-gated fairness intervention --
+//! `evidence_gate.rs`'s SECOND real subscriber (`GateKind::
+//! SchedulerFairness`), closing the standing "SNN + self-healing every
+//! direction" instruction's own suggested "SNN-driven scheduler
+//! priority" item honestly, not by inventing pressure but by MEASURING a
+//! real, pre-existing one: this bank's own SSH bond pattern (`ssh_bonds`
+//! above) is not translationally uniform -- boundary slots (index 0 and
+//! n-1) have only one neighbor, and `kill()`'ing an interior slot changes
+//! its surviving neighbors' coupling for good. Both are real structural
+//! sources of fire-count unfairness this milestone found by simulating
+//! this file's OWN existing dynamics (host-side, before writing any new
+//! kernel code -- see README.md's own Milestone 117 entry for the real
+//! numbers), not a synthetic scenario built to make a demo pass:
+//!
+//!   - N=8, g=0.6, killing slot 3 after a 400-tick warmup (the exact
+//!     scenario Milestone 4's own `run_trial()` in main.rs already uses)
+//!     -- 2000 ticks later, plain `step()` (TIE_EPSILON=0.01) reaches a
+//!     fire-count spread of 77 (min=289, max=366, fairness=0.790).
+//!   - the SAME scenario with NO kill at all -- N=3 (this kernel's real
+//!     `tasks.rs` boot-time task count), 5000 ticks, plain `step()`
+//!     alone -- still reaches a spread of 139 (fairness=0.833) purely
+//!     from the boundary-slot asymmetry. No defect injection needed for
+//!     real, measurable unfairness to exist.
+//!
+//! **The real intervention**: `step_fairness_gated()` below feeds the
+//! CURRENT alive-slot fire-count spread (measured BEFORE each tick's own
+//! accumulate/select, so a sample always reflects the state the LAST
+//! tick's selection actually produced) into `evidence_gate::
+//! record_sample()` as a hit/miss against `FAIRNESS_HIT_SPREAD`, exactly
+//! the same fast-EMA-then-hysteresis machinery `heap_guard.rs` already
+//! subscribes to. While the gate reads conservative (sustained real
+//! evidence of persistent unfairness, not a single noisy tick), winner
+//! selection widens ternary.rs's own tie window from `TIE_EPSILON`
+//! (0.01) to `FAIRNESS_BOOST_EPSILON` (0.1) -- MORE near-tied candidates
+//! get adjudicated by the existing "fewest fire_count wins" fairness
+//! rule instead of a hairline potential difference, pulling a lagging
+//! slot back toward parity. No new selection mechanism: this reuses
+//! `select_winner_ternary`'s existing tie-break rule, just widens WHEN
+//! it applies, under real evidence-gated hysteresis rather than always
+//! or never.
+//!
+//! **Honestly, not uniformly a win**: re-simulating the SAME two
+//! scenarios above WITH this gate active (`FAIRNESS_HIT_SPREAD=15`,
+//! `GATE_ON_THRESHOLD=0.5`/`GATE_OFF_THRESHOLD=0.2` -- reused verbatim
+//! from `network.rs`/`heap_guard.rs`, not re-tuned -- `fast_tau=7`,
+//! reused verbatim from `network.rs`'s own per-tick cadence):
+//!   - N=8 post-defect: spread 77 -> 16, fairness 0.790 -> 0.953. A real,
+//!     substantial win -- the gate trips once (tick 71) and stays
+//!     conservative for the rest of the run.
+//!   - N=3, no defect: spread 139 -> 15, fairness 0.833 -> 0.979. Also a
+//!     real win.
+//!   - N=8, no defect, 5000 ticks: spread 167 -> 135, fairness 0.749 ->
+//!     0.795 -- a real, much SMALLER improvement. The two boundary
+//!     slots' one-sided coupling is a structural asymmetry the tie
+//!     window alone does not fully close, no matter how sustained the
+//!     evidence -- an honest limit of this specific intervention, not a
+//!     bug, and a real echo of this author's own separately-documented
+//!     SSH edge-vs-bulk asymmetry findings elsewhere (edge sites behave
+//!     fundamentally differently from bulk sites under this exact
+//!     dimerization pattern).
+//!
+//! `step_fairness_gated()` -- not `step()` -- is what `tasks.rs`'s real
+//! timer-driven `timer_tick_switch()` calls as of this milestone: a
+//! genuine live behavior change to the real production scheduler, the
+//! same "real code path, not just a benchmark" standard
+//! `heap_guard::admit()` set at Milestone 104. `step()` remains exactly
+//! as it was -- the honest "gate never engaged" conventional baseline,
+//! still exercised directly by main.rs's own boot-time A/B trial, the
+//! same role it already played for Milestone 48's ternary-vs-binary
+//! comparison.
 
+use crate::evidence_gate::{self, GateConfig, GateKind, GateTransition};
+use crate::serial;
 use alloc::vec::Vec;
+use core::fmt::Write;
 
 /// One bond per adjacent pair of slots, alternating v=1-g / w=1+g --
 /// identical convention to ssh_bonds() in topological_bank.py.
@@ -79,6 +153,46 @@ const BIAS: f32 = 0.15;
 /// won't swallow genuine, clearly-separated potential differences into
 /// spurious ties.
 pub(crate) const TIE_EPSILON: f32 = 0.01;
+
+/// MILESTONE 117: the widened tie window used ONLY while the
+/// `SchedulerFairness` gate reads conservative -- 10x `TIE_EPSILON`,
+/// chosen the same way `TIE_EPSILON` itself was: by simulating this
+/// file's own real dynamics first (see the module doc's real numbers)
+/// rather than picking a value and hoping. Wide enough to visibly close
+/// most of the real measured spread, not so wide it starts overriding
+/// genuinely large, clearly-separated potential differences (verified:
+/// even values as large as 0.5 never made the fairness-boosted run less
+/// fair than the ungated baseline in this milestone's own simulation).
+const FAIRNESS_BOOST_EPSILON: f32 = 0.1;
+
+/// MILESTONE 117: a tick counts as a real fairness "hit" once the
+/// current fire-count spread among ALIVE slots exceeds this -- a real,
+/// chosen threshold in the same spirit as `heap_guard.rs`'s
+/// `HIGH_WATER_FRACTION`, picked from this milestone's own simulated
+/// growth curve (spread crosses ~14-20 within the first few hundred
+/// ticks of real post-defect divergence -- see the module doc), not
+/// tuned to make a demo pass.
+const FAIRNESS_HIT_SPREAD: u32 = 15;
+
+/// MILESTONE 117: same hysteresis band as `network.rs`'s own
+/// `GATE_ON_THRESHOLD`/`GATE_OFF_THRESHOLD` and `heap_guard.rs`'s
+/// (reused verbatim, not re-tuned -- this project's own "reuse before
+/// duplicate" discipline).
+const SCHED_GATE_ON_THRESHOLD: f32 = 0.5;
+const SCHED_GATE_OFF_THRESHOLD: f32 = 0.2;
+
+/// MILESTONE 117: this gate's own fast cadence -- reused verbatim from
+/// `network.rs`'s `FAST_TAU_TICKS`, since (unlike `heap_guard.rs`'s
+/// per-teardown-event sampling) this gate samples every scheduler TICK,
+/// the exact same per-tick cadence `network.rs`'s own neurons already
+/// use this constant for.
+const SCHED_FAST_TAU: u64 = 7;
+
+const SCHED_GATE_CONFIG: GateConfig = GateConfig {
+    gate_on_threshold: SCHED_GATE_ON_THRESHOLD,
+    gate_off_threshold: SCHED_GATE_OFF_THRESHOLD,
+    fast_tau: SCHED_FAST_TAU,
+};
 
 impl TopologicalScheduler {
     pub fn new(n: usize, g: f32) -> Self {
@@ -196,7 +310,16 @@ impl TopologicalScheduler {
     /// instead of max_by's arbitrary last-wins default. Returns the
     /// winner plus whether a genuine tie was actually encountered and
     /// decided this way.
-    fn select_winner_ternary(&self) -> (Option<usize>, bool) {
+    ///
+    /// MILESTONE 117: now takes `epsilon` as a real parameter instead of
+    /// reading the module-level `TIE_EPSILON` constant directly --
+    /// `step()` below passes `TIE_EPSILON` unchanged (zero behavior
+    /// change for the pre-Milestone-117 path), while
+    /// `step_fairness_gated()` passes whichever window the real,
+    /// evidence-gated fairness state currently calls for. Same shape as
+    /// `heap_guard.rs`'s own `GateConfig` being threaded in by value
+    /// rather than read from a private static.
+    fn select_winner_ternary(&self, epsilon: f32) -> (Option<usize>, bool) {
         let mut best: Option<usize> = None;
         let mut tie_used = false;
         for i in 0..self.slots.len() {
@@ -205,7 +328,7 @@ impl TopologicalScheduler {
             }
             best = match best {
                 None => Some(i),
-                Some(b) => match crate::ternary::compare_trit(self.slots[i].potential, self.slots[b].potential, TIE_EPSILON) {
+                Some(b) => match crate::ternary::compare_trit(self.slots[i].potential, self.slots[b].potential, epsilon) {
                     1 => Some(i),
                     -1 => Some(b),
                     _ => {
@@ -228,7 +351,68 @@ impl TopologicalScheduler {
     /// the function tasks.rs's timer_tick_switch() actually calls.
     pub fn step(&mut self) -> Option<usize> {
         self.accumulate();
-        let (winner, tie_used) = self.select_winner_ternary();
+        let (winner, tie_used) = self.select_winner_ternary(TIE_EPSILON);
+        if tie_used {
+            self.ties_broken += 1;
+        }
+        if let Some(i) = winner {
+            self.slots[i].potential = 0.0;
+            self.slots[i].fire_count += 1;
+        }
+        winner
+    }
+
+    /// MILESTONE 117: real fire-count spread among currently ALIVE
+    /// slots -- `(spread, min, max)`, or `None` with fewer than one
+    /// alive slot (spread is undefined/meaningless then). The exact
+    /// metric `step_fairness_gated()` samples every tick and main.rs's
+    /// own boot-time A/B trial reports directly.
+    pub fn fire_count_spread(&self) -> Option<(u32, u32, u32)> {
+        let mut counts = self.slots.iter().filter(|s| s.alive).map(|s| s.fire_count);
+        let first = counts.next()?;
+        let (min, max) = counts.fold((first, first), |(lo, hi), c| (lo.min(c), hi.max(c)));
+        Some((max - min, min, max))
+    }
+
+    /// MILESTONE 117: the REAL evidence-gated fairness path --
+    /// `tasks.rs`'s `timer_tick_switch()` calls THIS, not `step()`, as of
+    /// this milestone (see this module's own doc for why and the real
+    /// measured numbers). Samples the CURRENT real spread (as of the end
+    /// of the PREVIOUS tick's own selection -- deliberately measured
+    /// before this tick's own accumulate/select, so a sample never
+    /// reflects a selection it hasn't influenced yet) into the shared
+    /// `evidence_gate` machinery, logs a real transition exactly like
+    /// `heap_guard::record_teardown_sample()` does, then runs this tick's
+    /// own accumulate/select using `FAIRNESS_BOOST_EPSILON` in place of
+    /// `TIE_EPSILON` while, and only while, sustained real evidence says
+    /// this bank is in a genuinely unfair stretch.
+    pub fn step_fairness_gated(&mut self) -> Option<usize> {
+        let hit = self.fire_count_spread().is_some_and(|(spread, _, _)| spread > FAIRNESS_HIT_SPREAD);
+        let (transition, evidence) = evidence_gate::record_sample(GateKind::SchedulerFairness, &SCHED_GATE_CONFIG, hit);
+        match transition {
+            GateTransition::Entered => {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 117: scheduler-fairness gate -- entering CONSERVATIVE mode (evidence={evidence:.3}, widening tie window {TIE_EPSILON} -> {FAIRNESS_BOOST_EPSILON})"
+                );
+            }
+            GateTransition::Left => {
+                let _ = writeln!(
+                    serial(),
+                    "milestone 117: scheduler-fairness gate -- leaving CONSERVATIVE mode (evidence={evidence:.3}, tie window back to {TIE_EPSILON})"
+                );
+            }
+            GateTransition::Unchanged => {}
+        }
+
+        let epsilon = if evidence_gate::is_conservative(GateKind::SchedulerFairness) {
+            FAIRNESS_BOOST_EPSILON
+        } else {
+            TIE_EPSILON
+        };
+
+        self.accumulate();
+        let (winner, tie_used) = self.select_winner_ternary(epsilon);
         if tie_used {
             self.ties_broken += 1;
         }

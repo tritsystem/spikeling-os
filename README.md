@@ -9338,6 +9338,178 @@ self-test suite, genuinely open for a future pass.
       compiler self-test's own per-compile leak, `heap_guard::admit()`
       covering only its original two call sites) remains unchanged,
       unrelated to this milestone.
+- [x] **Milestone 118**: real TWO-LEVEL `int` pointers -- `int **p;` local
+      declaration, `*p`/`**p` as rvalues, and `**p = expr;` as an lvalue.
+      Both Milestone 116's and Milestone 117's own closing disclosures
+      named `int **`/multi-level pointers as the well-scoped next compiler
+      slice; this milestone takes it, returning to the compiler track
+      after Milestone 117's own real Tier 13 subsystem milestone, the same
+      "not every milestone needs SNN/evidence-gate work, and correctly so"
+      carve-out Milestone 107 through 116 already established for pure
+      compiler-frontend work.
+
+      **A real, honest surprise found while building this**: the RVALUE
+      half of the feature -- both `*p` (yields the inner `int *` value)
+      and `**p` (yields the pointed-to `int`) -- needed ZERO new codegen
+      once `int **p;` declarations parse at all. `parse_unary()`'s own `*`
+      case has recursed into itself since Milestone 109 (`unary := "*"
+      unary | ...`, built so `*` composes with `-`/`~`/`!`, never
+      specifically for double dereference), so `**p` already parses as
+      `OP_DEREF(OP_DEREF(EXPR_IDENT(p)))` with no parser change at all;
+      and `EXPR_UNARY`'s own `OP_DEREF` codegen arm (Milestone 109/112)
+      already falls through to the ordinary full-width
+      `emit_mov_rax_mem_rax()` load whenever its operand is anything other
+      than a plain `EXPR_IDENT` naming a `char *` variable -- exactly the
+      shape the OUTER `OP_DEREF` of `**p` always has (its own operand is
+      the INNER `OP_DEREF` node, not an `EXPR_IDENT`), so it was already,
+      silently, doing the right thing -- that arm's own Milestone 112 doc
+      comment even names "a nested dereference `**q`" explicitly as one of
+      the shapes that falls through correctly, written five milestones
+      before anything could actually construct one.
+
+      **The two genuinely new pieces of work**: (1) parser acceptance of
+      the `int **p ...;` declarator grammar -- `parse_double_pointer_decl()`,
+      a real sibling of `parse_pointer_decl()`, not a reuse of it with a
+      level parameter, since an `int **` declarator needs its own
+      distinct `StmtNode.then_body` sentinel (`3`, collision-free against
+      the pre-existing `0`/`1`/`2` values) and its own new
+      `VarSlot.is_int_ptr_ptr` flag -- `then_body: 2`/`is_int_ptr` already
+      mean something different and specific ("single-level `int *`"); and
+      (2) the LVALUE write side, `**p = expr;`, which genuinely does need
+      new codegen -- the new `STMT_ASSIGN_DEREF2` statement kind. Its
+      codegen is `STMT_ASSIGN_DEREF`'s own single-level write sequence
+      with exactly one extra instruction inserted at the front: load `p`'s
+      own value (`emit_mov_rax_rbp_off()`), dereference it ONE more time
+      (`emit_mov_rax_mem_rax()`, the same instruction `EXPR_UNARY`'s
+      `OP_DEREF` arm already uses for `*p` as an rvalue) to reach the real
+      target `int`'s own address, THEN push/evaluate-the-RHS/pop/store
+      exactly as before. Zero new x86_64 encodings anywhere in this
+      milestone -- every instruction this feature needs
+      (`emit_mov_rax_rbp_off()`, `emit_mov_rax_mem_rax()`,
+      `emit_push_rax()`, `emit_pop_reg()`, `emit_mov_mem_rcx_rax()`,
+      `emit_mov_rbp_off_rax()`) already existed before it, the same
+      "combine, don't invent" discipline Milestone 115's own
+      `emit_shl_rax_imm8()` paragraph already named as an ideal, just
+      taken one step further here -- this milestone needs no new
+      instruction at all, only a new arrangement of old ones.
+
+      `find_var()`'s own return tuple grows to SIX elements (the new
+      `is_int_ptr_ptr` field); all NINE of its call sites are updated for
+      the new arity, every one of which just ignores the new field -- the
+      same "ignore the field you don't need" precedent every prior
+      addition (Milestone 110/112/115) already established. This milestone
+      adds no new `find_var()` call site at all -- `STMT_ASSIGN_DEREF2`'s
+      own codegen resolves `p` via the ordinary `stack_off` field every
+      call site has always used, the same way `STMT_ASSIGN_DEREF` already
+      does.
+
+      **New self-test cases**, all three run in-process
+      (`CodegenMode::Callable`), the same tier Milestone 107 through 116
+      all already used for their own new cases -- no new real
+      `fork()`/`exec()`/`wait()` cycle is added by this milestone: CASE 117
+      (`int x; int *p; int **pp; x = 42; p = &x; pp = &p; return **pp;` --
+      the real, distinguishing proof `**pp` genuinely reaches `x`'s own
+      value through two real levels of indirection, AND a real proof the
+      new declarator grammar itself landed, since a pre-fix build would
+      reject this program at PARSE time, not merely compute the wrong
+      answer; expected `42`); CASE 118 (the same shape, but
+      `**pp = 99; return x;` -- the real, distinguishing proof of the one
+      genuinely new codegen surface, `STMT_ASSIGN_DEREF2`, reaching THROUGH
+      both levels to land on `x`'s own real stack slot; expected `99`);
+      CASE 119 (a real, decisive ALIASING tripwire -- two separate `int *`
+      locals `p1`/`p2`, only `p2`'s address ever taken into `pp` via
+      `int **pp = &p2;`, a combined declarator+initializer this milestone
+      also exercises for the first time; `**pp = 77; return a + b;` must
+      come out `87`, not `30`, proving `is_int_ptr_ptr`'s own new sentinel
+      landed on the CORRECT declared slot rather than merely A slot, the
+      same standard Milestone 96/104/114's own cross-slot cases already
+      established; expected `87`).
+
+      **`cargo build` clean from the repo root (kernel + host runner, zero
+      warnings)**. `kernel/assets/cc.elf` rebuilt via the project's own
+      pinned-nightly `rustc` recipe (`tools/cc_src/README.md`, unchanged)
+      -- 105352 bytes, up from Milestone 116's 103256 (Milestone 117 did
+      not touch this file at all); the real `PT_LOAD` `p_memsz` via
+      `readelf -l` is 90784 bytes, 23 pages (up one page from Milestone
+      116's own 22) -- comfortably under the 64-page per-segment cap and
+      128-page total cap, no cap change needed. The rebuilt `cc.elf` was
+      independently re-derived from the current `main.rs` via a
+      from-scratch invocation of the exact same recipe and diffed
+      byte-for-byte identical against the committed binary (`cmp`, not
+      eyeballed). **Zero new compiler warnings** -- verified the same way
+      Milestone 109 through 116 verified their own: reproducing the
+      standalone `rustc` invocation against a `git stash` of this
+      milestone's own changes (a real, clean Milestone 117 checkout, since
+      Milestone 117 itself never touched this file either) and diffing the
+      sorted warning list against this milestone's own build -- byte-for-
+      byte identical 16-warning set.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m118_fresh_boot.log`/`m118_reused_boot.log`), no
+      stray `qemu-system-x86_64.exe` process before or after either boot
+      (checked via `tasklist`). Every marker was verified via a real
+      reconstruction script written this session (not committed, matching
+      every prior session's own disclosed practice) that byte-precisely
+      slices each real ring-3 WRITE-syscall payload out of the raw log
+      using that write's own declared `len=N` (rather than trusting line
+      boundaries) and concatenates them in real file order -- correctly
+      reassembling markers fragmented across two separate WRITE syscalls,
+      the exact real quirk Milestone 117's own session first found and
+      disclosed -- plus a separate scan of the kernel's own direct
+      `writeln!` lines. Fresh boot: 300 total distinct markers, every one
+      `PASS`, zero `FAIL`. Reused boot: the identical 53-line `fs self-test`
+      FAIL set every milestone since 70 has recorded (the Milestone-62-era
+      fixture-cleanup artifact), byte-for-byte identical in NAME and VALUE
+      to Milestone 117's own committed `m117_reused_boot.log` when diffed
+      directly through the same script -- zero markers missing, zero newly
+      failing anywhere else. Diffing this milestone's own fresh boot
+      against Milestone 117's own committed `m117_fresh_boot.log` (296
+      markers) through the same script shows the ONLY difference is the
+      addition of `OVERALL_M118=PASS` plus the three new case markers
+      (296 -> 300, exactly +4) -- a real, precise regression check, not
+      eyeballed. Milestone 104/106's own heap-pressure gate came out byte-
+      identical to every milestone since 108's own recorded baseline on
+      both boots: `samples_taken=68 gate_trip_episodes=0
+      naive_instantaneous_hits=0 admissions_denied_so_far=0`. Milestone
+      117's own scheduler-fairness gate came out byte-identical to its own
+      committed value on both boots too: `samples_taken=2400
+      trip_episodes=1`. `run_preemption_demo()` completed on both boots
+      with all three real task counters > 0 (fresh: `task0=2647
+      task1=2504 task2=2804`; reused: `task0=2663 task1=2467
+      task2=2726` -- real inter-boot timing jitter, consistent with every
+      prior milestone's own two-boot pairs), zero `SKIPPED` lines on
+      either boot. Zero `panicked at`/`kernel panicked` and zero `DOUBLE
+      FAULT`/`TRIPLE FAULT` in either log (checked directly, the four
+      literal "panicked at"-adjacent substring matches in each log are all
+      pre-existing "no panic, no double fault" SELF-TEST CONFIRMATION
+      lines Milestone 51/58/61/67 each already print, not real panics --
+      confirmed by inspecting each match directly, not merely counting).
+
+      **Still genuinely open**: no `char **` (only `int **` -- mirrors
+      `char *`'s own later, separate arrival after `int *`); no `int ***`
+      or deeper (exactly one extra level of indirection is recognized, via
+      one new dedicated flag, not a general level-counting scheme); no
+      `int **` PARAMETER or return value -- `collect_vars_for_function()`
+      unconditionally writes `is_int_ptr_ptr: 0` for every parameter this
+      milestone, the same real, disclosed one-milestone scope cut
+      `is_char_ptr` (112->113) and `is_int_ptr` (115->116) each already
+      went through, a real, well-scoped candidate for Milestone 119; no
+      pointer arithmetic on an `int **` itself (`p + 1` where `p` is
+      `int **` is NOT recognized by `ptr_operand_scale()` -- it silently
+      falls through to the ordinary UNSCALED add, the exact same "not yet
+      reached" gap `int *` itself had between Milestone 109 and 115); no
+      `int **p, *q;`-style mixed-declarator list (`parse_double_pointer_
+      decl()` is its own standalone single-declarator statement, the same
+      restriction every other declarator shape besides plain
+      `make_decl()`'s comma-chain already has); no `p++`/`p--` (this lexer
+      still has no `++`/`--` tokens at all); pointer-pointer subtraction
+      still not implemented. Everything else Milestone 116/117 disclosed
+      as open (`MAX_PARAMS` 8, no `sizeof`, `char` as the only non-`int`
+      scalar type, the compiler self-test's own per-compile leak,
+      `heap_guard::admit()` covering only its original two call sites,
+      `evidence_gate.rs` still having exactly two real subscribers)
+      remains unchanged, unrelated to this milestone.
 
 ## Building and running
 

@@ -1650,6 +1650,80 @@
 // own "Scope" paragraph above named MINUS the one item this milestone
 // closes (the `int *`-parameter gap) -- see this file's own top-level
 // Milestone 116 disclosure in `README.md` for the complete, current list.
+//
+// MILESTONE 118: real TWO-LEVEL `int` pointers -- `int **p;` local
+// declaration, `*p`/`**p` as rvalues, and `**p = expr;` as an lvalue.
+// M116/M117's own closing disclosures both named `int **`/multi-level
+// pointers as the well-scoped next compiler slice; this milestone takes
+// it, deliberately following the exact same "local variable only, first
+// slice" scope every earlier pointer feature (Milestone 109's own `int
+// *`) started from before crossing a function-call boundary several
+// milestones later.
+//
+// The real, honest surprise found while building this: the RVALUE half
+// of this feature -- both `*p` (yields the inner `int *` value, an
+// address) and `**p` (yields the pointed-to `int`) -- needed ZERO new
+// codegen once `int **p;` declarations parse at all. `parse_unary()`'s
+// own `*` case already recurses into itself (Milestone 109's own
+// `unary := "*" unary | ...` production, built for composing `*` with
+// `-`/`~`/`!`, never specifically for double dereference), so `**p`
+// already parses as `OP_DEREF(OP_DEREF(EXPR_IDENT(p)))` with no parser
+// change at all; and `EXPR_UNARY`'s own `OP_DEREF` codegen arm (Milestone
+// 109/112) already falls through to the ordinary full-width
+// `emit_mov_rax_mem_rax()` load whenever its operand is anything other
+// than a plain `EXPR_IDENT` naming a `char *` variable -- exactly the
+// shape the OUTER `OP_DEREF` of `**p` always has (its own operand is the
+// INNER `OP_DEREF` node, not an `EXPR_IDENT`), so it was already,
+// silently, doing the right thing. The only genuinely NEW work is (1)
+// parser acceptance of the `int **p ...;` declarator grammar
+// (`parse_double_pointer_decl()`, a real sibling of `parse_pointer_decl()`,
+// not a reuse of it -- an `int **` declarator needs its own `then_body`
+// sentinel, `3`, and its own new `VarSlot.is_int_ptr_ptr` flag, since
+// `then_body: 2`/`is_int_ptr` already means something different and
+// specific: "single-level `int *`") and (2) the LVALUE write side,
+// `**p = expr;` (the new `STMT_ASSIGN_DEREF2` statement kind), which
+// genuinely does need new codegen: load `p`'s own value (the address of
+// the pointee `int *` cell), dereference it ONCE more
+// (`emit_mov_rax_mem_rax()`, reused) to reach the real target `int`'s own
+// address, then push/evaluate-RHS/pop/store exactly like
+// `STMT_ASSIGN_DEREF`'s own single-level write already does. Zero new
+// x86_64 encodings anywhere in this milestone -- every instruction this
+// feature needs (`emit_mov_rax_rbp_off()`, `emit_mov_rax_mem_rax()`,
+// `emit_push_rax()`, `emit_pop_reg()`, `emit_mov_mem_rcx_rax()`,
+// `emit_mov_rbp_off_rax()`) already existed before this milestone.
+//
+// `find_var()`'s return tuple grows to SIX elements (the new
+// `is_int_ptr_ptr` field); every one of its nine call sites is updated
+// for the new arity, the same "every call site ignores the field it does
+// not need" precedent every prior `find_var()` field addition (Milestone
+// 110/112/115) already established -- none of the pre-existing call
+// sites (`EXPR_IDENT`, `EXPR_INDEX`, `OP_ADDR`, `OP_DEREF`,
+// `ptr_operand_scale()`, `STMT_ASSIGN`, `STMT_ASSIGN_INDEX`,
+// `STMT_ASSIGN_DEREF`) needs to know whether a variable is an `int **`
+// specifically.
+//
+// Scope, deliberately real and disclosed, the same "narrow first slice"
+// discipline Milestone 109 itself used for single-level pointers: LOCAL
+// `int **` variables only -- no `int **` PARAMETER or return value (the
+// exact same real gap `is_char_ptr`/`is_int_ptr` each carried for one
+// milestone before the next one closed it; `collect_vars_for_function()`
+// unconditionally writes `is_int_ptr_ptr: 0` for every parameter this
+// milestone, a real, disclosed scope cut, not an oversight); no `char
+// **`, only `int **` (mirrors `char *`'s own later, separate arrival
+// after `int *`); no `int ***` or deeper (this compiler now recognizes
+// exactly ONE extra level of indirection, via one new dedicated flag, not
+// a general level-counting scheme); pointer arithmetic on an `int **`
+// itself (`p + 1` where `p` is `int **`) is NOT recognized by
+// `ptr_operand_scale()` -- it silently falls through to the ordinary
+// UNSCALED add, the exact same "not yet reached" gap `int *` itself had
+// between Milestone 109 and 115; no `int **p, *q;`-style mixed-declarator
+// list (`parse_double_pointer_decl()` is its own standalone
+// single-declarator statement, the same restriction every other
+// declarator shape besides plain `make_decl()`'s comma-chain already has);
+// `*p = expr;` (a SINGLE-level write through an `int **`, storing a new
+// `int *` address into the pointee) is not a new code path at all -- the
+// pre-existing `STMT_ASSIGN_DEREF` already handles it correctly with zero
+// changes, since that arm has never cared what type the pointee is.
 #![no_std]
 #![no_main]
 
@@ -2468,6 +2542,12 @@ const STMT_ASSIGN_INDEX: u8 = 13;
 // is the entire real dereference-target grammar (there is no `*(p+1)`
 // this milestone's own narrow scope could even reach).
 const STMT_ASSIGN_DEREF: u8 = 14;
+// MILESTONE 118: `**p = expr;` -- a real TWO-LEVEL pointer dereference
+// WRITE, the lvalue form of `**p`. Own kind rather than a reuse of
+// `STMT_ASSIGN_DEREF` above (which is a real, distinct, single-level
+// operation, not a special case of this one) -- see `gen_stmt_list()`'s
+// own new arm for this kind's full codegen derivation.
+const STMT_ASSIGN_DEREF2: u8 = 15;
 
 #[repr(C)]
 struct StmtNode {
@@ -3611,6 +3691,47 @@ impl Parser {
         Ok(head)
     }
 
+    /// MILESTONE 118: `"int" "*" "*" IDENT ("=" logic_or)? ";"` -- a real
+    /// TWO-LEVEL `int` pointer declarator. `name` and the two `*` tokens
+    /// are already consumed by the caller (`TOK_INT`'s own arm in
+    /// parse_stmt(), the same "already consumed before this helper runs"
+    /// shape `parse_pointer_decl()` above already uses for its own single
+    /// `*`). A genuinely SEPARATE function from `parse_pointer_decl()`,
+    /// not a reuse of it with a level parameter -- an `int **` declarator
+    /// needs its own distinct `then_body` sentinel (`3`, collision-free
+    /// against the existing `0`/`1`/`2` values -- see
+    /// `collect_vars_rec()`'s own updated doc comment) and always writes
+    /// `expr: 0` (there is no `char **` for this milestone to encode; see
+    /// this file's own top Milestone 118 doc comment's "Scope"
+    /// paragraph), so folding it into `parse_pointer_decl()`'s existing
+    /// boolean parameter would just be a second, harder-to-read encoding
+    /// of the exact same distinction a dedicated function already makes
+    /// obvious. Deliberately narrow, mirroring `parse_pointer_decl()`'s
+    /// own restriction: exactly ONE `int **` declarator per statement (no
+    /// `int **p, **q;` list, no mixing into an `int a, **p, b;` chain).
+    /// Reuses `finish_ident_assign()` directly for the optional `"="
+    /// <ternary>` initializer, exactly like `parse_pointer_decl()` does,
+    /// so `int **pp = &p;` is a real, legal combined declaration+
+    /// initializer in one statement.
+    unsafe fn parse_double_pointer_decl(&mut self, name: Token) -> Result<u64, ParseError> {
+        let head = unsafe { alloc_stmt() };
+        if head == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                head as *mut StmtNode,
+                StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 3, else_body: 0 },
+            )
+        };
+        if unsafe { self.peek() }.kind == TOK_ASSIGN {
+            let assign = unsafe { self.finish_ident_assign(name, false) }?;
+            unsafe { (*(head as *mut StmtNode)).next = assign };
+        }
+        unsafe { self.expect(TOK_SEMI) }?;
+        Ok(head)
+    }
+
     /// MILESTONE 84 logic, extracted at MILESTONE 86 so `for`'s init and
     /// step clauses can reuse it. `name` is the already-consumed IDENT;
     /// the next token is `=` or one of the nine compound-assignment
@@ -3706,7 +3827,22 @@ impl Parser {
                 // Milestone 108 already used for array-vs-scalar just
                 // below.
                 if unsafe { self.peek() }.kind == TOK_STAR {
-                    unsafe { self.advance() }; // consume '*'
+                    unsafe { self.advance() }; // consume first '*'
+                    // MILESTONE 118: a SECOND immediate `*` makes this an
+                    // `int **p ...;` two-level pointer declarator instead
+                    // -- one more token of lookahead, checked BEFORE the
+                    // IDENT is consumed, the exact same "peek before
+                    // deciding which declarator shape this is" discipline
+                    // this arm's own Milestone 109 check just above
+                    // already established, applied recursively one level
+                    // deeper. A single `*` (no second one) falls through
+                    // to the pre-existing `int *` path completely
+                    // unchanged.
+                    if unsafe { self.peek() }.kind == TOK_STAR {
+                        unsafe { self.advance() }; // consume second '*'
+                        let name = unsafe { self.expect(TOK_IDENT) }?;
+                        return unsafe { self.parse_double_pointer_decl(name) };
+                    }
                     let name = unsafe { self.expect(TOK_IDENT) }?;
                     return unsafe { self.parse_pointer_decl(name, false) };
                 }
@@ -3846,7 +3982,39 @@ impl Parser {
             // assignment's RHS, a call argument, a `return` expression,
             // etc.) -- the two can never both fire on the same token.
             TOK_STAR => {
-                unsafe { self.advance() }; // consume '*'
+                unsafe { self.advance() }; // consume first '*'
+                // MILESTONE 118: a SECOND immediate `*` makes this
+                // `**p = expr;` -- a real TWO-LEVEL pointer dereference
+                // WRITE, the lvalue form of `**p` -- instead of the
+                // pre-existing single-level `*p = expr;`. Same "one more
+                // token of lookahead, checked before the IDENT" shape
+                // this file's own TOK_INT arm just used for the
+                // declarator side; unambiguous with parse_unary()'s own
+                // recursive `*` handling for the identical reason the
+                // pre-existing single-`*` case already was (this dispatch
+                // only ever sees the first token of a brand-new
+                // statement). The pointer operand stays restricted to a
+                // plain IDENT, the same narrow scope the single-level
+                // case already established -- there is no `*(*p) = expr;`
+                // or `**f() = expr;` grammar here.
+                if unsafe { self.peek() }.kind == TOK_STAR {
+                    unsafe { self.advance() }; // consume second '*'
+                    let name = unsafe { self.expect(TOK_IDENT) }?;
+                    unsafe { self.expect(TOK_ASSIGN) }?;
+                    let rhs = unsafe { self.parse_ternary() }?;
+                    unsafe { self.expect(TOK_SEMI) }?;
+                    let node = unsafe { alloc_stmt() };
+                    if node == 0 {
+                        return Err(ParseError::OutOfMemory);
+                    }
+                    unsafe {
+                        core::ptr::write(
+                            node as *mut StmtNode,
+                            StmtNode { kind: STMT_ASSIGN_DEREF2, ident_off: name.ident_off, ident_len: name.ident_len, expr: rhs, next: 0, then_body: 0, else_body: 0 },
+                        )
+                    };
+                    return Ok(node);
+                }
                 let name = unsafe { self.expect(TOK_IDENT) }?;
                 unsafe { self.expect(TOK_ASSIGN) }?;
                 let rhs = unsafe { self.parse_ternary() }?;
@@ -4858,6 +5026,30 @@ struct VarSlot {
     // own one-milestone-only gap). See that function's own updated doc
     // comment.
     is_int_ptr: u8,
+    // MILESTONE 118: 1 exactly for a local `int **p;` pointer DECLARATOR's
+    // own named slot, 0 for everything else -- an ordinary `int`, a `char`
+    // scalar/pointer, an array, or a single-level `int *`/`char *`
+    // pointer. A genuinely NEW field, not a reuse of `is_int_ptr` above:
+    // `is_int_ptr` specifically means "this slot holds a single-level
+    // `int *` value" (consulted by `ptr_operand_scale()` to decide an
+    // 8-byte arithmetic scale) -- an `int **` slot is a DIFFERENT declared
+    // type and deliberately does NOT set it, so `p + 1` on an `int **`
+    // does not accidentally get scaled by this milestone's own field
+    // (see this file's own top Milestone 118 doc comment's "Scope"
+    // paragraph -- `ptr_operand_scale()` is not extended to recognize
+    // `is_int_ptr_ptr` at all yet, a real, disclosed gap, not an
+    // oversight). This field's only real reader is `collect_vars_rec()`
+    // below, which sets it from `parse_double_pointer_decl()`'s own new
+    // `then_body: 3` sentinel -- every OTHER `STMT_DECL` producer in this
+    // file only ever writes `then_body` as 0, 1, or 2 (Milestone 102's
+    // `is_char` type-tag, and Milestone 115's own `int *` sentinel
+    // respectively), so `3` is a real, collision-free "this declarator is
+    // a TWO-level pointer" signal. Deliberately NOT threaded into
+    // `ParamInfo`/a parameter's own `VarSlot` this milestone -- an `int
+    // **` PARAMETER is real, disclosed future work, the same one-
+    // milestone-then-close-it shape `is_char_ptr` (112->113) and
+    // `is_int_ptr` (115->116) each already went through.
+    is_int_ptr_ptr: u8,
 }
 
 unsafe fn var_write(vars_ptr: u64, idx: u64, v: VarSlot) {
@@ -4961,9 +5153,24 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // every milestone before this one, so `is_int_ptr_decl` is
             // correctly false and `is_char`/`is_char_ptr` both compute
             // exactly as they always have).
+            // MILESTONE 118: `s.then_body == 3` is the new sentinel
+            // `parse_double_pointer_decl()` writes for an `int **`
+            // declarator -- real and collision-free for the identical
+            // reason `2` was at Milestone 115 (no other STMT_DECL producer
+            // ever writes anything but 0/1/2). Gates the new
+            // `is_int_ptr_ptr` field exactly the way `is_int_ptr_decl`
+            // gates `is_int_ptr` just above -- and, just like that case,
+            // `is_char_flag` must come out 0 here too (an `int **` slot's
+            // own bare read is an ordinary full 8-byte load, never
+            // narrowed), which `is_char_flag`'s existing `else { s.then_
+            // body as u8 }` fallback would get WRONG (it would read back
+            // the literal `3`) if this check were not added -- so
+            // `is_int_ptr_ptr_decl` is folded into the SAME `is_char_flag`
+            // gate below, not a second independent one.
             let is_int_ptr_decl = s.then_body == 2;
-            let is_char_flag: u8 = if is_int_ptr_decl { 0 } else { s.then_body as u8 };
-            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: is_char_flag, is_array: if elem_count > 1 { 1 } else { 0 }, is_char_ptr: s.expr as u8, is_int_ptr: if is_int_ptr_decl { 1 } else { 0 } }) };
+            let is_int_ptr_ptr_decl = s.then_body == 3;
+            let is_char_flag: u8 = if is_int_ptr_decl || is_int_ptr_ptr_decl { 0 } else { s.then_body as u8 };
+            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: is_char_flag, is_array: if elem_count > 1 { 1 } else { 0 }, is_char_ptr: s.expr as u8, is_int_ptr: if is_int_ptr_decl { 1 } else { 0 }, is_int_ptr_ptr: if is_int_ptr_ptr_decl { 1 } else { 0 } }) };
             // MILESTONE 108: an array of `elem_count` > 1 reserves
             // `elem_count` contiguous 8-byte stack slots (element `i`
             // lives at `off - 8*i`, i.e. progressively MORE negative as
@@ -4992,7 +5199,7 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             let mut k: u64 = 1;
             while k < elem_count {
                 let elem_off = off - 8 * (k as i32);
-                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0, is_array: 0, is_char_ptr: 0, is_int_ptr: 0 }) };
+                unsafe { var_write(vars_ptr, *n + k, VarSlot { name_off: 0, name_len: 0, stack_off: elem_off, is_char: 0, is_array: 0, is_char_ptr: 0, is_int_ptr: 0, is_int_ptr_ptr: 0 }) };
                 k += 1;
             }
             *n += elem_count;
@@ -5118,7 +5325,16 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // same "accepting the grammar plus threading the one flag IS the
         // complete feature" shape Milestone 110/113 both already
         // established.
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: p.is_int_ptr }) };
+        // MILESTONE 118: `is_int_ptr_ptr` is unconditionally 0 for every
+        // parameter -- `ParamInfo` has no equivalent bit, and this
+        // milestone deliberately does not extend `int **` across a
+        // function-call boundary (see this file's own top Milestone 118
+        // doc comment's "Scope" paragraph). The same real, disclosed
+        // scope cut `is_char_ptr` (112) and `is_int_ptr` (115) each
+        // carried for exactly one milestone before the next one closed
+        // it -- a real, disclosed candidate for Milestone 119, not
+        // attempted here.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: p.is_int_ptr, is_int_ptr_ptr: 0 }) };
         n += 1;
         pi += 1;
     }
@@ -5170,12 +5386,25 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
 /// the field you don't need" precedent every prior `find_var()` field
 /// addition already established. `ptr_operand_scale()` is a genuinely
 /// NEW, eighth call site this milestone adds.
-unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8, u8, u8, u8)> {
+/// MILESTONE 118: now returns `(stack_off, is_char, is_array, is_char_ptr,
+/// is_int_ptr, is_int_ptr_ptr)` -- the sixth field records whether a
+/// variable was declared `int **`, needed by `collect_vars_rec()`'s own
+/// double-dereference write codegen (`STMT_ASSIGN_DEREF2`, new -- see its
+/// own doc comment). All NINE of this function's pre-existing call sites
+/// are updated for the new tuple arity, every one of which just ignores
+/// the new field -- the exact same "ignore the field you don't need"
+/// precedent every prior addition (Milestone 110/112/115) already
+/// established; this milestone adds no new `find_var()` call site at all
+/// (`STMT_ASSIGN_DEREF2`'s own codegen resolves its pointer operand via
+/// the ordinary `emit_mov_rax_rbp_off()` slot-offset path, the same way
+/// `STMT_ASSIGN_DEREF` already does, needing only `stack_off` -- the
+/// first tuple field every call site has always used).
+unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, ident_len: u64) -> Option<(i32, u8, u8, u8, u8, u8)> {
     let mut i: u64 = 0;
     while i < nvars {
         let v = unsafe { var_read(vars_ptr, i) };
         if unsafe { same_span(src_ptr, v.name_off as u64, v.name_len as u64, ident_off, ident_len) } {
-            return Some((v.stack_off, v.is_char, v.is_array, v.is_char_ptr, v.is_int_ptr));
+            return Some((v.stack_off, v.is_char, v.is_array, v.is_char_ptr, v.is_int_ptr, v.is_int_ptr_ptr));
         }
         i += 1;
     }
@@ -5215,7 +5444,13 @@ unsafe fn ptr_operand_scale(src_ptr: u64, vars_ptr: u64, nvars: u64, node: &Expr
         return None;
     }
     match unsafe { find_var(src_ptr, vars_ptr, nvars, node.ident_off as u64, node.ident_len as u64) } {
-        Some((_o, _is_char, is_array, is_char_ptr, is_int_ptr)) => {
+        // MILESTONE 118: `_is_int_ptr_ptr` is deliberately ignored here --
+        // an `int **` variable's own arithmetic (`p + 1` where `p` is
+        // `int **`) is NOT recognized by this milestone (see this file's
+        // own top Milestone 118 doc comment's "Scope" paragraph); it
+        // falls through to `None` (unscaled), the same real, disclosed
+        // gap `int *` itself had here between Milestone 109 and 115.
+        Some((_o, _is_char, is_array, is_char_ptr, is_int_ptr, _is_int_ptr_ptr)) => {
             if is_char_ptr != 0 {
                 Some(1)
             } else if is_array != 0 || is_int_ptr != 0 {
@@ -6047,7 +6282,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 // own codegen is needed, since EXPR_CALL evaluates each
                 // argument through this same gen_expr()/EXPR_IDENT path
                 // like any other expression.
-                Some((o, is_char, is_array, _is_char_ptr, _is_int_ptr)) => {
+                Some((o, is_char, is_array, _is_char_ptr, _is_int_ptr, _is_int_ptr_ptr)) => {
                     if is_array != 0 {
                         unsafe { buf.emit_lea_rax_rbp_off(o) };
                     } else if is_char != 0 {
@@ -6167,7 +6402,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         EXPR_INDEX => {
             let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
             let (base_off, is_array, is_char_ptr) = match slot {
-                Some((o, _is_char, is_array, is_char_ptr, _is_int_ptr)) => (o, is_array, is_char_ptr),
+                Some((o, _is_char, is_array, is_char_ptr, _is_int_ptr, _is_int_ptr_ptr)) => (o, is_array, is_char_ptr),
                 None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
             };
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
@@ -6361,7 +6596,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                 // rbp_off()` call already matches real C's own `&arr`
                 // rule for that reason, needing no is_array branch of
                 // its own, unlike EXPR_IDENT's plain read above it).
-                Some((o, _is_char, _is_array, _is_char_ptr, _is_int_ptr)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
+                Some((o, _is_char, _is_array, _is_char_ptr, _is_int_ptr, _is_int_ptr_ptr)) => unsafe { buf.emit_lea_rax_rbp_off(o) },
                 None => return Err(CodeGenError::UndeclaredVariable(operand.ident_off as u64)),
             }
         }
@@ -6413,7 +6648,7 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
             let operand = unsafe { core::ptr::read(e.left as *const ExprNode) };
             let is_char_pointee = if operand.kind == EXPR_IDENT {
                 match unsafe { find_var(src_ptr, vars_ptr, nvars, operand.ident_off as u64, operand.ident_len as u64) } {
-                    Some((_, _, _, is_char_ptr, _)) => is_char_ptr != 0,
+                    Some((_, _, _, is_char_ptr, _, _is_int_ptr_ptr)) => is_char_ptr != 0,
                     None => false,
                 }
             } else {
@@ -6877,7 +7112,7 @@ unsafe fn gen_stmt_list(
                 // array is not a modifiable lvalue -- so this is the
                 // same call, not new invented semantics.
                 let store_off = match slot {
-                    Some((o, _is_char, is_array, _is_char_ptr, _is_int_ptr)) => {
+                    Some((o, _is_char, is_array, _is_char_ptr, _is_int_ptr, _is_int_ptr_ptr)) => {
                         if is_array != 0 {
                             return Err(CodeGenError::ArrayNotAssignable(s.ident_off as u64));
                         }
@@ -6942,7 +7177,7 @@ unsafe fn gen_stmt_list(
             STMT_ASSIGN_INDEX => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 let (base_off, is_array, is_char_ptr) = match slot {
-                    Some((o, _is_char, is_array, is_char_ptr, _is_int_ptr)) => (o, is_array, is_char_ptr),
+                    Some((o, _is_char, is_array, is_char_ptr, _is_int_ptr, _is_int_ptr_ptr)) => (o, is_array, is_char_ptr),
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.then_body) }?;
@@ -6999,9 +7234,48 @@ unsafe fn gen_stmt_list(
             STMT_ASSIGN_DEREF => {
                 let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
                 match slot {
-                    Some((o, _is_char, _is_array, _is_char_ptr, _is_int_ptr)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
+                    Some((o, _is_char, _is_array, _is_char_ptr, _is_int_ptr, _is_int_ptr_ptr)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
                     None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
                 }
+                unsafe { buf.emit_push_rax() };
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
+                unsafe { buf.emit_pop_reg(REG_RCX) };
+                unsafe { buf.emit_mov_mem_rcx_rax() };
+            }
+            // MILESTONE 118: `**p = expr;` -- a real TWO-LEVEL pointer
+            // dereference WRITE, the one genuinely new codegen surface
+            // this milestone adds (see this file's own top Milestone 118
+            // doc comment for why the RVALUE side needed none at all).
+            // `s.ident_off`/`s.ident_len` name `p` itself (not either
+            // pointee) -- its own VALUE is read first, exactly like
+            // `STMT_ASSIGN_DEREF` just above (`emit_mov_rax_rbp_off()`),
+            // but then dereferenced ONE MORE time, via the same
+            // `emit_mov_rax_mem_rax()` `EXPR_UNARY`'s own `OP_DEREF` arm
+            // already uses for `*p` as an rvalue, to reach the REAL target
+            // `int`'s own address before the push/RHS/pop/store sequence
+            // `STMT_ASSIGN_DEREF` already established runs unchanged:
+            //   mov rax, [rbp+o]     (RAX = p's own value, &(*p))
+            //   mov rax, [rax]       (RAX = *p's own value, the real target address)
+            //   push rax             (save the target address)
+            //   <rhs>                (gen_expr, value into RAX)
+            //   pop rcx              (RCX = the saved target address)
+            //   mov [rcx], rax       (**p = value, the real store)
+            // Zero new CodeBuf encodings -- both `emit_mov_rax_rbp_off()`
+            // and `emit_mov_rax_mem_rax()` already existed, the same
+            // "combine, don't invent" discipline this file's own
+            // Milestone 118 doc comment already named. Always the ordinary
+            // full 8-byte store, matching `STMT_ASSIGN_DEREF`'s own
+            // Milestone 112 write-side convention (narrowing only ever
+            // happens on READ, never WRITE) -- there is no `char **` for
+            // this arm to ever need to narrow anyway (see this file's own
+            // Scope disclosure).
+            STMT_ASSIGN_DEREF2 => {
+                let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, s.ident_off as u64, s.ident_len as u64) };
+                match slot {
+                    Some((o, _is_char, _is_array, _is_char_ptr, _is_int_ptr, _is_int_ptr_ptr)) => unsafe { buf.emit_mov_rax_rbp_off(o) },
+                    None => return Err(CodeGenError::UndeclaredVariable(s.ident_off as u64)),
+                }
+                unsafe { buf.emit_mov_rax_mem_rax() };
                 unsafe { buf.emit_push_rax() };
                 unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, s.expr) }?;
                 unsafe { buf.emit_pop_reg(REG_RCX) };
@@ -12274,7 +12548,137 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m116 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 118: real TWO-LEVEL `int` pointers -- `int **p;`
+        // local declaration, `*p`/`**p` as rvalues, and `**p = expr;` as
+        // an lvalue. See this file's own top Milestone 118 doc comment
+        // for the full design derivation, including the real, honest
+        // surprise that the RVALUE half needed zero new codegen at all.
+        // All three cases run in-process (`CodegenMode::Callable`), the
+        // same tier Milestone 107 through 116 all already used for their
+        // own new cases -- no new real `fork()`/`exec()`/`wait()` cycle
+        // is added by this milestone.
+        //
+        // CASE 117: the real, distinguishing proof that `**pp` (double
+        // dereference, RVALUE) genuinely reaches `x`'s own real value
+        // through TWO real levels of indirection -- `pp` holds `&p`,
+        // `p` holds `&x`, so `*pp` must yield `p`'s own value (`&x`) and
+        // `**pp` must yield `x`'s own value. As this file's own top
+        // Milestone 118 doc comment discloses, a pre-fix build (this
+        // milestone's own committed Milestone 116 baseline, where `int
+        // **p;` is not even legal grammar) would reject this program at
+        // PARSE time (`int` followed by `*` followed by `*` falls through
+        // to `parse_pointer_decl()`'s own `expect(TOK_IDENT)`, which
+        // fails on the second `*` token) -- so this case is a real proof
+        // of the declarator grammar landing, not only the dereference
+        // codegen.
+        //   int main() {
+        //       int x; int *p; int **pp;
+        //       x = 42;
+        //       p = &x;
+        //       pp = &p;
+        //       return **pp;
+        //   }
+        // Hand-computed: 42.
+        // -------------------------------------------------------------
+        const SRC117: &[u8] = b"int main() { int x; int *p; int **pp; x = 42; p = &x; pp = &p; return **pp; }";
+        let case117_result = compile_and_run_program_callable(SRC117.as_ptr() as u64, SRC117.len() as u64);
+        w(b"  case117 (int** declaration + real double-dereference READ **pp, in-process) returned=");
+        if let Some(r) = case117_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 42)\n");
+        let case117_ok = case117_result == Some(42);
+        write_check(b"case117_int_ptr_ptr_double_deref_read_returns_42=", case117_ok);
+
+        w(b"\n");
+
+        // CASE 118: the real, distinguishing proof that `**pp = expr;`
+        // (double dereference, LVALUE) is the one genuinely new codegen
+        // surface this milestone adds -- `STMT_ASSIGN_DEREF2`. `pp` holds
+        // `&p`, `p` holds `&x`, so `**pp = 99;` must reach THROUGH both
+        // levels and land on `x`'s own real stack slot, not `p`'s. A
+        // pre-fix build with only `STMT_ASSIGN_DEREF`'s own single-level
+        // write (this milestone's own hypothetical half-measure, had it
+        // stopped at the declarator grammar without adding the new
+        // statement kind) would reject `**pp = 99;` at parse time for the
+        // identical "second `*` where an IDENT was expected" reason CASE
+        // 117 names above.
+        //   int main() {
+        //       int x; int *p; int **pp;
+        //       x = 5;
+        //       p = &x;
+        //       pp = &p;
+        //       **pp = 99;
+        //       return x;
+        //   }
+        // Hand-computed: 99.
+        // -------------------------------------------------------------
+        const SRC118: &[u8] = b"int main() { int x; int *p; int **pp; x = 5; p = &x; pp = &p; **pp = 99; return x; }";
+        let case118_result = compile_and_run_program_callable(SRC118.as_ptr() as u64, SRC118.len() as u64);
+        w(b"  case118 (real double-dereference WRITE **pp = expr; reaches x's own slot, in-process) returned=");
+        if let Some(r) = case118_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 99)\n");
+        let case118_ok = case118_result == Some(99);
+        write_check(b"case118_int_ptr_ptr_double_deref_write_returns_99=", case118_ok);
+
+        w(b"\n");
+
+        // CASE 119: a real, decisive ALIASING tripwire -- TWO separate
+        // `int *` locals (`p1`, `p2`), only ONE of which (`p2`) ever has
+        // its address taken into `pp`. `pp = &p2;` here also exercises
+        // `parse_double_pointer_decl()`'s own combined declarator+
+        // initializer grammar (`int **pp = &p2;`), not the separate
+        // plain-assignment form CASE 117/118 both used. If `is_int_ptr_
+        // ptr`'s own new `then_body: 3` sentinel were wired to the WRONG
+        // declarator's slot (a plausible bug shape: `collect_vars_rec()`
+        // assigns stack slots in real source declaration order, so an
+        // off-by-one in the new sentinel check could silently alias `p1`
+        // instead of `p2`), `**pp = 77;` would corrupt `a` instead of
+        // `b`, and this case's own final sum would come out wrong (`10 +
+        // 20 == 30`, not `10 + 77 == 87`) even though CASE 117/118 both
+        // already passed -- the same "prove it reaches the CORRECT slot,
+        // not merely A slot" standard Milestone 96/104/114's own
+        // cross-slot cases already established.
+        //   int main() {
+        //       int a; int b;
+        //       int *p1; int *p2;
+        //       a = 10; b = 20;
+        //       p1 = &a; p2 = &b;
+        //       int **pp = &p2;
+        //       **pp = 77;
+        //       return a + b;
+        //   }
+        // Hand-computed: 87 (a stays 10, b becomes 77).
+        // -------------------------------------------------------------
+        const SRC119: &[u8] = b"int main() { int a; int b; int *p1; int *p2; a = 10; b = 20; p1 = &a; p2 = &b; int **pp = &p2; **pp = 77; return a + b; }";
+        let case119_result = compile_and_run_program_callable(SRC119.as_ptr() as u64, SRC119.len() as u64);
+        w(b"  case119 (int** aliases the CORRECT local via a combined declarator+initializer, in-process) returned=");
+        if let Some(r) = case119_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 87)\n");
+        let case119_ok = case119_result == Some(87);
+        write_check(b"case119_int_ptr_ptr_aliases_correct_slot_returns_87=", case119_ok);
+
+        w(b"\n");
+
+        let overall_m118 = case117_ok && case118_ok && case119_ok;
+        w(b"OVERALL_M118=");
+        w(if overall_m118 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 { 0 } else { 1 });
     }
 }
 

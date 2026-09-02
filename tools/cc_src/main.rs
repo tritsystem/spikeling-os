@@ -1600,22 +1600,56 @@
 //
 // Scope, deliberately real and disclosed: local `int *`/`char *`
 // variables and decayed array bases ONLY -- an `int *` PARAMETER is NOT
-// recognized (`ParamInfo` has no `is_int_ptr` equivalent, the same real
-// scope cut `is_char_ptr` itself carried for exactly one milestone, 112,
-// before 113 closed it; `p + 1` inside a function taking `int *p` falls
-// through to the ordinary unscaled add, silently, exactly as it always
-// has); `p++`/`p--` remain entirely unimplemented (this lexer has no
-// `++`/`--` tokens AT ALL, a real, larger, separate feature, not merely
-// this milestone's own narrower scope cut); pointer-pointer subtraction
-// (real C: an element-count difference) is not implemented, falling
-// through to a plain, meaningless raw-address subtract; `int - pointer`
-// (not legal C to begin with) is not given any special meaning either;
-// scaling is recognized only when the pointer-like operand is
+// yet recognized (`ParamInfo` has no `is_int_ptr` equivalent, the same
+// real scope cut `is_char_ptr` itself carried for exactly one milestone,
+// 112, before 113 closed it; `p + 1` inside a function taking `int *p`
+// falls through to the ordinary unscaled add, silently, exactly as it
+// always has -- closed the very next milestone, 116, see its own doc
+// comment below); `p++`/`p--` remain entirely unimplemented (this lexer
+// has no `++`/`--` tokens AT ALL, a real, larger, separate feature, not
+// merely this milestone's own narrower scope cut); pointer-pointer
+// subtraction (real C: an element-count difference) is not implemented,
+// falling through to a plain, meaningless raw-address subtract; `int -
+// pointer` (not legal C to begin with) is not given any special meaning
+// either; scaling is recognized only when the pointer-like operand is
 // syntactically a plain `EXPR_IDENT`, the same "resolved by operand
 // SHAPE" restriction `OP_ADDR`/`OP_DEREF` already established; no type
 // system of any kind, so nothing here rejects nonsensical pointer
 // arithmetic at compile time, only computes a real (if sometimes
 // meaningless) address for it.
+//
+// MILESTONE 116: real pointer arithmetic now crosses a real function-call
+// boundary -- an `int *` PARAMETER is recognized by `ptr_operand_scale()`
+// too, closing the exact gap this milestone's own paragraph above just
+// named. The fix is a real, disciplined mirror of Milestone 113's own
+// identical fix for `is_char_ptr`: a new `ParamInfo::is_int_ptr` field,
+// set by `parse_params()`'s own pre-existing `int *` branch (the `*`
+// token was already consumed since Milestone 110; nothing downstream
+// needed to know it was there until now), threaded into the parameter's
+// own `VarSlot.is_int_ptr` by `collect_vars_for_function()` -- previously
+// hardcoded 0, per this milestone's own "Scope" paragraph above, now
+// genuinely variable. `ptr_operand_scale()` itself needs -- and receives
+// -- ZERO code change: it already reads `is_int_ptr` generically through
+// `find_var()`, with no awareness of whether a given `VarSlot` came from
+// a parameter or a local declaration, the same "accepting the grammar
+// plus threading the one flag IS the complete feature" shape Milestone
+// 110/113 both already established. Zero new x86_64 encodings.
+//
+// New self-test cases CASE 114 (an `int *` parameter, `+`, real
+// cross-function aliasing proven alongside the scaling fix) and CASE 115
+// (a decayed array base passed as the argument, `-`) hand-verify the real
+// fix; CASE 116 (a `char *` parameter, `+`) is a real, deliberate
+// VERIFICATION-only case, not a new fix -- `is_char_ptr` was already
+// threaded into a parameter's own `VarSlot` since Milestone 113, so
+// `char *` pointer arithmetic through a parameter was already reachable
+// the moment Milestone 115 landed, just never exercised by a dedicated
+// case; CASE 116 closes that real, disclosed verification gap and proves
+// this milestone's own `is_int_ptr` threading did not regress it.
+//
+// Still genuinely open after this milestone: everything Milestone 115's
+// own "Scope" paragraph above named MINUS the one item this milestone
+// closes (the `int *`-parameter gap) -- see this file's own top-level
+// Milestone 116 disclosure in `README.md` for the complete, current list.
 #![no_std]
 #![no_main]
 
@@ -2494,6 +2528,24 @@ struct ParamInfo {
     // through it should narrow) -- `parse_params()` sets exactly one of
     // `is_char`/`is_char_ptr`, never both, for any single parameter.
     is_char_ptr: u8,
+    // MILESTONE 116: 1 if this parameter was declared `int *`, 0
+    // otherwise -- the real "declared-parameter-type bit" Milestone 115's
+    // own closing disclosure named as the missing piece for extending
+    // real pointer arithmetic across a function-call boundary (`is_int_
+    // ptr` existed on `VarSlot` since that milestone, but `ParamInfo` had
+    // no equivalent, the exact same real, disclosed scope cut
+    // `is_char_ptr` itself carried for exactly one milestone -- 112 --
+    // before 113 closed it here). `collect_vars_for_function()` copies
+    // this straight into the parameter's own `VarSlot.is_int_ptr`, so
+    // `ptr_operand_scale()` -- which already reads that field generically
+    // through `find_var()`, with zero awareness of whether a given slot
+    // came from a parameter or a local declaration -- now recognizes an
+    // `int *` PARAMETER as a real pointer for `+`/`-` scaling too, with
+    // NO codegen change at that call site at all, the same "accepting the
+    // grammar plus threading the one flag IS the complete feature" shape
+    // Milestone 110/113 both already established for the analogous `int
+    // *`/`char *` cases.
+    is_int_ptr: u8,
 }
 
 /// MILESTONE 72: the maximum number of parameters a single function may
@@ -4244,18 +4296,29 @@ impl Parser {
             // combined with a second flag.
             let mut is_char = is_char;
             let mut is_char_ptr = false;
+            // MILESTONE 116: the `int *` branch of this same check (the
+            // token was already consumed here since Milestone 110, but
+            // nothing downstream ever needed to know it was seen -- see
+            // that milestone's own doc comment above) now ALSO records a
+            // real flag, `is_int_ptr`, the exact "declared-parameter-type
+            // bit" Milestone 115's own closing disclosure named as
+            // missing. Mirrors the `char *` branch's own `is_char_ptr`
+            // exactly, just for the opposite leading keyword.
+            let mut is_int_ptr = false;
             if unsafe { self.peek() }.kind == TOK_STAR {
                 unsafe { self.advance() };
                 if is_char {
                     is_char = false;
                     is_char_ptr = true;
+                } else {
+                    is_int_ptr = true;
                 }
             }
             let name = unsafe { self.expect(TOK_IDENT) }?;
             if count as u64 >= MAX_PARAMS {
                 return Err(ParseError::TooManyParams);
             }
-            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 }, is_char_ptr: if is_char_ptr { 1 } else { 0 } }) };
+            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 }, is_char_ptr: if is_char_ptr { 1 } else { 0 }, is_int_ptr: if is_int_ptr { 1 } else { 0 } }) };
             count += 1;
             if unsafe { self.peek() }.kind == TOK_COMMA {
                 unsafe { self.advance() };
@@ -4767,11 +4830,9 @@ struct VarSlot {
     is_char_ptr: u8,
     // MILESTONE 115: 1 exactly for a local `int *p;` pointer DECLARATOR's
     // own named slot, 0 for everything else (an ordinary `int`, a `char`
-    // scalar, an array, a `char *` pointer, and every parameter -- see
-    // this milestone's own closing "Still genuinely open" disclosure for
-    // why parameters stay 0 here). A genuinely NEW field, not a reuse of
-    // `is_char_ptr` above: before this milestone, an `int *p;` pointer
-    // declarator and a plain `int p;` scalar declarator produced a
+    // scalar, an array, or a `char *` pointer). A genuinely NEW field, not
+    // a reuse of `is_char_ptr` above: before this milestone, an `int *p;`
+    // pointer declarator and a plain `int p;` scalar declarator produced a
     // BYTE-IDENTICAL `StmtNode` (both `then_body: 0, expr: 0`) --
     // Milestone 109's own deliberate "a pointer's runtime VALUE is just
     // another 8-byte stack slot, needing no new VarSlot field" design
@@ -4788,7 +4849,14 @@ struct VarSlot {
     // at all. `parse_pointer_decl()` now writes a new sentinel
     // (`then_body: 2`, see that function's own updated doc comment) into
     // the `int *` declarator's own `STMT_DECL` specifically to make this
-    // field derivable -- `collect_vars_rec()` below is the only reader.
+    // field derivable -- `collect_vars_rec()` below was Milestone 115's
+    // only reader.
+    // MILESTONE 116: also 1 for an `int *p` PARAMETER's own named slot --
+    // `collect_vars_for_function()` below now threads `ParamInfo::is_int_
+    // ptr` straight through, the exact same real, disclosed scope-closing
+    // step Milestone 113 already took for `is_char_ptr` (Milestone 112's
+    // own one-milestone-only gap). See that function's own updated doc
+    // comment.
     is_int_ptr: u8,
 }
 
@@ -5027,18 +5095,30 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // call site at all, the same "accepting the grammar plus
         // threading the one flag IS the complete feature" shape Milestone
         // 110 already established for `int *` parameters.
-        // MILESTONE 115: `is_int_ptr` is always 0 for a parameter -- a
-        // real, disclosed scope cut, the exact same shape `is_char_ptr`
-        // itself carried for ONE milestone (112, before 113 closed it):
-        // `ParamInfo` has no equivalent bit recording whether a plain
-        // `int` parameter was actually declared `int *`, so this
-        // milestone's own pointer-arithmetic scaling (`EXPR_BINARY`'s new
-        // codegen below) cannot yet recognize an `int *` PARAMETER as a
-        // pointer -- `p + 1` inside a function taking `int *p` silently
-        // falls through to the ordinary UNSCALED integer add, exactly as
-        // it did before this milestone existed. See this milestone's own
-        // closing "Still genuinely open" note.
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: 0 }) };
+        // MILESTONE 115 (superseded by 116 below): `is_int_ptr` was
+        // always 0 for a parameter -- Milestone 115 deliberately did not
+        // extend real pointer arithmetic across a function-call boundary
+        // (`ParamInfo` had no equivalent bit recording whether a plain
+        // `int` parameter was actually declared `int *`), the same real,
+        // disclosed scope cut Milestone 112 itself used for `is_char_ptr`
+        // before Milestone 113 later closed it.
+        // MILESTONE 116: `is_int_ptr` now carries straight through from
+        // `p.is_int_ptr` (the real declared-parameter-type bit
+        // `parse_params()` now records -- see `ParamInfo::is_int_ptr`'s
+        // own doc comment), the exact "thread a real declared-parameter-
+        // type bit through `ParamInfo`" step Milestone 115's own closing
+        // disclosure named as the missing piece, mirroring Milestone 113's
+        // own identical fix for `is_char_ptr`. An `int *p` parameter's own
+        // `VarSlot` now correctly ends up with `is_int_ptr: 1`, so
+        // `ptr_operand_scale()` -- which already reads this field
+        // generically through `find_var()`, with zero awareness of
+        // whether a given slot came from a parameter or a local
+        // declaration -- scales a parameter's own `p + n`/`p - n`
+        // correctly with NO codegen change at that call site at all, the
+        // same "accepting the grammar plus threading the one flag IS the
+        // complete feature" shape Milestone 110/113 both already
+        // established.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: p.is_int_ptr }) };
         n += 1;
         pi += 1;
     }
@@ -5120,10 +5200,16 @@ unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, iden
 /// 109/112) already established for `&`/`*`, applied here to `+`/`-` for
 /// the same reason: reliably recognizing a pointer TYPE from an arbitrary
 /// expression shape would need a real type system this subset does not
-/// have (see this milestone's own closing disclosure). A parameter is
-/// never recognized here regardless of its real declared type
-/// (`is_int_ptr` is unconditionally 0 for every parameter -- see
-/// `collect_vars_for_function()`'s own updated doc comment).
+/// have (see this milestone's own closing disclosure). MILESTONE 116: a
+/// parameter IS now correctly recognized here too, for both `int *` and
+/// `char *` -- `find_var()` (called just below) makes no distinction at
+/// all between a `VarSlot` that came from a parameter versus a local
+/// declaration, so once `collect_vars_for_function()` threads a real
+/// `is_int_ptr`/`is_char_ptr` value into a parameter's own slot (Milestone
+/// 113 already did this for `is_char_ptr`; Milestone 116 closes the
+/// matching `is_int_ptr` gap Milestone 115's own closing disclosure
+/// named), this function needs -- and receives -- ZERO code change to
+/// pick it up.
 unsafe fn ptr_operand_scale(src_ptr: u64, vars_ptr: u64, nvars: u64, node: &ExprNode) -> Option<u8> {
     if node.kind != EXPR_IDENT {
         return None;
@@ -12049,7 +12135,146 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m115 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 116: real pointer arithmetic (Milestone 115) now
+        // crosses a real function-call boundary -- an `int *` PARAMETER
+        // is recognized by `ptr_operand_scale()` too, closing the exact
+        // gap Milestone 115's own closing disclosure named ("pointer
+        // arithmetic does NOT cross a function-call boundary ... `p + 1`
+        // inside a function taking `int *p` silently falls through to the
+        // ordinary UNSCALED add"). See this file's own top Milestone 116
+        // doc comment and `ParamInfo::is_int_ptr`'s own doc comment for
+        // the full derivation. All three cases run in-process
+        // (`CodegenMode::Callable`), the same tier Milestone 107 through
+        // 115 all already used for their own new cases -- no new real
+        // `fork()`/`exec()`/`wait()` cycle is added by this milestone.
+        //
+        // CASE 114: the real, distinguishing proof that `p + 1` scales
+        // correctly, AND aliases the real caller-side stack slot
+        // correctly, when `p` is an `int *` PARAMETER, not only a local
+        // variable (CASE 110's own scope) -- `read_next()`'s own `p`
+        // holds the exact SAME real runtime address `main()`'s own `p`
+        // does (an ordinary pass-by-value copy of an address, unchanged
+        // since Milestone 72), so `*(p + 1)` inside the CALLEE must reach
+        // `y`'s own real stack slot in the CALLER's frame, exactly the
+        // same real cross-function aliasing Milestone 96/104's own CASE
+        // 96/104 already established for `p[idx]`/`*p`, now proven for
+        // arithmetic-computed addresses specifically. A pre-fix build
+        // (this milestone's own committed Milestone 115 baseline, where
+        // `is_int_ptr` is unconditionally 0 for every parameter) would
+        // compute an unaligned, off-by-one-byte address instead (the
+        // unscaled `rbp-16 + 1`), reading garbage rather than the clean
+        // `111` this case expects.
+        //   int read_next(int *p) { return *(p + 1); }
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *p; p = &x;
+        //       return read_next(p) == 111;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC114: &[u8] = b"int read_next(int *p) { return *(p + 1); } int main() { int y; int x; y = 111; x = 222; int *p; p = &x; return read_next(p) == 111; }";
+        let case114_result = compile_and_run_program_callable(SRC114.as_ptr() as u64, SRC114.len() as u64);
+        w(b"  case114 (int* pointer arithmetic scales AND aliases correctly through a PARAMETER, in-process) returned=");
+        if let Some(r) = case114_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case114_ok = case114_result == Some(1);
+        write_check(b"case114_int_ptr_plus_through_param_returns_1=", case114_ok);
+
+        w(b"\n");
+
+        // CASE 115: the same real proof as CASE 114, but for a DECAYED
+        // ARRAY base passed as the argument (`is_array`, a genuinely
+        // separate `ptr_operand_scale()` classification branch from CASE
+        // 114's own `int *` local variable) and `-` instead of `+` --
+        // `read_prev()`'s own `p` parameter must recognize `is_int_ptr`
+        // regardless of whether the CALLER's own argument expression was
+        // a plain `int *` variable or a just-decayed array name; `ip`
+        // decays to `&arr[0]`, `read_prev(ip)` passes that address by
+        // value, and `p - 1` inside the callee must reach `arr[1]`'s own
+        // real address (this compiler's own downward-growing array
+        // layout, Milestone 115's own disclosure, unchanged).
+        //   int read_prev(int *p) { return *(p - 1); }
+        //   int main() {
+        //       int arr[3];
+        //       arr[0] = 1; arr[1] = 2; arr[2] = 3;
+        //       int *ip; ip = arr;
+        //       return read_prev(ip) == 2;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC115: &[u8] = b"int read_prev(int *p) { return *(p - 1); } int main() { int arr[3]; arr[0] = 1; arr[1] = 2; arr[2] = 3; int *ip; ip = arr; return read_prev(ip) == 2; }";
+        let case115_result = compile_and_run_program_callable(SRC115.as_ptr() as u64, SRC115.len() as u64);
+        w(b"  case115 (decayed array base pointer arithmetic scales through a PARAMETER via `-`, in-process) returned=");
+        if let Some(r) = case115_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case115_ok = case115_result == Some(1);
+        write_check(b"case115_array_decay_minus_through_param_returns_1=", case115_ok);
+
+        w(b"\n");
+
+        // CASE 116: a real, deliberate VERIFICATION case, not a new fix --
+        // `char *` pointer arithmetic through a PARAMETER was ALREADY
+        // reachable the moment Milestone 115 landed (`is_char_ptr` was
+        // already threaded into a parameter's own `VarSlot` since
+        // Milestone 113, unaffected by Milestone 115's own `is_int_ptr`-
+        // specific gap), but Milestone 115 itself never exercised that
+        // exact combination with a dedicated case. This case closes that
+        // real, disclosed verification gap and, just as importantly,
+        // proves this milestone's own new `int *`-parameter fix did NOT
+        // accidentally regress the already-correct `char *`-parameter
+        // path (a plausible bug shape: threading `is_int_ptr` incorrectly
+        // could have clobbered `is_char_ptr` in the same `VarSlot`
+        // construction). `at_next()` deliberately returns `int`, not
+        // `char` (`is_char_return == false`), so the function's own
+        // return-value narrowing cannot interact with or mask this case's
+        // own result -- `p + 8` (byte-scaled, `is_char_ptr` on the
+        // PARAMETER `p`) must reach `d`'s own real slot, and the
+        // dereference itself stays un-narrowed (`p + 8` is a real
+        // `EXPR_BINARY`, not the plain `EXPR_IDENT` shape `OP_DEREF`'s own
+        // narrowing check requires, the same disclosed restriction CASE
+        // 113 already proved), so the comparison is against the real,
+        // un-narrowed `200`.
+        //   int at_next(char *p) { return *(p + 8); }
+        //   int main() {
+        //       char d; char c;
+        //       d = 200; c = 3;
+        //       char *p; p = &c;
+        //       return at_next(p) == 200;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC116: &[u8] = b"int at_next(char *p) { return *(p + 8); } int main() { char d; char c; d = 200; c = 3; char *p; p = &c; return at_next(p) == 200; }";
+        let case116_result = compile_and_run_program_callable(SRC116.as_ptr() as u64, SRC116.len() as u64);
+        w(b"  case116 (char* pointer arithmetic through a PARAMETER, verification only + no regression on int* fix, in-process) returned=");
+        if let Some(r) = case116_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case116_ok = case116_result == Some(1);
+        write_check(b"case116_char_ptr_plus_through_param_returns_1=", case116_ok);
+
+        w(b"\n");
+
+        let overall_m116 = case114_ok && case115_ok && case116_ok;
+        w(b"OVERALL_M116=");
+        w(if overall_m116 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 { 0 } else { 1 });
     }
 }
 

@@ -1819,6 +1819,78 @@
 // mixed-declarator list; no `p++`/`p--`; pointer-pointer subtraction still
 // not implemented. Everything else Milestone 119 disclosed as open
 // remains unchanged, unrelated to this milestone.
+//
+// MILESTONE 121: pointer arithmetic on an `int **` itself -- `pp + n`,
+// `n + pp`, and `pp - n` -- is now real, closing the exact gap Milestone
+// 118 first named ("pointer arithmetic on an `int **` itself ... is NOT
+// recognized by `ptr_operand_scale()`") and Milestone 119/120 each
+// re-confirmed still open. The fix is exactly one new disjunct in
+// `ptr_operand_scale()`'s own classification match arm: `is_int_ptr_ptr
+// != 0` is added alongside the pre-existing `is_array != 0 || is_int_ptr
+// != 0` check that already selects `Some(8)`, and the comment block that
+// used to explain why `_is_int_ptr_ptr` was deliberately ignored there is
+// removed since it no longer is. See `ptr_operand_scale()`'s own updated
+// doc comment for the full derivation.
+//
+// A real, honest observation this milestone's own investigation turned
+// up, not something engineered to look tidy in hindsight: `is_int_ptr_ptr`
+// was already fully threaded everywhere `ptr_operand_scale()` itself reads
+// from -- `VarSlot.is_int_ptr_ptr` for a LOCAL `int **` (Milestone 118)
+// and `ParamInfo.is_int_ptr_ptr`, threaded into the parameter's own
+// `VarSlot` by `collect_vars_for_function()` (Milestone 119), for an
+// `int **` PARAMETER -- before this milestone touched a single line. That
+// is genuinely different from `is_int_ptr` itself, which needed TWO
+// separate milestones to reach the same place (115 added `int *`
+// arithmetic for a local only, since `ptr_operand_scale()` and
+// `VarSlot.is_int_ptr` did not exist before that milestone; 116 then
+// closed the parameter half once `ParamInfo.is_int_ptr` existed). Here,
+// both prerequisites were already in place, so this ONE fix -- unlike
+// `is_int_ptr`'s own two-milestone arc -- unlocks pointer arithmetic on
+// `int **` for a local variable, a parameter, AND (transitively, since
+// `ptr_operand_scale()` only ever inspects an `EXPR_IDENT` operand's own
+// declared `VarSlot` flags, never how that slot's value was populated) a
+// local `int **q` populated from an `int **` RETURN value (Milestone
+// 120), all in the same milestone. `EXPR_BINARY`'s own `+`/`-` codegen
+// (Milestone 115) needs -- and receives -- ZERO code change: it already
+// consumes `ptr_operand_scale()`'s `Option<u8>` result generically,
+// with no awareness of which `VarSlot` field produced the `Some(8)`, the
+// same "combine, don't invent" precedent Milestone 118's own zero-codegen
+// rvalue paragraph already established one level of indirection lower.
+// Zero new x86_64 encodings.
+//
+// New self-test cases CASE 126 (`pp + 1` through a local `int **`, the
+// pointer on the LEFT, scaling RCX via the pre-existing
+// `emit_shl_rcx_imm8()`) and CASE 127 (`1 + pp`, the pointer on the
+// RIGHT, scaling RAX via the pre-existing `emit_shl_rax_imm8()` --
+// Milestone 115's own two genuinely distinct operand-order code paths,
+// now both exercised for `int **` too) hand-verify the real fix; CASE 128
+// (an `int **` PARAMETER, `**(pp + 1)`, crossing a real function-call
+// boundary) is a real, deliberate VERIFICATION case, not a second fix --
+// proving the SAME one-line change already reaches the parameter case too,
+// exactly as this milestone's own paragraph above predicts, rather than
+// needing its own dedicated follow-up milestone the way `is_int_ptr`
+// did; CASE 129 (a `char *` and an `int **` both doing pointer
+// arithmetic in the SAME expression) is a second VERIFICATION case,
+// proving the new `is_int_ptr_ptr != 0` disjunct did not disturb
+// `ptr_operand_scale()`'s own pre-existing `is_char_ptr` branch (scale 1,
+// not 8) -- the same "zero cross-contamination between coexisting
+// pointer classifications" standard Milestone 109's own CASE 109 already
+// established for indexing.
+//
+// Still genuinely open after this milestone: `int **` pointer-pointer
+// SUBTRACTION (`pp1 - pp2`, real C's own element-count-difference meaning)
+// is still not implemented -- the same real, disclosed gap Milestone 115
+// itself named for `int *`/`char *` and never closed for any pointer
+// depth; `EXPR_INDEX` (`pp[1]`) was NOT touched or newly verified by this
+// milestone -- it has its own separate, older classification (Milestone
+// 108/114) that scales by 8 for anything not `is_char_ptr`, already
+// ignoring `is_int_ptr`/`is_int_ptr_ptr` as a distinction before this
+// milestone existed, so it is plausible `pp[1]` already worked, but this
+// milestone does not add a dedicated case proving it and is not claiming
+// it as a fix; no `char **` of any kind; no `int ***` or deeper; no `int
+// **p, *q;` mixed-declarator list; no `p++`/`p--`. Everything else
+// Milestone 120 disclosed as open remains unchanged, unrelated to this
+// milestone.
 #![no_std]
 #![no_main]
 
@@ -5631,21 +5703,30 @@ unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, iden
 /// matching `is_int_ptr` gap Milestone 115's own closing disclosure
 /// named), this function needs -- and receives -- ZERO code change to
 /// pick it up.
+/// MILESTONE 121: `is_int_ptr_ptr` is no longer ignored -- an `int **`
+/// variable's own arithmetic (`p + 1` where `p` is `int **`) is now
+/// recognized too, closing the real, disclosed gap Milestone 118/119/120
+/// each named in turn ("pointer arithmetic on an `int **` itself ...
+/// is NOT recognized by `ptr_operand_scale()`"). Scaled by 8, the exact
+/// same value `is_int_ptr`/`is_array` already use -- an `int **`'s own
+/// pointee is an `int *` value, itself stored in one 8-byte `VarSlot`
+/// cell, the identical "one element == one 8-byte stack-slot's worth of
+/// address space" reasoning this function already applies to `int *`
+/// and a decayed array base, now extended one level of indirection
+/// further. See this file's own top Milestone 121 doc comment for why a
+/// SINGLE one-line change here, not two separate milestones the way
+/// `is_int_ptr` itself needed (115 local, 116 parameter), is enough to
+/// unlock this for both a local `int **` AND an `int **` parameter at
+/// once.
 unsafe fn ptr_operand_scale(src_ptr: u64, vars_ptr: u64, nvars: u64, node: &ExprNode) -> Option<u8> {
     if node.kind != EXPR_IDENT {
         return None;
     }
     match unsafe { find_var(src_ptr, vars_ptr, nvars, node.ident_off as u64, node.ident_len as u64) } {
-        // MILESTONE 118: `_is_int_ptr_ptr` is deliberately ignored here --
-        // an `int **` variable's own arithmetic (`p + 1` where `p` is
-        // `int **`) is NOT recognized by this milestone (see this file's
-        // own top Milestone 118 doc comment's "Scope" paragraph); it
-        // falls through to `None` (unscaled), the same real, disclosed
-        // gap `int *` itself had here between Milestone 109 and 115.
-        Some((_o, _is_char, is_array, is_char_ptr, is_int_ptr, _is_int_ptr_ptr)) => {
+        Some((_o, _is_char, is_array, is_char_ptr, is_int_ptr, is_int_ptr_ptr)) => {
             if is_char_ptr != 0 {
                 Some(1)
-            } else if is_array != 0 || is_int_ptr != 0 {
+            } else if is_array != 0 || is_int_ptr != 0 || is_int_ptr_ptr != 0 {
                 Some(8)
             } else {
                 None
@@ -13136,7 +13217,176 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m120 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 121: pointer arithmetic on an `int **` itself -- `pp +
+        // n`, `n + pp`, and `pp - n` -- is now real, closing the exact gap
+        // Milestone 118 first named and Milestone 119/120 each
+        // re-confirmed still open ("pointer arithmetic on an `int **`
+        // itself ... is NOT recognized by `ptr_operand_scale()`"). See
+        // this file's own top Milestone 121 doc comment and
+        // `ptr_operand_scale()`'s own updated doc comment for the full
+        // derivation -- one new disjunct (`is_int_ptr_ptr != 0`) in an
+        // existing classification match arm, zero new x86_64 encodings,
+        // zero `EXPR_BINARY` codegen change. All four cases run in-process
+        // (`CodegenMode::Callable`), the same tier Milestone 107 through
+        // 120 all already used for their own new cases -- no new real
+        // `fork()`/`exec()`/`wait()` cycle is added by this milestone.
+        //
+        // A note on WHICH addresses these cases hand-verify, the same
+        // "declaration-order stack layout" reliance Milestone 115's own
+        // top note first established for plain scalars: the Kth declared
+        // scalar (or pointer -- every `VarSlot`, regardless of declared
+        // type, occupies exactly one 8-byte cell) lands at `rbp - 8*K`, so
+        // real, hardware-correct ADDRESS-INCREASING `pp + 1` reaches
+        // whichever `int *` was declared IMMEDIATELY BEFORE `pp`'s own
+        // pointee in source order.
+        //
+        // CASE 126: the real, distinguishing proof that `pp + 1` (the
+        // pointer on the LEFT) genuinely scales an `int **` by 8, not 0
+        // (unscaled): `py` declared 3rd (`rbp-24`), `px` 4th (`rbp-32`);
+        // `pp = &px` (`rbp-32`); `pp + 1` must reach `rbp-32 + 1*8 ==
+        // rbp-24`, exactly `py`'s own slot -- which itself holds `&y`, so
+        // one more real dereference (`*(pp + 1)`, i.e. `py`'s own value)
+        // must reach `y`. A pre-fix build (this milestone's own committed
+        // Milestone 120 baseline, no `int **` scaling at all) would
+        // instead compute `rbp-32 + 1 == rbp-31`, an unaligned, real-but-
+        // wrong address one byte into the middle of `py`'s own slot.
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *py; int *px;
+        //       py = &y; px = &x;
+        //       int **pp; pp = &px;
+        //       return **(pp + 1) == 111;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC126: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *py; int *px; py = &y; px = &x; int **pp; pp = &px; return **(pp + 1) == 111; }";
+        let case126_result = compile_and_run_program_callable(SRC126.as_ptr() as u64, SRC126.len() as u64);
+        w(b"  case126 (pp + 1 through int** scales by 8, pointer on the left, double-deref reaches the adjacent int*'s own pointee, in-process) returned=");
+        if let Some(r) = case126_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case126_ok = case126_result == Some(1);
+        write_check(b"case126_int_ptr_ptr_plus_scales_by_8_returns_1=", case126_ok);
+
+        w(b"\n");
+
+        // CASE 127: the real, distinguishing proof that `1 + pp` (the
+        // pointer on the RIGHT, real C's own commutative spelling) ALSO
+        // scales correctly -- the genuinely distinct code path (scaling
+        // RAX via `emit_shl_rax_imm8()`, not RCX) CASE 126 alone does not
+        // exercise: a bug that scaled only the pointer-on-the-left shape
+        // would still pass CASE 126 but fail here, since RCX holds `pp`'s
+        // OWN value in this operand order, not the integer `1`.
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *py; int *px;
+        //       py = &y; px = &x;
+        //       int **pp; pp = &px;
+        //       return **(1 + pp) == 111;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC127: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *py; int *px; py = &y; px = &x; int **pp; pp = &px; return **(1 + pp) == 111; }";
+        let case127_result = compile_and_run_program_callable(SRC127.as_ptr() as u64, SRC127.len() as u64);
+        w(b"  case127 (1 + pp through int** scales by 8, pointer on the right, exercises emit_shl_rax_imm8, in-process) returned=");
+        if let Some(r) = case127_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case127_ok = case127_result == Some(1);
+        write_check(b"case127_int_plus_ptr_ptr_scales_by_8_returns_1=", case127_ok);
+
+        w(b"\n");
+
+        // CASE 128: a real, deliberate VERIFICATION case, not a second
+        // fix -- proves this milestone's own single one-line change in
+        // `ptr_operand_scale()` already reaches an `int **` PARAMETER too,
+        // through a real function-call boundary, exactly as this
+        // milestone's own top doc comment predicts (unlike `is_int_ptr`,
+        // which needed a dedicated follow-up milestone, 116, to close the
+        // identical parameter gap). `pp` inside `read_adjacent_pp()` holds
+        // `&px` from the CALLER's own frame; `pp + 1` must reach the
+        // caller's own `py` slot (declared immediately before `px`), and
+        // `**(pp + 1)` must reach THROUGH both real levels of indirection
+        // from inside the callee to land on the caller's own `y`.
+        //   int read_adjacent_pp(int **pp) { return **(pp + 1); }
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *py; int *px;
+        //       py = &y; px = &x;
+        //       return read_adjacent_pp(&px);
+        //   }
+        // Hand-computed: 111.
+        // -------------------------------------------------------------
+        const SRC128: &[u8] = b"int read_adjacent_pp(int **pp) { return **(pp + 1); } int main() { int y; int x; y = 111; x = 222; int *py; int *px; py = &y; px = &x; return read_adjacent_pp(&px); }";
+        let case128_result = compile_and_run_program_callable(SRC128.as_ptr() as u64, SRC128.len() as u64);
+        w(b"  case128 (int** PARAMETER pointer arithmetic through a call boundary, verification the same one-line fix reaches parameters too, in-process) returned=");
+        if let Some(r) = case128_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 111)\n");
+        let case128_ok = case128_result == Some(111);
+        write_check(b"case128_int_ptr_ptr_param_arithmetic_through_call_returns_111=", case128_ok);
+
+        w(b"\n");
+
+        // CASE 129: a second real, deliberate VERIFICATION case -- proves
+        // the new `is_int_ptr_ptr != 0` disjunct did NOT disturb
+        // `ptr_operand_scale()`'s own pre-existing `is_char_ptr` branch
+        // (scale 1, checked FIRST in the if/else chain) -- a `char *` and
+        // an `int **` both doing real pointer arithmetic in the SAME
+        // expression, the same "zero cross-contamination between
+        // coexisting pointer classifications" standard Milestone 109's own
+        // CASE 109 already established for indexing, applied here to
+        // arithmetic for the first time across three distinct pointer
+        // depths. `cp + 8` (byte-scaled) must still reach `d`; `**(pp + 1)`
+        // (8-scaled, two real levels) must still reach `y`.
+        //   int main() {
+        //       char d; char c;
+        //       d = 200; c = 3;
+        //       char *cp; cp = &c;
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *py; int *px;
+        //       py = &y; px = &x;
+        //       int **pp; pp = &px;
+        //       return (*(cp + 8) == 200) + (**(pp + 1) == 111) * 10;
+        //   }
+        // Hand-computed: 1 + 10 = 11.
+        // -------------------------------------------------------------
+        const SRC129: &[u8] = b"int main() { char d; char c; d = 200; c = 3; char *cp; cp = &c; int y; int x; y = 111; x = 222; int *py; int *px; py = &y; px = &x; int **pp; pp = &px; return (*(cp + 8) == 200) + (**(pp + 1) == 111) * 10; }";
+        let case129_result = compile_and_run_program_callable(SRC129.as_ptr() as u64, SRC129.len() as u64);
+        w(b"  case129 (char* scale-1 and int** scale-8 arithmetic coexist with zero cross-contamination, in-process) returned=");
+        if let Some(r) = case129_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case129_ok = case129_result == Some(11);
+        write_check(b"case129_char_ptr_and_int_ptr_ptr_arithmetic_coexist_returns_11=", case129_ok);
+
+        w(b"\n");
+
+        let overall_m121 = case126_ok && case127_ok && case128_ok && case129_ok;
+        w(b"OVERALL_M121=");
+        w(if overall_m121 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 { 0 } else { 1 });
     }
 }
 

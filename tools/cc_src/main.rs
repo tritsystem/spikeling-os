@@ -1761,6 +1761,64 @@
 // implemented, this compiler's return type still being exactly `int`/
 // `char`) -- see this file's own top-level Milestone 119 disclosure in
 // `README.md` for the complete, current list.
+//
+// MILESTONE 120: an `int **` RETURN value -- `int **f(...)` -- is now
+// real, closing the exact other half of the gap Milestone 119's own
+// closing disclosure named ("an `int **` RETURN value is still not
+// implemented"). `parse_function()`'s own `int` return-type branch
+// (already extended for a single `*` by Milestone 110) now accepts a
+// SECOND immediate `*` too, mirroring `parse_params()`'s own two-star
+// lookahead (Milestone 119) and `parse_stmt()`'s own declaration-site
+// two-star lookahead (Milestone 118) at the one remaining grammar
+// position that had not yet been extended.
+//
+// The real, honest surprise -- though by this point a well-established
+// pattern, not a fresh one: this needs NO new `FuncDef` field and ZERO
+// codegen change anywhere, on EITHER side of the call boundary.
+// `STMT_RETURN`'s own codegen has only ever asked one question --
+// `is_char_return` -- and that question was already, transitively,
+// answered correctly for two levels of pointer indirection the moment it
+// was answered correctly for one (Milestone 110): a pointer return of any
+// depth must never be narrowed, RAX already holds the exact right 8-byte
+// value regardless of how many stars its declared type has. And on the
+// CALLING side, `EXPR_CALL`'s own codegen has NEVER consulted the
+// callee's `is_char_return` at all -- only the callee's own
+// `STMT_RETURN` does, for its own narrowing decision -- so a caller
+// storing a call's result into a local `int **q` (Milestone 118) and
+// reading or writing through it with `**q` (Milestone 118's own
+// `STMT_ASSIGN_DEREF2`) was ALREADY fully correct the instant `int **`
+// locals and `int **` parameters both existed; this milestone's only
+// real, new work is the one missing token of lookahead in exactly one
+// grammar position. `MAX_PARAMS`/`sizeof`/self-test-leak items and
+// `evidence_gate.rs` having exactly two real subscribers are unrelated to
+// this milestone and remain exactly as Milestone 119 left them -- pure
+// compiler-frontend work, correctly no SNN/evidence-gate angle here, the
+// same carve-out Milestone 107 through 119's own pure-frontend milestones
+// already established.
+//
+// New self-test cases CASE 123 (an `int **` RETURN value, `**q` as an
+// RVALUE after the call result is stored into a local `int **`) and CASE
+// 124 (the same shape, `**q = expr;` as an LVALUE reaching back into the
+// real caller's own stack slot) hand-verify the real fix; CASE 125 (a
+// single-star `int *` return AND a two-star `int **` return coexisting in
+// the SAME program, used together in one expression) is a real,
+// deliberate VERIFICATION-only case, not a new fix -- proving
+// `parse_function()`'s own extended lookahead did not regress the
+// pre-existing single-star return path.
+//
+// Still genuinely open after this milestone: no `char **` of any kind
+// (only `int **`, return value included -- this branch is deliberately
+// `int`-only, mirroring `parse_double_pointer_decl()`'s own `int`-only
+// restriction); no `int ***` or deeper, as a return type, parameter, or
+// local (a third `*` here falls through to `self.expect(TOK_IDENT)` and
+// is rejected as an ordinary parse error, not silently accepted or
+// truncated); no pointer arithmetic on an `int **` of any kind, return
+// value included (`ptr_operand_scale()` still does not recognize
+// `is_int_ptr_ptr` -- the same real, disclosed gap Milestone 118/119 each
+// already named, now also true of a returned `int **`); no `int **p, *q;`
+// mixed-declarator list; no `p++`/`p--`; pointer-pointer subtraction still
+// not implemented. Everything else Milestone 119 disclosed as open
+// remains unchanged, unrelated to this milestone.
 #![no_std]
 #![no_main]
 
@@ -4632,8 +4690,44 @@ impl Parser {
             // here (this branch's existing value) after consuming the
             // token is the complete, correct implementation -- accepting
             // the grammar is the entire feature.
+            //
+            // MILESTONE 120: a SECOND immediate `*` marks a two-level
+            // `int **` return type -- `int **f(...)`, the exact gap
+            // Milestone 119's own closing disclosure named ("an `int **`
+            // RETURN value is still not implemented"). The identical
+            // reasoning applies transitively: `STMT_RETURN`'s own codegen
+            // narrows if AND ONLY IF `is_char_return` is set, and RAX
+            // already holds the correct raw 8-byte pointer value coming
+            // out of the return expression regardless of how many levels
+            // of indirection that pointer has -- narrowing would be
+            // exactly as wrong for an `int **` return as it already is
+            // for an `int *` return, so leaving `is_char_return` false
+            // here after consuming BOTH tokens is, again, the complete,
+            // correct implementation. No new `FuncDef` field, no new
+            // codegen anywhere: `EXPR_CALL`'s own codegen (the call site)
+            // has never consulted the callee's `is_char_return` at all --
+            // only the callee's OWN `STMT_RETURN` does, for its own
+            // narrowing decision -- so a caller storing this function's
+            // result into a local `int **q` and dereferencing through it
+            // (`**q`) was already reachable the moment `int **q;` local
+            // declarations (Milestone 118) and `int **` PARAMETERS
+            // (Milestone 119) existed; this milestone's only real, new
+            // work is accepting the SECOND `*` in this one grammar
+            // position. Deliberately narrow, mirroring every earlier
+            // pointer-return step (`char *` return stayed single-star
+            // only, Milestone 113; this branch itself stays `int`-only,
+            // no `char **`): a THIRD `*` (`int ***f(...)`) is not
+            // consumed here and falls through to `self.expect(TOK_IDENT)`
+            // just below, which will reject it as an ordinary
+            // `UnexpectedToken` parse error -- the same "no `int ***`, no
+            // deeper" restriction Milestone 118 already established for
+            // local variables and Milestone 119 for parameters, now also
+            // true of the return-type grammar position.
             if unsafe { self.peek() }.kind == TOK_STAR {
                 unsafe { self.advance() };
+                if unsafe { self.peek() }.kind == TOK_STAR {
+                    unsafe { self.advance() };
+                }
             }
             false
         };
@@ -12913,7 +13007,136 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m119 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 { 0 } else { 1 });
+        // -------------------------------------------------------------
+        // MILESTONE 120: an `int **` RETURN value -- `int **f(...)` -- is
+        // now real, closing the exact other half of the gap Milestone
+        // 119's own closing disclosure named ("an `int **` RETURN value is
+        // still not implemented"). `parse_function()`'s own `int`
+        // return-type branch (single-star since Milestone 110) now accepts
+        // a SECOND immediate `*` too, the one remaining grammar position
+        // `parse_stmt()` (118) and `parse_params()` (119) had already been
+        // extended at. No new `FuncDef` field, no codegen change on EITHER
+        // side of the call boundary: `STMT_RETURN` has only ever asked
+        // `is_char_return`, already correctly `false` for any pointer
+        // depth (Milestone 110's own reasoning transfers unchanged), and
+        // `EXPR_CALL`'s own codegen has never consulted the callee's
+        // return-type flag at all. A caller storing a call's result into a
+        // local `int **q` and reading/writing through `**q` was already
+        // correct the moment `int **` locals (118) and `int **` parameters
+        // (119) existed; the only real new work is the missing token of
+        // lookahead. All three cases run in-process
+        // (`CodegenMode::Callable`), the same tier every prior pointer
+        // milestone used for its own new cases -- no new real
+        // `fork()`/`exec()`/`wait()` cycle is added by this milestone.
+        //
+        // CASE 123: the real, distinguishing proof that an `int **`
+        // RETURN value crosses the call boundary un-corrupted and is
+        // usable as an RVALUE through a real double dereference --
+        // `identity_pp()` returns its own `int **` parameter unchanged,
+        // the result is stored into a local `int **q` (Milestone 118's own
+        // declarator), and `**q` must reach `x`'s own real value THROUGH
+        // TWO real levels of indirection, mirroring Milestone 113's own
+        // CASE 105 (a `char *` return, one level) now for a two-level `int
+        // **` return.
+        //   int **identity_pp(int **pp) { return pp; }
+        //   int main() {
+        //       int x; int *p; int **q;
+        //       x = 77;
+        //       p = &x;
+        //       q = identity_pp(&p);
+        //       return **q;
+        //   }
+        // Hand-computed: 77.
+        // -------------------------------------------------------------
+        const SRC123: &[u8] = b"int **identity_pp(int **pp) { return pp; } int main() { int x; int *p; int **q; x = 77; p = &x; q = identity_pp(&p); return **q; }";
+        let case123_result = compile_and_run_program_callable(SRC123.as_ptr() as u64, SRC123.len() as u64);
+        w(b"  case123 (int** RETURN value crosses a call boundary, **q READ through the stored result, in-process) returned=");
+        if let Some(r) = case123_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 77)\n");
+        let case123_ok = case123_result == Some(77);
+        write_check(b"case123_int_ptr_ptr_return_value_double_deref_read_returns_77=", case123_ok);
+
+        w(b"\n");
+
+        // CASE 124: the write-side mirror of CASE 123 -- `**q = 99;`
+        // (Milestone 118's own `STMT_ASSIGN_DEREF2`) through a local `int
+        // **q` populated from an `int **` RETURN value must reach THROUGH
+        // both real levels of indirection and land on `x`'s own real stack
+        // slot, not merely inside a copy. `dummy` is unused here (unlike
+        // CASE 121, `q = identity_pp(&p);` is itself a legal `TOK_IDENT
+        // "=" ...` assignment statement, so no bare-call-as-statement
+        // workaround is needed for the call itself).
+        //   int **identity_pp(int **pp) { return pp; }
+        //   int main() {
+        //       int x; int *p; int **q;
+        //       x = 5;
+        //       p = &x;
+        //       q = identity_pp(&p);
+        //       **q = 99;
+        //       return x;
+        //   }
+        // Hand-computed: 99.
+        // -------------------------------------------------------------
+        const SRC124: &[u8] = b"int **identity_pp(int **pp) { return pp; } int main() { int x; int *p; int **q; x = 5; p = &x; q = identity_pp(&p); **q = 99; return x; }";
+        let case124_result = compile_and_run_program_callable(SRC124.as_ptr() as u64, SRC124.len() as u64);
+        w(b"  case124 (int** RETURN value crosses a call boundary, **q WRITE reaches the real caller slot, in-process) returned=");
+        if let Some(r) = case124_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 99)\n");
+        let case124_ok = case124_result == Some(99);
+        write_check(b"case124_int_ptr_ptr_return_value_double_deref_write_returns_99=", case124_ok);
+
+        w(b"\n");
+
+        // CASE 125: a real, deliberate VERIFICATION case, not a new fix --
+        // proves `parse_function()`'s own extended two-star lookahead did
+        // NOT regress the pre-existing single-star `int *` return path
+        // (Milestone 110), by declaring BOTH an `int *`-returning function
+        // and an `int **`-returning function in the SAME program and using
+        // both results together in one expression -- the return-type
+        // mirror of CASE 122's own parameter-side coexistence check.
+        //   int *identity_p(int *p) { return p; }
+        //   int **identity_pp(int **pp) { return pp; }
+        //   int main() {
+        //       int a; int *ap; int **app; int *rp; int **rpp;
+        //       a = 10;
+        //       ap = &a;
+        //       app = &ap;
+        //       rp = identity_p(ap);
+        //       rpp = identity_pp(app);
+        //       return *rp + **rpp;
+        //   }
+        // Hand-computed: rp == ap (address of a), so *rp == a == 10.
+        // rpp == app (address of ap), so *rpp == ap and **rpp == a == 10.
+        // Total: 20.
+        // -------------------------------------------------------------
+        const SRC125: &[u8] = b"int *identity_p(int *p) { return p; } int **identity_pp(int **pp) { return pp; } int main() { int a; int *ap; int **app; int *rp; int **rpp; a = 10; ap = &a; app = &ap; rp = identity_p(ap); rpp = identity_pp(app); return *rp + **rpp; }";
+        let case125_result = compile_and_run_program_callable(SRC125.as_ptr() as u64, SRC125.len() as u64);
+        w(b"  case125 (a single-star int* return AND a two-star int** return coexist correctly in one program, verification only, in-process) returned=");
+        if let Some(r) = case125_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 20)\n");
+        let case125_ok = case125_result == Some(20);
+        write_check(b"case125_int_ptr_and_int_ptr_ptr_returns_coexist_returns_20=", case125_ok);
+
+        w(b"\n");
+
+        let overall_m120 = case123_ok && case124_ok && case125_ok;
+        w(b"OVERALL_M120=");
+        w(if overall_m120 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 { 0 } else { 1 });
     }
 }
 

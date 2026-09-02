@@ -9629,6 +9629,164 @@ self-test suite, genuinely open for a future pass.
       having exactly two real subscribers) remains unchanged, unrelated to
       this milestone.
 
+- [x] **Milestone 120**: an `int **` RETURN value -- `int **f(...)` -- is
+      now real (`tools/cc_src/main.rs`), closing the exact other half of the
+      gap Milestone 119's own closing disclosure named ("an `int **` RETURN
+      value is still not implemented, this compiler's return type still
+      being exactly `int`/`char`").
+
+      **The fix is one more token of lookahead in one grammar position,
+      nothing else**: `parse_function()`'s own `int` return-type branch
+      already accepted an optional single `*` since Milestone 110 (`int
+      *f(...)`); this milestone extends it to accept a SECOND immediate `*`
+      too, mirroring `parse_stmt()`'s own two-star declaration-site
+      lookahead (Milestone 118) and `parse_params()`'s own two-star
+      parameter lookahead (Milestone 119) at the one remaining place in the
+      grammar that had not yet been extended. Deliberately narrow, matching
+      every earlier pointer-return step: `int`-only (no `char **` -- there
+      is no `char **` anywhere in this subset, the same restriction
+      `parse_double_pointer_decl()` and Milestone 119's own parameter fix
+      both already carry), and a third `*` (`int ***f(...)`) is not consumed
+      here -- it falls straight through to `self.expect(TOK_IDENT)`, which
+      rejects it as an ordinary `UnexpectedToken` parse error, the same "no
+      `int ***`, no deeper" restriction Milestone 118/119 already
+      established for locals and parameters, now also true of the
+      return-type position.
+
+      **No new `FuncDef` field, and -- genuinely, not just "we got lucky" --
+      zero codegen change anywhere, on EITHER side of the call boundary**:
+      `STMT_RETURN`'s own codegen has only ever asked one question,
+      `is_char_return`, and that question was already answered correctly
+      for two levels of pointer indirection the moment it was answered
+      correctly for one (Milestone 110's own reasoning transfers completely
+      unchanged -- a pointer return of any depth must never be narrowed, RAX
+      already holds the right raw 8-byte value regardless of how many stars
+      its declared type has). And on the CALLING side, `EXPR_CALL`'s own
+      codegen has never consulted the callee's `is_char_return` at all --
+      only the callee's OWN `STMT_RETURN` does, purely for its own narrowing
+      decision -- so a caller storing a call's result into a local `int
+      **q` (Milestone 118's own declarator) and reading or writing through
+      it with `**q` (Milestone 118's own `STMT_ASSIGN_DEREF2`) was ALREADY
+      fully correct the instant `int **` locals and `int **` parameters
+      both existed as real features; this milestone's only real, new work
+      is the missing token of lookahead. Zero new x86_64 encodings.
+
+      **New self-test cases**, all three run in-process
+      (`CodegenMode::Callable`), the same tier every prior pointer milestone
+      used for its own new cases -- no new real `fork()`/`exec()`/`wait()`
+      cycle is added by this milestone: CASE 123 (`int **identity_pp(int
+      **pp) { return pp; }`, its result stored into a local `int **q`, then
+      `**q` read as an RVALUE -- the real, distinguishing proof that an
+      `int **` RETURN value crosses the call boundary un-corrupted and
+      reaches the caller's own real value through TWO real levels of
+      indirection, the return-type mirror of Milestone 113's own CASE 105
+      for a `char *` return, one level; expected `77`); CASE 124 (the
+      write-side mirror -- `**q = 99;` through a local `int **q` populated
+      from an `int **` RETURN value must reach THROUGH both real levels of
+      indirection and land on the caller's own real stack slot, not merely
+      inside a copy; expected `99`); CASE 125 (a real, deliberate
+      VERIFICATION case, not a new fix -- an `int *`-returning function
+      AND an `int **`-returning function declared in the SAME program, both
+      results used together in one expression, proving
+      `parse_function()`'s own extended two-star lookahead did not regress
+      the pre-existing single-star `int *` return path, the return-type
+      mirror of CASE 122's own parameter-side coexistence check; expected
+      `20`).
+
+      **No SNN/evidence-gate work this milestone, and correctly so**: this
+      is pure compiler-frontend work -- one extra token of lookahead in one
+      grammar position, zero new fields, zero new codegen -- with no kernel
+      subsystem decision anywhere in it for an evidence-gated hysteresis
+      gate to meaningfully subscribe to. The same carve-out Milestone 107
+      through 119's own pure-frontend milestones already established.
+
+      **`cargo build` clean from the repo root (kernel + host runner, zero
+      warnings)**. `kernel/assets/cc.elf` rebuilt via the project's own
+      pinned-nightly `rustc` recipe (`tools/cc_src/README.md`, unchanged) --
+      108512 bytes, up from Milestone 119's 106784; the real `PT_LOAD`
+      `p_memsz` via `readelf -l` is 93432 bytes, still 23 pages (the same
+      page count as Milestone 119, just more bytes within it) --
+      comfortably under the 64-page per-segment cap and 128-page total cap,
+      no cap change needed. The rebuilt `cc.elf` was independently
+      re-derived from the current `main.rs` via a from-scratch second
+      invocation of the exact same recipe and diffed byte-for-byte identical
+      against the committed binary (`cmp`, not eyeballed). **Zero new
+      compiler warnings** -- verified the same way every prior milestone
+      verified its own: reproducing the standalone `rustc` invocation
+      against the project's own pre-Milestone-120 committed baseline (via
+      `git stash`) and diffing the sorted warning list against this
+      milestone's own build -- the same 16 warnings, same names, same
+      messages; only their line numbers shifted (this milestone's own ~90
+      lines of new top-of-file doc comment pushed every later line down),
+      confirmed by diffing the warning TEXT with line numbers stripped, not
+      merely eyeballed.
+
+      Two real QEMU boots against a genuinely fresh disk (`target/
+      persist.img`/`persist2.img` deleted first), `cargo run -- bios`,
+      fresh then reused (`m120_fresh_boot.log`/`m120_reused_boot.log`), no
+      stray `qemu-system-x86_64.exe` process before or after either boot
+      (checked via `tasklist`). Every marker was verified via a real script
+      this session wrote (not committed, matching every prior session's own
+      disclosed practice) that reconstructs the exact WRITE-syscall payload
+      stream from each raw serial log (concatenating every `milestone 31:
+      syscall WRITE ... raw bytes >>> ... <<< end of write` block using each
+      write's own declared byte length, correctly handling the real
+      split-marker fragmentation this project's own house style discloses
+      -- `OVERALL_M120=` and its own trailing `PASS` were confirmed to
+      arrive as two SEPARATE WRITE syscalls in this session's own fresh
+      boot, reassembled correctly), plus a direct raw-text scan for the
+      older direct-serial `milestone NN: self-test -- OVERALL: PASS` /
+      `fs self-test: <name> OVERALL=PASS` styles. Fresh boot: 198 total
+      distinct markers, every one `PASS`, zero `FAIL` -- CASE 123
+      returns `77`, CASE 124 returns `99`, CASE 125 returns `20`, all three
+      matching their hand-computed expectations exactly, confirmed by
+      reading the real `returned=... (expected ...)` text out of the
+      reconstructed stream, not merely trusting the boolean `case*_ok` flag.
+      Reused boot: the identical 54-line `fs self-test` FAIL set every
+      milestone since 70 has recorded (the Milestone-62-era
+      fixture-cleanup artifact), byte-for-byte identical in NAME and VALUE
+      to this session's own committed `m119_reused_boot.log` when diffed
+      directly (`diff`, not eyeballed) -- zero markers missing, zero newly
+      failing anywhere else. Diffing this milestone's own fresh/reused
+      boots against this session's own committed Milestone 119 fresh/reused
+      logs through the same script shows the ONLY difference on either boot
+      is the addition of `OVERALL_M120=PASS` plus the three new case
+      markers (194 -> 198 total markers on both boots, exactly +4) -- a
+      real, precise regression check, not eyeballed. Milestone 104/106's
+      own heap-pressure gate and Milestone 117's own scheduler-fairness gate
+      both came out byte-identical to their own recorded baselines on both
+      boots (`samples_taken=68 gate_trip_episodes=0
+      naive_instantaneous_hits=0 admissions_denied_so_far=0`;
+      `samples_taken=2400 trip_episodes=1`). `run_preemption_demo()`
+      completed on both boots with all three real task counters > 0 (fresh:
+      `task0=2512 task1=2567 task2=2827`; reused: `task0=2671 task1=2529
+      task2=2646` -- real inter-boot timing jitter, consistent with every
+      prior milestone's own two-boot pairs), zero `SKIPPED` lines on either
+      boot. Zero real `panicked at`/`kernel panicked`/`DOUBLE FAULT`/`TRIPLE
+      FAULT` in either log -- confirmed by direct `grep -c`, zero matches in
+      both (the five other raw `FAIL`/`FAILED` substring hits on the fresh
+      boot -- syscall-error-path self-tests for `READ`/`WAIT`/`SBRK`/
+      `GETPGID` plus Milestone 6's own "no keystrokes received" interactive
+      -shell line -- are the same pre-existing, already-disclosed lines
+      Milestone 119's own committed fresh boot log has too, byte-for-byte
+      identical content, not a new regression).
+
+      **Still genuinely open**: no `char **` of any kind (only `int **`,
+      return value included -- this branch is deliberately `int`-only,
+      mirroring `parse_double_pointer_decl()`'s own `int`-only restriction);
+      no `int ***` or deeper, as a return type, parameter, or local (a third
+      `*` here falls through to `self.expect(TOK_IDENT)` and is rejected as
+      an ordinary parse error, not silently accepted or truncated); no
+      pointer arithmetic on an `int **` of any kind, return value included
+      (`ptr_operand_scale()` still does not recognize `is_int_ptr_ptr` --
+      the same real, disclosed gap Milestone 118/119 each already named,
+      now also true of a returned `int **`); no `int **p, *q;`
+      mixed-declarator list; no `p++`/`p--`; pointer-pointer subtraction
+      still not implemented. Everything else Milestone 119 disclosed as
+      open (`MAX_PARAMS`/`sizeof`/self-test-leak items, `evidence_gate.rs`
+      still having exactly two real subscribers) remains unchanged,
+      unrelated to this milestone.
+
 ## Building and running
 
 Requires:

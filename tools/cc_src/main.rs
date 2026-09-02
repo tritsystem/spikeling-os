@@ -1891,6 +1891,56 @@
 // **p, *q;` mixed-declarator list; no `p++`/`p--`. Everything else
 // Milestone 120 disclosed as open remains unchanged, unrelated to this
 // milestone.
+//
+// MILESTONE 122: real `pointer - pointer` -- C's own ELEMENT-COUNT
+// difference `(addr_a - addr_b) / sizeof(T)` -- is now implemented,
+// closing the exact gap Milestone 115 first named ("`pointer - pointer`
+// ... is a real, disclosed gap this milestone does NOT implement") and
+// Milestone 116 through 121 each left standing. The fix is one new
+// disjunct in `EXPR_BINARY`'s own `-` codegen: when `ptr_operand_scale()`
+// classifies BOTH operands as pointers (`(Some(sc), Some(_))`, the exact
+// pattern the `-` arm previously routed to a plain unscaled byte subtract
+// via its `_` fall-through), the raw byte `sub` still runs, then RAX is
+// divided by the pointee size with `emit_sar_rax_imm8(3)` -- an
+// ARITHMETIC right shift, this milestone's one genuinely new x86_64
+// encoding (`SAR r/m64, imm8`, REX.W `C1` /7; see its own doc comment for
+// why both its halves were already independently SDM-verified by
+// Milestone 79 and 108/115). `sc == 1` (both `char *`) takes no shift --
+// the byte difference already IS the element count.
+//
+// Zero new parser work: `p1 - p2` has ALWAYS parsed as an ordinary
+// `EXPR_BINARY` with `op == b'-'` (two `EXPR_IDENT` operands), exactly
+// like `p - 1` did before Milestone 115 -- the node shape is identical,
+// only the codegen's interpretation of a both-operands-are-pointers `-`
+// changes. And -- the honest observation this milestone's own
+// investigation turned up, not something arranged to look tidy --
+// `is_int_ptr_ptr` was already wired into `ptr_operand_scale()` to
+// return `Some(8)` by Milestone 121, so this ONE `-` codegen disjunct
+// reaches `int **` pointer-pointer subtraction (`pp1 - pp2`) in the same
+// milestone as the `int *` / decayed-array case, with no `int **`-
+// specific line anywhere: `ptr_operand_scale()` only ever inspects an
+// `EXPR_IDENT` operand's own declared `VarSlot` flags, never the pointer
+// depth as a separate axis past the `Some(8)` it already yields.
+//
+// New self-test cases CASE 130 (`int *` ptr-ptr, `(arr + 5) - (arr + 2)`,
+// expected 3), CASE 131 (`char *` ptr-ptr, `sc == 1`, no shift, two
+// adjacent `char` slots 8 bytes apart, expected 8), CASE 132 (the SIGNED
+// case -- `p1 < p2`, `(p1 - p2) == -3`, expected 1 -- which a logical
+// `SHR` would fail and only the arithmetic `SAR` passes), CASE 133 (`int
+// **` ptr-ptr, `(pp1 - pp2) == -2`, expected 1 -- the deliberate
+// VERIFICATION case proving the same one disjunct reaches `int **` too,
+// per the paragraph above), and CASE 134 (a REGRESSION guard, the
+// structural twin of the pre-existing CASE 112 -- `p - 2` where `p` is a
+// pointer and `2` is an int still reaches the `(Some(sc), None)` arm and
+// byte-scales correctly, `p = arr; *(p - 2)` reaching `arr[2]`, expected
+// 3 -- proving the new `(Some, Some)` arm did not disturb the pre-existing
+// pointer-minus-integer path).
+//
+// Still genuinely open after this milestone: no `char **` of any kind; no
+// `int ***` or deeper; no `int **p, *q;` mixed-declarator list; no
+// `p++`/`p--`; `pp[1]` (`EXPR_INDEX` through an `int **`) still not
+// given a dedicated proving case. Everything else Milestone 121 disclosed
+// as open remains unchanged, unrelated to this milestone.
 #![no_std]
 #![no_main]
 
@@ -6346,6 +6396,29 @@ impl CodeBuf {
     unsafe fn emit_shl_rax_imm8(&mut self, imm: u8) {
         unsafe { self.push_bytes(&[0x48, 0xC1, 0xE0, imm]) };
     }
+    /// MILESTONE 122: `SAR r/m64, imm8` (REX.W `C1` /7 ib) applied to RAX --
+    /// an ARITHMETIC (sign-preserving) right shift, the exact division-by-a-
+    /// power-of-two real C compilers emit for `pointer - pointer` when the
+    /// pointee size is a power of two (see `EXPR_BINARY`'s own `-` codegen
+    /// below). Not a genuinely new encoding FAMILY: both halves are already
+    /// independently hand-verified against the Intel SDM by an earlier
+    /// milestone -- the `C1` immediate-shift opcode by `emit_shl_rcx_imm8()`
+    /// (Milestone 108) and `emit_shl_rax_imm8()` just above, and the `0xF8`
+    /// ModRM byte (mod=11 / reg=111 (SAR's own opcode-extension digit) /
+    /// rm=000 (RAX)) by `emit_sar_rax_cl()` above (Milestone 79, which
+    /// already shifts RAX by this SAME `0xF8` ModRM byte, just via the
+    /// register-count `D3` opcode instead of this immediate-count `C1` one).
+    /// Same "combine two independently-verified halves" shape
+    /// `emit_shl_rax_imm8()`'s own doc comment already described. Arithmetic
+    /// (`SAR`, reg=111) NOT logical (`SHR`, reg=101) is load-bearing: a valid
+    /// `p1 - p2` where `p1 < p2` is a real negative element count, and only
+    /// `SAR` sign-extends the byte difference correctly (a valid pointer
+    /// difference is always an exact multiple of the pointee size, so `SAR`
+    /// -- which rounds toward negative infinity -- gives the exact right
+    /// answer for both signs, no `idiv` needed).
+    unsafe fn emit_sar_rax_imm8(&mut self, imm: u8) {
+        unsafe { self.push_bytes(&[0x48, 0xC1, 0xF8, imm]) };
+    }
     /// `MOV RAX, [RAX]` (REX.W `8B` /r) -- a real array-element LOAD
     /// through a runtime-computed address already sitting in RAX itself
     /// (the exact address emit_lea_rax_rbp_off()+emit_shl_rcx_imm8()+
@@ -7148,35 +7221,52 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
                     // side NOT also a recognized pointer) scales RCX (the
                     // integer operand) exactly like the `+` arm's own
                     // `(Some(sc), None)` case above, then the ordinary
-                    // `sub` runs. Real C defines NO other `-` shape
-                    // involving a pointer as legal: `int - pointer` is not
-                    // legal C (this subset makes no attempt to fabricate a
-                    // meaning for it either -- `left_scale == None` here
-                    // always skips scaling, regardless of `right_scale`,
-                    // so it falls through to the same plain unscaled
-                    // subtract every non-pointer `-` already used before
-                    // this milestone), and `pointer - pointer` (real C:
-                    // the ELEMENT-COUNT difference, `(addr_a - addr_b) /
-                    // sizeof(T)`) is a real, disclosed gap this milestone
-                    // does NOT implement -- see this milestone's own
-                    // closing "Still genuinely open" note. Deliberately
-                    // NOT scaling RCX in that ptr-ptr case (`right_scale`
-                    // is also `Some` there) rather than scaling it anyway
-                    // and producing a different but equally wrong number:
-                    // this falls through to the exact same plain,
-                    // unscaled `sub` -- a real raw BYTE address
-                    // difference, not real C's own element-count meaning
-                    // -- that every pointer-involving `-` already computed
-                    // before this milestone existed, the same "no attempt
-                    // to fabricate a meaning" restriction the `int -
-                    // pointer` case just above already states.
+                    // `sub` runs. `int - pointer` is not legal C (this
+                    // subset makes no attempt to fabricate a meaning for it
+                    // either -- `left_scale == None` with `right_scale ==
+                    // Some` hits the `_` arm below and falls through to the
+                    // same plain unscaled subtract every non-pointer `-`
+                    // already used before Milestone 115).
+                    //
+                    // MILESTONE 122: `pointer - pointer` (`left_scale ==
+                    // Some` AND `right_scale == Some`) is now REAL -- C's
+                    // own ELEMENT-COUNT difference `(addr_a - addr_b) /
+                    // sizeof(T)`, closing the exact gap Milestone 115 first
+                    // named and Milestone 116-121 each re-confirmed still
+                    // open. The raw byte `sub` runs first (unchanged), then
+                    // RAX is divided by the pointee size with an ARITHMETIC
+                    // shift (`emit_sar_rax_imm8(3)`, this milestone's one
+                    // genuinely new encoding -- see its own doc comment):
+                    // `sc == 8` for an `int *`, an `int **` (Milestone 121
+                    // already made `ptr_operand_scale()` return `Some(8)`
+                    // for `is_int_ptr_ptr`, so this same one path reaches
+                    // `int **` ptr-ptr subtraction with zero extra work),
+                    // or a decayed `int` array base; `sc == 1` for a
+                    // `char *` needs NO shift at all (byte difference already
+                    // IS the element count). `left_scale`'s value is used
+                    // (the two agree for any well-formed program -- real C
+                    // requires both operands point to compatible types).
+                    // ARITHMETIC not logical shift is load-bearing: a valid
+                    // `p1 - p2` with `p1 < p2` is a real negative count and
+                    // only `SAR` sign-extends the byte difference right.
                     b'-' => {
-                        if let (Some(sc), None) = (left_scale, right_scale) {
-                            if sc == 8 {
-                                unsafe { buf.emit_shl_rcx_imm8(3) };
+                        match (left_scale, right_scale) {
+                            (Some(sc), None) => {
+                                if sc == 8 {
+                                    unsafe { buf.emit_shl_rcx_imm8(3) };
+                                }
+                                unsafe { buf.emit_sub_rax_rcx() };
+                            }
+                            (Some(sc), Some(_)) => {
+                                unsafe { buf.emit_sub_rax_rcx() };
+                                if sc == 8 {
+                                    unsafe { buf.emit_sar_rax_imm8(3) };
+                                }
+                            }
+                            _ => {
+                                unsafe { buf.emit_sub_rax_rcx() };
                             }
                         }
-                        unsafe { buf.emit_sub_rax_rcx() }
                     }
                     b'*' => unsafe { buf.emit_imul_rax_rcx() },
                     b'/' => {
@@ -13386,7 +13476,129 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m121 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 { 0 } else { 1 });
+        w(b"\n");
+
+        // -------------------------------------------------------------
+        // MILESTONE 122: real `pointer - pointer` -- C's own ELEMENT-COUNT
+        // difference `(addr_a - addr_b) / sizeof(T)`, closing the gap
+        // Milestone 115 first named and 116..121 each left standing. One
+        // new disjunct in `EXPR_BINARY`'s `-` codegen (`(Some(sc),
+        // Some(_))`): raw byte `sub`, then an ARITHMETIC `emit_sar_rax_imm8(3)`
+        // (this milestone's one new x86_64 encoding) for `sc == 8`; no
+        // shift for a `char *` (`sc == 1`). See this file's own top
+        // Milestone 122 doc comment and that codegen's own comment for the
+        // full derivation. All cases run in-process (CodegenMode::Callable),
+        // the same tier 107 through 121 all used -- no new real
+        // fork()/exec()/wait() cycle.
+        //
+        // A note on the stack layout these cases hand-verify, the same
+        // "declaration-order == `rbp - 8*K`" reliance Milestone 115's own
+        // top note established: consecutively declared locals land 8 bytes
+        // apart in source order regardless of declared type (every VarSlot
+        // is one 8-byte cell), so `&second - &first == 8` bytes exactly.
+        // -------------------------------------------------------------
+        const SRC130: &[u8] = b"int main() { int arr[6]; int *p1; int *p2; p1 = arr + 5; p2 = arr + 2; return p1 - p2; }";
+        let case130_result = compile_and_run_program_callable(SRC130.as_ptr() as u64, SRC130.len() as u64);
+        w(b"  case130 (int* pointer-pointer subtraction (arr+5)-(arr+2), raw byte diff 24 then /8, in-process) returned=");
+        if let Some(r) = case130_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case130_ok = case130_result == Some(3);
+        write_check(b"case130_int_ptr_minus_int_ptr_returns_3=", case130_ok);
+
+        w(b"\n");
+
+        // CASE 131: the `char *` path -- `ptr_operand_scale()` gives
+        // `Some(1)`, so NO shift runs and the raw byte difference IS the
+        // element count. `cp1 = &d` (rbp-8, the 1st-declared local),
+        // `cp2 = &c` (rbp-16, the 2nd) -> `cp1 - cp2 == 8` exactly. A build
+        // that wrongly applied the `/8` here would return 1.
+        const SRC131: &[u8] = b"int main() { char d; char c; char *cp1; char *cp2; cp1 = &d; cp2 = &c; return cp1 - cp2; }";
+        let case131_result = compile_and_run_program_callable(SRC131.as_ptr() as u64, SRC131.len() as u64);
+        w(b"  case131 (char* pointer-pointer subtraction, scale 1 so NO shift, adjacent slots 8 bytes apart, in-process) returned=");
+        if let Some(r) = case131_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 8)\n");
+        let case131_ok = case131_result == Some(8);
+        write_check(b"case131_char_ptr_minus_char_ptr_scale1_returns_8=", case131_ok);
+
+        w(b"\n");
+
+        // CASE 132: the SIGNED case -- `p1 < p2`, so `p1 - p2` is a real
+        // NEGATIVE element count. Raw byte diff is -24; only an ARITHMETIC
+        // shift (`SAR`, reg=111) sign-extends that to -3. A logical `SHR`
+        // (reg=101) would give a huge positive number and this case would
+        // return 0. `(p1 - p2) == -3` keeps the result a clean 0/1.
+        const SRC132: &[u8] = b"int main() { int arr[6]; int *p1; int *p2; p1 = arr + 2; p2 = arr + 5; return (p1 - p2) == -3; }";
+        let case132_result = compile_and_run_program_callable(SRC132.as_ptr() as u64, SRC132.len() as u64);
+        w(b"  case132 (SIGNED pointer-pointer: p1<p2 so (p1-p2)==-3, only arithmetic SAR passes, in-process) returned=");
+        if let Some(r) = case132_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case132_ok = case132_result == Some(1);
+        write_check(b"case132_signed_ptr_ptr_subtraction_negative_returns_1=", case132_ok);
+
+        w(b"\n");
+
+        // CASE 133: a deliberate VERIFICATION case, not a second fix -- the
+        // SAME one `-` codegen disjunct already reaches an `int **`
+        // pointer-pointer subtraction, because Milestone 121 already made
+        // `ptr_operand_scale()` return `Some(8)` for `is_int_ptr_ptr`.
+        // `pp1 = &c` (rbp-24, 3rd local), `pp2 = &a` (rbp-8, 1st) ->
+        // byte diff -16, `/8` -> -2. `(pp1 - pp2) == -2` -> 1.
+        const SRC133: &[u8] = b"int main() { int *a; int *b; int *c; int **pp1; int **pp2; pp1 = &c; pp2 = &a; return (pp1 - pp2) == -2; }";
+        let case133_result = compile_and_run_program_callable(SRC133.as_ptr() as u64, SRC133.len() as u64);
+        w(b"  case133 (VERIFICATION: int** pointer-pointer subtraction reaches the same disjunct, (pp1-pp2)==-2, in-process) returned=");
+        if let Some(r) = case133_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case133_ok = case133_result == Some(1);
+        write_check(b"case133_int_ptr_ptr_pointer_pointer_subtraction_returns_1=", case133_ok);
+
+        w(b"\n");
+
+        // CASE 134: a REGRESSION guard -- `p - 2` (pointer minus INTEGER)
+        // must still reach the `(Some(sc), None)` arm and byte-scale the
+        // integer, unchanged by this milestone's new `(Some, Some)` arm. Built
+        // as the exact structural twin of the pre-existing CASE 112
+        // (`*(arr - 2) == 3`, which passes) but routed through an intermediate
+        // `int *p` local instead of the decayed array directly: `p = arr`
+        // (&arr[0]); `p - 2` byte-scales the `2` to 16 and subtracts; in this
+        // compiler's own declaration-order stack layout (arr[0] highest, each
+        // later element 8 bytes lower -- CASE 112's own established fact) that
+        // lands on `arr[2]`, so `*(p - 2)` is 3.
+        const SRC134: &[u8] = b"int main() { int arr[3]; arr[0] = 1; arr[1] = 2; arr[2] = 3; int *p; p = arr; return *(p - 2); }";
+        let case134_result = compile_and_run_program_callable(SRC134.as_ptr() as u64, SRC134.len() as u64);
+        w(b"  case134 (REGRESSION: pointer-minus-integer p-2 still byte-scales via the (Some,None) arm, twin of CASE 112, in-process) returned=");
+        if let Some(r) = case134_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case134_ok = case134_result == Some(3);
+        write_check(b"case134_pointer_minus_integer_regression_returns_3=", case134_ok);
+
+        w(b"\n");
+
+        let overall_m122 = case130_ok && case131_ok && case132_ok && case133_ok && case134_ok;
+        w(b"OVERALL_M122=");
+        w(if overall_m122 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 { 0 } else { 1 });
     }
 }
 

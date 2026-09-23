@@ -4016,13 +4016,27 @@ impl Parser {
     /// paragraph), so folding it into `parse_pointer_decl()`'s existing
     /// boolean parameter would just be a second, harder-to-read encoding
     /// of the exact same distinction a dedicated function already makes
-    /// obvious. Deliberately narrow, mirroring `parse_pointer_decl()`'s
-    /// own restriction: exactly ONE `int **` declarator per statement (no
-    /// `int **p, **q;` list, no mixing into an `int a, **p, b;` chain).
-    /// Reuses `finish_ident_assign()` directly for the optional `"="
-    /// <ternary>` initializer, exactly like `parse_pointer_decl()` does,
-    /// so `int **pp = &p;` is a real, legal combined declaration+
+    /// obvious. Reuses `finish_ident_assign()` directly for the optional
+    /// `"=" <ternary>` initializer, exactly like `parse_pointer_decl()`
+    /// does, so `int **pp = &p;` is a real, legal combined declaration+
     /// initializer in one statement.
+    ///
+    /// MILESTONE 128: extended for a real comma-separated `int **`
+    /// declarator LIST, same depth throughout (`int **p, **q;`) -- the
+    /// exact same real gap this doc comment used to disclose ("no `int
+    /// **p, **q;` list"), closed the same way Milestone 126 closed the
+    /// analogous gap in `parse_pointer_decl()`: each comma-continuation
+    /// re-consumes its own leading `**` (this lexer has no single `**`
+    /// token -- two separate `TOK_STAR`s, same as the head declarator's
+    /// own already-established two-`self.expect(TOK_STAR)` shape one
+    /// caller-level up) and gets its own `then_body: 3` `STMT_DECL`.
+    /// Deliberately still NOT extended to mix a bare or single-`*`
+    /// declarator into this SAME list (`int **p, *q;`, the actually
+    /// mixed-DEPTH case Milestone 122 originally named) -- that is a
+    /// real, separate, disclosed gap, left for its own future milestone
+    /// rather than grown here, mirroring how Milestone 126 and 127 split
+    /// the analogous work for `parse_pointer_decl()` into two steps
+    /// instead of one.
     unsafe fn parse_double_pointer_decl(&mut self, name: Token) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
@@ -4034,9 +4048,34 @@ impl Parser {
                 StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 3, else_body: 0 },
             )
         };
+        let mut tail = head;
         if unsafe { self.peek() }.kind == TOK_ASSIGN {
             let assign = unsafe { self.finish_ident_assign(name, false) }?;
-            unsafe { (*(head as *mut StmtNode)).next = assign };
+            unsafe { (*(tail as *mut StmtNode)).next = assign };
+            tail = assign;
+        }
+        while unsafe { self.peek() }.kind == TOK_COMMA {
+            unsafe { self.advance() }; // ','
+            unsafe { self.expect(TOK_STAR) }?; // first '*' -- same depth as the head declarator
+            unsafe { self.expect(TOK_STAR) }?; // second '*'
+            let nm = unsafe { self.expect(TOK_IDENT) }?;
+            let d = unsafe { alloc_stmt() };
+            if d == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    d as *mut StmtNode,
+                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: 3, else_body: 0 },
+                )
+            };
+            unsafe { (*(tail as *mut StmtNode)).next = d };
+            tail = d;
+            if unsafe { self.peek() }.kind == TOK_ASSIGN {
+                let assign = unsafe { self.finish_ident_assign(nm, false) }?;
+                unsafe { (*(tail as *mut StmtNode)).next = assign };
+                tail = assign;
+            }
         }
         unsafe { self.expect(TOK_SEMI) }?;
         Ok(head)
@@ -13895,7 +13934,65 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m127 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 { 0 } else { 1 });
+        // CASE 144: MILESTONE 128 -- a real comma-separated `int **`
+        // declarator list, same depth (`int **p, **q;`), each an
+        // independent double-pointer to its own distinct `int *`.
+        const SRC144: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pa; int *pb; pa = &a; pb = &b; int **p, **q; p = &pa; q = &pb; return **p + **q; }";
+        let case144_result = compile_and_run_program_callable(SRC144.as_ptr() as u64, SRC144.len() as u64);
+        w(b"  case144 (int **p, **q comma list, two independent double pointers, **p+**q) returned=");
+        if let Some(r) = case144_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case144_ok = case144_result == Some(3);
+        write_check(b"case144_int_ptr_ptr_comma_list_returns_3=", case144_ok);
+
+        w(b"\n");
+
+        // CASE 145: a per-declarator `=` initializer INSIDE the new
+        // `int **` comma list (`int **p = &pa, **q = &pb;`) -- proves
+        // `finish_ident_assign()` is reached for the SECOND declarator
+        // too, not just the head one.
+        const SRC145: &[u8] = b"int main() { int a; int b; a = 10; b = 20; int *pa; int *pb; pa = &a; pb = &b; int **p = &pa, **q = &pb; return **p + **q; }";
+        let case145_result = compile_and_run_program_callable(SRC145.as_ptr() as u64, SRC145.len() as u64);
+        w(b"  case145 (int **p = &pa, **q = &pb -- per-declarator initializer inside the int** comma list) returned=");
+        if let Some(r) = case145_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 30)\n");
+        let case145_ok = case145_result == Some(30);
+        write_check(b"case145_int_ptr_ptr_comma_list_initializer_returns_30=", case145_ok);
+
+        w(b"\n");
+
+        // CASE 146: a REGRESSION guard -- a single, non-comma `int
+        // **pp;` declarator (the entire pre-Milestone-128 grammar for
+        // this function) must still parse and run identically: the new
+        // `while TOK_COMMA` loop's condition is simply never true here.
+        const SRC146: &[u8] = b"int main() { int a; a = 7; int *pa; pa = &a; int **pp; pp = &pa; return **pp; }";
+        let case146_result = compile_and_run_program_callable(SRC146.as_ptr() as u64, SRC146.len() as u64);
+        w(b"  case146 (REGRESSION: single non-comma int **pp; unaffected by the new comma loop) returned=");
+        if let Some(r) = case146_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 7)\n");
+        let case146_ok = case146_result == Some(7);
+        write_check(b"case146_single_double_pointer_declarator_regression_returns_7=", case146_ok);
+
+        w(b"\n");
+
+        let overall_m128 = case144_ok && case145_ok && case146_ok;
+        w(b"OVERALL_M128=");
+        w(if overall_m128 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 { 0 } else { 1 });
     }
 }
 

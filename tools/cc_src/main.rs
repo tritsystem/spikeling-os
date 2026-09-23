@@ -4030,13 +4030,19 @@ impl Parser {
     /// token -- two separate `TOK_STAR`s, same as the head declarator's
     /// own already-established two-`self.expect(TOK_STAR)` shape one
     /// caller-level up) and gets its own `then_body: 3` `STMT_DECL`.
-    /// Deliberately still NOT extended to mix a bare or single-`*`
-    /// declarator into this SAME list (`int **p, *q;`, the actually
-    /// mixed-DEPTH case Milestone 122 originally named) -- that is a
-    /// real, separate, disclosed gap, left for its own future milestone
-    /// rather than grown here, mirroring how Milestone 126 and 127 split
-    /// the analogous work for `parse_pointer_decl()` into two steps
-    /// instead of one.
+    ///
+    /// MILESTONE 129: the actual mixed-DEPTH case Milestone 122
+    /// originally named (`int **p, *q;`) -- closed from THIS side
+    /// (entered via a head `int **` declarator). Each comma-
+    /// continuation's `**` is now independently optional: zero, one, or
+    /// two `*` tokens are all legal, giving that continuation its own
+    /// depth-0 (bare `int`), depth-1 (`int *`), or depth-2 (`int **`)
+    /// `STMT_DECL`, reusing the exact `then_body` sentinels (`0`/`2`/`3`)
+    /// `make_decl()`/`parse_pointer_decl()`/this function's own head
+    /// declarator already established for those depths. The symmetric
+    /// OTHER direction -- entering via a head `int *` and upgrading a
+    /// continuation to `**` inside `parse_pointer_decl()`'s own list --
+    /// is a separate, disclosed gap, not attempted here.
     unsafe fn parse_double_pointer_decl(&mut self, name: Token) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
@@ -4056,8 +4062,26 @@ impl Parser {
         }
         while unsafe { self.peek() }.kind == TOK_COMMA {
             unsafe { self.advance() }; // ','
-            unsafe { self.expect(TOK_STAR) }?; // first '*' -- same depth as the head declarator
-            unsafe { self.expect(TOK_STAR) }?; // second '*'
+            // MILESTONE 129: the leading `**` on a comma-continuation is
+            // now OPTIONAL and its OWN depth, not required to match the
+            // head declarator's depth -- the actual mixed-DEPTH gap
+            // Milestone 122 originally named (`int **p, *q;`), closed
+            // from this side (entered via `int **`) by letting each
+            // continuation independently be depth-2 (`**`), depth-1
+            // (`*`), or depth-0 (bare), reusing the SAME `then_body`
+            // sentinels (`3`/`2`/`0`) `parse_pointer_decl()`/`make_decl()`
+            // already established for those exact depths -- no new
+            // encoding invented for a fact `collect_vars_rec()` already
+            // knows how to read.
+            let has_first_star = unsafe { self.peek() }.kind == TOK_STAR;
+            if has_first_star {
+                unsafe { self.advance() }; // first '*'
+            }
+            let has_second_star = has_first_star && unsafe { self.peek() }.kind == TOK_STAR;
+            if has_second_star {
+                unsafe { self.advance() }; // second '*'
+            }
+            let d_then_body: u64 = if has_second_star { 3 } else if has_first_star { 2 } else { 0 };
             let nm = unsafe { self.expect(TOK_IDENT) }?;
             let d = unsafe { alloc_stmt() };
             if d == 0 {
@@ -4066,7 +4090,7 @@ impl Parser {
             unsafe {
                 core::ptr::write(
                     d as *mut StmtNode,
-                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: 3, else_body: 0 },
+                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: d_then_body, else_body: 0 },
                 )
             };
             unsafe { (*(tail as *mut StmtNode)).next = d };
@@ -13992,7 +14016,67 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m128 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 { 0 } else { 1 });
+        // CASE 147: MILESTONE 129 -- the actual mixed-DEPTH case
+        // Milestone 122 originally named, all three depths in ONE list
+        // entered via `int **`: `int **p, *q, r;` -- `p` a real `int
+        // **`, `q` a real `int *`, `r` a plain `int`, all in the same
+        // statement. `**p + *q + r`.
+        const SRC147: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pa; pa = &a; int **p, *q, r; p = &pa; q = &b; r = 100; return **p + *q + r; }";
+        let case147_result = compile_and_run_program_callable(SRC147.as_ptr() as u64, SRC147.len() as u64);
+        w(b"  case147 (int **p, *q, r -- all three depths mixed in one list entered via int**, **p+*q+r) returned=");
+        if let Some(r) = case147_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 103)\n");
+        let case147_ok = case147_result == Some(103);
+        write_check(b"case147_mixed_depth_int_ptr_ptr_list_returns_103=", case147_ok);
+
+        w(b"\n");
+
+        // CASE 148: a REGRESSION guard -- `int **p, **q;` (Milestone
+        // 128's own all-depth-2 case) must still recognize an EXPLICIT
+        // `**` correctly on a comma continuation now that it's optional
+        // rather than required.
+        const SRC148: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pa; int *pb; pa = &a; pb = &b; int **p, **q; p = &pa; q = &pb; return **p + **q; }";
+        let case148_result = compile_and_run_program_callable(SRC148.as_ptr() as u64, SRC148.len() as u64);
+        w(b"  case148 (REGRESSION: int **p, **q -- explicit '**' on a continuation still recognized) returned=");
+        if let Some(r) = case148_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case148_ok = case148_result == Some(3);
+        write_check(b"case148_double_depth_comma_list_regression_returns_3=", case148_ok);
+
+        w(b"\n");
+
+        // CASE 149: a depth-2-then-depth-0 list with NO depth-1 in
+        // between (`int **p, q;`) -- proves the per-continuation depth
+        // check works independently for each comma, not just for a
+        // fixed three-item pattern like CASE 147's own shape.
+        const SRC149: &[u8] = b"int main() { int a; a = 5; int *pa; pa = &a; int **p, q; p = &pa; q = 9; return **p + q; }";
+        let case149_result = compile_and_run_program_callable(SRC149.as_ptr() as u64, SRC149.len() as u64);
+        w(b"  case149 (int **p, q -- depth-2 then bare, no depth-1 in between, **p+q) returned=");
+        if let Some(r) = case149_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 14)\n");
+        let case149_ok = case149_result == Some(14);
+        write_check(b"case149_double_depth_then_bare_returns_14=", case149_ok);
+
+        w(b"\n");
+
+        let overall_m129 = case147_ok && case148_ok && case149_ok;
+        w(b"OVERALL_M129=");
+        w(if overall_m129 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 { 0 } else { 1 });
     }
 }
 

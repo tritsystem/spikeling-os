@@ -4178,12 +4178,16 @@ impl Parser {
     /// separate `TOK_STAR` expects -- this lexer has no single `***`
     /// token, the same two-separate-stars shape Milestone 128 already
     /// established for `**`, extended by one more) and gets its own
-    /// `then_body: 4` `STMT_DECL`. Deliberately still SAME-DEPTH ONLY --
-    /// mixing a bare/single-`*`/double-`**` declarator into this list
-    /// (the actual mixed-DEPTH case Milestone 129/130 closed for `int
-    /// **`) is real, disclosed, separate future work, mirroring how
-    /// Milestone 128 itself shipped same-depth-only before Milestone
-    /// 129/130 closed the mixed-depth gap for the shallower feature.
+    /// `then_body: 4` `STMT_DECL`.
+    ///
+    /// MILESTONE 134: the mixed-DEPTH case, entered via this head `int
+    /// ***` -- the same gap Milestone 129 closed for `int **`, one level
+    /// deeper. Each comma-continuation's `*` tokens are now all
+    /// independently optional (0, 1, 2, or 3 of them), giving each
+    /// continuation its own depth -- bare `int`, `int *`, `int **`, or
+    /// `int ***` -- all in one statement. The symmetric OTHER directions
+    /// (entered via a head `int *` or `int **`, upgrading a continuation
+    /// to `***`) remain separate, disclosed future work.
     unsafe fn parse_triple_pointer_decl(&mut self, name: Token) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
@@ -4203,9 +4207,33 @@ impl Parser {
         }
         while unsafe { self.peek() }.kind == TOK_COMMA {
             unsafe { self.advance() }; // ','
-            unsafe { self.expect(TOK_STAR) }?; // first '*' -- same depth as the head declarator
-            unsafe { self.expect(TOK_STAR) }?; // second '*'
-            unsafe { self.expect(TOK_STAR) }?; // third '*'
+            // MILESTONE 134: the leading `***` on a comma-continuation is
+            // now fully OPTIONAL, depth-by-depth -- the same mixed-DEPTH
+            // gap Milestone 129 closed for `int **`, entered via `int
+            // ***` this time: a continuation may independently be bare
+            // (depth 0, plain `int`), `*` (depth 1, `int *`), `**` (depth
+            // 2, `int **`), or `***` (depth 3, matching the head), all in
+            // ONE `int ***p, ...;` statement. Reuses the exact `then_
+            // body` sentinels (`0`/`2`/`3`/`4`) `make_decl()`/`parse_
+            // pointer_decl()`/`parse_double_pointer_decl()`/this
+            // function's own head declarator already established for
+            // those four depths -- no new encoding. The symmetric OTHER
+            // directions (entered via a head `int *` or `int **`,
+            // upgrading a continuation to `***`) are separate, disclosed
+            // future work, not attempted here.
+            let has_star1 = unsafe { self.peek() }.kind == TOK_STAR;
+            if has_star1 {
+                unsafe { self.advance() };
+            }
+            let has_star2 = has_star1 && unsafe { self.peek() }.kind == TOK_STAR;
+            if has_star2 {
+                unsafe { self.advance() };
+            }
+            let has_star3 = has_star2 && unsafe { self.peek() }.kind == TOK_STAR;
+            if has_star3 {
+                unsafe { self.advance() };
+            }
+            let d_then_body: u64 = if has_star3 { 4 } else if has_star2 { 3 } else if has_star1 { 2 } else { 0 };
             let nm = unsafe { self.expect(TOK_IDENT) }?;
             let d = unsafe { alloc_stmt() };
             if d == 0 {
@@ -4214,7 +4242,7 @@ impl Parser {
             unsafe {
                 core::ptr::write(
                     d as *mut StmtNode,
-                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: 4, else_body: 0 },
+                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: d_then_body, else_body: 0 },
                 )
             };
             unsafe { (*(tail as *mut StmtNode)).next = d };
@@ -14460,7 +14488,55 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m133 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 { 0 } else { 1 });
+        // CASE 159: MILESTONE 134 -- the actual mixed-DEPTH case entered
+        // via a head `int ***`: `int ***p, **q, *r, s;` -- all FOUR
+        // depths (three-level, two-level, one-level, bare) in one
+        // statement. Kept to exactly 8 real local variables (`a`, `b`,
+        // `pa`, `ppa`, `p`, `q`, `r`, `s`) to stay inside this compiler's
+        // own `MAX_VARS` cap -- `q` and `r` deliberately reuse `pa`/`b`
+        // as their own targets rather than allocating fresh ones, an
+        // economical choice for the variable budget, not a weaker test:
+        // each of `***p`/`**q`/`*r`/`s` still exercises its own distinct
+        // EXPR_UNARY dereference-chain LENGTH, which is the actual thing
+        // this milestone changes.
+        const SRC159: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pa; pa = &a; int **ppa; ppa = &pa; int ***p, **q, *r, s; p = &ppa; q = &pa; r = &b; s = 4; return ***p + **q + *r + s; }";
+        let case159_result = compile_and_run_program_callable(SRC159.as_ptr() as u64, SRC159.len() as u64);
+        w(b"  case159 (int ***p, **q, *r, s -- all four depths mixed in one list entered via int***, ***p+**q+*r+s) returned=");
+        if let Some(r) = case159_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 8)\n");
+        let case159_ok = case159_result == Some(8);
+        write_check(b"case159_mixed_depth_int_ptr_ptr_ptr_list_returns_8=", case159_ok);
+
+        w(b"\n");
+
+        // CASE 160: a REGRESSION guard -- `int ***p, ***q;` (Milestone
+        // 133's own all-depth-3 case) must still recognize an EXPLICIT
+        // `***` correctly on a comma continuation now that it's optional
+        // rather than required.
+        const SRC160: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pa; int *pb; pa = &a; pb = &b; int **ppa; int **ppb; ppa = &pa; ppb = &pb; int ***p, ***q; p = &ppa; q = &ppb; return ***p + ***q; }";
+        let case160_result = compile_and_run_program_callable(SRC160.as_ptr() as u64, SRC160.len() as u64);
+        w(b"  case160 (REGRESSION: int ***p, ***q -- explicit '***' on a continuation still recognized) returned=");
+        if let Some(r) = case160_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case160_ok = case160_result == Some(3);
+        write_check(b"case160_triple_depth_comma_list_regression_returns_3=", case160_ok);
+
+        w(b"\n");
+
+        let overall_m134 = case159_ok && case160_ok;
+        w(b"OVERALL_M134=");
+        w(if overall_m134 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 { 0 } else { 1 });
     }
 }
 

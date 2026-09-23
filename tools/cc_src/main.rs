@@ -3927,11 +3927,19 @@ impl Parser {
     /// re-consume its OWN leading `*` (a pointer declarator list, unlike
     /// a scalar one, repeats the sigil per name in real C: `int *p, *q;`
     /// not `int *p, q;` for two pointers) before the identifier, using
-    /// this SAME `is_char_pointee` for all of them -- deliberately not
-    /// yet supporting a bare (non-`*`) declarator mixed into a pointer
-    /// list, or a DIFFERENT depth (`**`) mixed in either direction; both
-    /// are real, disclosed, separate gaps left for their own future
-    /// milestone rather than grown here.
+    /// this SAME `is_char_pointee` for all of them.
+    ///
+    /// MILESTONE 127: the leading `*` on a comma-continuation
+    /// declarator is now OPTIONAL, not required -- real C's own rule
+    /// that the `*` binds to the NAME, not the base-type keyword, so
+    /// `int *p, q;` legally declares `p` as `int *` and `q` as plain
+    /// `int` in the SAME statement. A bare continuation reuses
+    /// `make_decl()`'s own scalar encoding (`then_body: 0`/`1` for
+    /// int/char, `expr: 0`) rather than inventing a second one for the
+    /// same fact `collect_vars_rec()` already knows how to read. A
+    /// DIFFERENT pointer DEPTH mixed in (`int **p, *q;`,
+    /// `parse_double_pointer_decl()`'s own still-separate declarator)
+    /// remains a real, disclosed, separate gap -- not attempted here.
     unsafe fn parse_pointer_decl(&mut self, name: Token, is_char_pointee: bool) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
@@ -3951,16 +3959,34 @@ impl Parser {
         }
         while unsafe { self.peek() }.kind == TOK_COMMA {
             unsafe { self.advance() }; // ','
-            unsafe { self.expect(TOK_STAR) }?; // each declarator repeats '*' -- same depth as the first
+            // MILESTONE 127: the leading `*` is now OPTIONAL per
+            // declarator -- real C allows mixing a bare (scalar)
+            // declarator into a pointer-declarator list (`int *p, q;`
+            // declares `p` as `int *` and `q` as plain `int`, the sigil
+            // binding to the NAME, not the base type keyword). `is_ptr`
+            // false means this declarator falls back to the SAME
+            // scalar encoding `make_decl()` already uses for a bare
+            // `int`/`char` declarator (`then_body: 0`/`1`, `expr: 0`) --
+            // reusing that existing, already-proven encoding rather
+            // than inventing a new one for the same fact.
+            let is_ptr = unsafe { self.peek() }.kind == TOK_STAR;
+            if is_ptr {
+                unsafe { self.advance() }; // consume '*'
+            }
             let nm = unsafe { self.expect(TOK_IDENT) }?;
             let d = unsafe { alloc_stmt() };
             if d == 0 {
                 return Err(ParseError::OutOfMemory);
             }
+            let (d_expr, d_then_body): (u64, u64) = if is_ptr {
+                (if is_char_pointee { 1 } else { 0 }, if is_char_pointee { 0 } else { 2 })
+            } else {
+                (0, if is_char_pointee { 1 } else { 0 })
+            };
             unsafe {
                 core::ptr::write(
                     d as *mut StmtNode,
-                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: if is_char_pointee { 1 } else { 0 }, next: 0, then_body: if is_char_pointee { 0 } else { 2 }, else_body: 0 },
+                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: d_expr, next: 0, then_body: d_then_body, else_body: 0 },
                 )
             };
             unsafe { (*(tail as *mut StmtNode)).next = d };
@@ -13790,7 +13816,86 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m126 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 { 0 } else { 1 });
+        // CASE 140: MILESTONE 127 -- a bare (non-`*`) declarator mixed
+        // into a pointer-declarator list (`int *p, q;`). `p` is a real
+        // `int *`, `q` a plain `int` in the SAME statement -- real C's
+        // own rule that `*` binds to the name, not the leading type
+        // keyword. `*p + q`.
+        const SRC140: &[u8] = b"int main() { int a; a = 5; int *p, q; p = &a; q = 9; return *p + q; }";
+        let case140_result = compile_and_run_program_callable(SRC140.as_ptr() as u64, SRC140.len() as u64);
+        w(b"  case140 (int *p, q -- bare scalar mixed into a pointer list, *p+q) returned=");
+        if let Some(r) = case140_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 14)\n");
+        let case140_ok = case140_result == Some(14);
+        write_check(b"case140_pointer_then_bare_scalar_mixed_returns_14=", case140_ok);
+
+        w(b"\n");
+
+        // CASE 141: the SAME mixing with `is_char_pointee = true` --
+        // proves the bare-continuation's own fallback encoding correctly
+        // reads `is_char_pointee` too (a plain `char` scalar, `then_body:
+        // 1`), not hardcoded to the `int` scalar encoding (`then_body:
+        // 0`) regardless of the list's real base type.
+        const SRC141: &[u8] = b"int main() { char c1; c1 = 3; char *p, c; p = &c1; c = 4; return *p + c; }";
+        let case141_result = compile_and_run_program_callable(SRC141.as_ptr() as u64, SRC141.len() as u64);
+        w(b"  case141 (char *p, c -- bare char scalar mixed into a char pointer list, *p+c) returned=");
+        if let Some(r) = case141_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 7)\n");
+        let case141_ok = case141_result == Some(7);
+        write_check(b"case141_char_pointer_then_bare_scalar_mixed_returns_7=", case141_ok);
+
+        w(b"\n");
+
+        // CASE 142: TWO bare continuations after one pointer (`int *p,
+        // q, r;`) -- proves the optional-`*` check re-runs correctly
+        // for every comma iteration, not just the first continuation.
+        const SRC142: &[u8] = b"int main() { int a; a = 100; int *p, q, r; p = &a; q = 5; r = 6; return *p + q + r; }";
+        let case142_result = compile_and_run_program_callable(SRC142.as_ptr() as u64, SRC142.len() as u64);
+        w(b"  case142 (int *p, q, r -- two bare scalars after one pointer, *p+q+r) returned=");
+        if let Some(r) = case142_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 111)\n");
+        let case142_ok = case142_result == Some(111);
+        write_check(b"case142_pointer_then_two_bare_scalars_returns_111=", case142_ok);
+
+        w(b"\n");
+
+        // CASE 143: a REGRESSION guard -- `int *p, *q;` (Milestone 126's
+        // own all-pointers case) must still recognize an EXPLICIT `*`
+        // correctly and still produce two real pointers, not silently
+        // fall back to the new bare-scalar path now that `*` is
+        // optional rather than required.
+        const SRC143: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *p, *q; p = &a; q = &b; return *p + *q; }";
+        let case143_result = compile_and_run_program_callable(SRC143.as_ptr() as u64, SRC143.len() as u64);
+        w(b"  case143 (REGRESSION: int *p, *q -- explicit '*' on every declarator still recognized) returned=");
+        if let Some(r) = case143_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case143_ok = case143_result == Some(3);
+        write_check(b"case143_all_pointer_comma_list_regression_returns_3=", case143_ok);
+
+        w(b"\n");
+
+        let overall_m127 = case140_ok && case141_ok && case142_ok && case143_ok;
+        w(b"OVERALL_M127=");
+        w(if overall_m127 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 { 0 } else { 1 });
     }
 }
 

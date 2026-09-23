@@ -6353,15 +6353,43 @@ unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, iden
 /// `is_int_ptr` itself needed (115 local, 116 parameter), is enough to
 /// unlock this for both a local `int **` AND an `int **` parameter at
 /// once.
+// MILESTONE 121: `is_int_ptr_ptr` recognized here (an `int **` value
+// itself, not just what it points to, scales `+`/`-` by 8) -- the exact
+// gap Milestone 118 first named and 119/120 each re-confirmed still
+// open.
+//
+// MILESTONE 139 (superseded by 140 below): `is_int_ptr_ptr_ptr` was
+// still ignored here (bound as `_is_int_ptr_ptr_ptr`) -- `int ***`
+// arithmetic on the pointer value itself was out of scope that
+// milestone (which only closed the function-call-boundary gap for
+// `int ***`), the exact same one-milestone-then-close-it shape
+// `is_int_ptr_ptr` itself carried through Milestone 118-120 before 121
+// closed it.
+//
+// MILESTONE 140: `is_int_ptr_ptr_ptr` now recognized too -- one more
+// disjunct alongside the pre-existing `is_array`/`is_int_ptr`/
+// `is_int_ptr_ptr` check that already selects `Some(8)`. Zero new
+// x86_64 encodings, zero `EXPR_BINARY` `+`/`-` codegen change: it
+// already consumes the `Option<u8>` scale generically, unaware which
+// `VarSlot` field produced `Some(8)`. Because `is_int_ptr_ptr_ptr` was
+// already threaded everywhere this function reads from -- a local
+// `int ***` (Milestone 132) and an `int ***` PARAMETER (Milestone
+// 139's own `collect_vars_for_function()` fix) -- this one change
+// unlocks `int ***` arithmetic for a local, a parameter, AND
+// (transitively, since this function only inspects an `EXPR_IDENT`
+// operand's declared `VarSlot` flags) a local `int ***` populated from
+// an `int ***` return value (also Milestone 139), all at once, the
+// same "both prerequisites were already in place" shape Milestone 121
+// itself observed for `int **`.
 unsafe fn ptr_operand_scale(src_ptr: u64, vars_ptr: u64, nvars: u64, node: &ExprNode) -> Option<u8> {
     if node.kind != EXPR_IDENT {
         return None;
     }
     match unsafe { find_var(src_ptr, vars_ptr, nvars, node.ident_off as u64, node.ident_len as u64) } {
-        Some((_o, _is_char, is_array, is_char_ptr, is_int_ptr, is_int_ptr_ptr, _is_int_ptr_ptr_ptr)) => {
+        Some((_o, _is_char, is_array, is_char_ptr, is_int_ptr, is_int_ptr_ptr, is_int_ptr_ptr_ptr)) => {
             if is_char_ptr != 0 {
                 Some(1)
-            } else if is_array != 0 || is_int_ptr != 0 || is_int_ptr_ptr != 0 {
+            } else if is_array != 0 || is_int_ptr != 0 || is_int_ptr_ptr != 0 || is_int_ptr_ptr_ptr != 0 {
                 Some(8)
             } else {
                 None
@@ -15156,7 +15184,162 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m139 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 { 0 } else { 1 });
+        // CASE 178: the real, distinguishing proof that `pppx + 1` (the
+        // pointer on the LEFT) genuinely scales an `int ***` by 8, not 0
+        // (unscaled) -- the exact three-level mirror of Milestone 121's
+        // own CASE126. Declaration order: y, x, py, px, ppy, ppx, pppx.
+        // `pppx = &ppx` (`rbp-48`); `pppx + 1` must reach
+        // `rbp-48 + 1*8 == rbp-40`, exactly `ppy`'s own slot -- which
+        // holds `&py` (`rbp-24`), whose own slot holds `&y` (`rbp-8`), so
+        // TWO more real dereferences (`***(pppx + 1)`) must reach `y`
+        // itself. A pre-fix build (this milestone's own committed
+        // Milestone 139 baseline, no `int ***` scaling at all) would
+        // instead compute `rbp-48 + 1 == rbp-47`, an unaligned,
+        // real-but-wrong address one byte into the middle of `ppy`'s own
+        // slot.
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *py; int *px;
+        //       py = &y; px = &x;
+        //       int **ppy; int **ppx;
+        //       ppy = &py; ppx = &px;
+        //       int ***pppx;
+        //       pppx = &ppx;
+        //       return ***(pppx + 1) == 111;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC178: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *py; int *px; py = &y; px = &x; int **ppy; int **ppx; ppy = &py; ppx = &px; int ***pppx; pppx = &ppx; return ***(pppx + 1) == 111; }";
+        let case178_result = compile_and_run_program_callable(SRC178.as_ptr() as u64, SRC178.len() as u64);
+        w(b"  case178 (pppx + 1 through int*** scales by 8, pointer on the left, triple-deref reaches the adjacent int**'s own pointee, in-process) returned=");
+        if let Some(r) = case178_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case178_ok = case178_result == Some(1);
+        write_check(b"case178_int_ptr_ptr_ptr_plus_scales_by_8_returns_1=", case178_ok);
+
+        w(b"\n");
+
+        // CASE 179: the genuinely distinct code path Milestone 121's own
+        // CASE127 established -- the pointer on the RIGHT (`1 + pppx`,
+        // `emit_shl_rax_imm8`, not the RCX path CASE 178 exercises), now
+        // proven one level deeper for `int ***`.
+        // -------------------------------------------------------------
+        const SRC179: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *py; int *px; py = &y; px = &x; int **ppy; int **ppx; ppy = &py; ppx = &px; int ***pppx; pppx = &ppx; return ***(1 + pppx) == 111; }";
+        let case179_result = compile_and_run_program_callable(SRC179.as_ptr() as u64, SRC179.len() as u64);
+        w(b"  case179 (1 + pppx, pointer on the right, the distinct shl-rax-imm8 code path, in-process) returned=");
+        if let Some(r) = case179_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case179_ok = case179_result == Some(1);
+        write_check(b"case179_one_plus_int_ptr_ptr_ptr_scales_by_8_returns_1=", case179_ok);
+
+        w(b"\n");
+
+        // CASE 180: a real, deliberate VERIFICATION case, not a second
+        // fix -- proves this milestone's own single one-line change in
+        // `ptr_operand_scale()` already reaches an `int ***` PARAMETER
+        // too, through a real function-call boundary, exactly as
+        // Milestone 121's own CASE128 already proved one level shallower
+        // (and unlike `is_int_ptr`, which needed a dedicated follow-up
+        // milestone, 116, to close the identical parameter gap).
+        //   int deref3_adjacent(int ***pppx) { return ***(pppx + 1); }
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *py; int *px;
+        //       py = &y; px = &x;
+        //       int **ppy; int **ppx;
+        //       ppy = &py; ppx = &px;
+        //       int ***pppx;
+        //       pppx = &ppx;
+        //       return deref3_adjacent(pppx);
+        //   }
+        // Hand-computed: 111.
+        // -------------------------------------------------------------
+        const SRC180: &[u8] = b"int deref3_adjacent(int ***pppx) { return ***(pppx + 1); } int main() { int y; int x; y = 111; x = 222; int *py; int *px; py = &y; px = &x; int **ppy; int **ppx; ppy = &py; ppx = &px; int ***pppx; pppx = &ppx; return deref3_adjacent(pppx); }";
+        let case180_result = compile_and_run_program_callable(SRC180.as_ptr() as u64, SRC180.len() as u64);
+        w(b"  case180 (int*** PARAMETER pointer arithmetic through a call boundary, verification the same one-line fix reaches parameters too, in-process) returned=");
+        if let Some(r) = case180_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 111)\n");
+        let case180_ok = case180_result == Some(111);
+        write_check(b"case180_int_ptr_ptr_ptr_param_arithmetic_through_call_returns_111=", case180_ok);
+
+        w(b"\n");
+
+        // CASE 181: a second real, deliberate VERIFICATION case -- proves
+        // the new `is_int_ptr_ptr_ptr != 0` disjunct did NOT disturb
+        // `ptr_operand_scale()`'s own pre-existing `is_char_ptr` branch
+        // (scale 1, checked FIRST in the if/else chain) -- a `char *` and
+        // an `int ***` both doing real pointer arithmetic in the SAME
+        // expression, the three-level mirror of Milestone 121's own
+        // CASE129. `cp + 8` (byte-scaled) must still reach `d`.
+        //
+        // A genuine, honestly-disclosed test-scoping fix made WHILE
+        // writing this case (caught by a real compile failure on first
+        // boot, not assumed): a naive port of CASE129's own two-parallel-
+        // chains shape (y/x, py/px, ppy/ppx, pppx -- 7 vars) plus the
+        // 3 char vars (d, c, cp) totals 10 locals in one function,
+        // exceeding `MAX_VARS` (8) -- `ParseError`s that far down a
+        // deeply-nested expression are easy to miss by inspection alone.
+        // Fixed by aliasing: `ppy` and `ppz` both legally point at the
+        // SAME `py` (there is no requirement that the two int** targets
+        // be independent, only that `pppz + 1` lands on the OTHER
+        // declared int** slot, `ppy`'s, one slot away from `pppz`'s own
+        // direct target `ppz`) -- 5 vars for the triple-pointer chain
+        // (`y`, `py`, `ppy`, `ppz`, `pppz`) + 3 char vars = exactly 8,
+        // the same "land exactly AT the cap, not under it" precedent
+        // Milestone 134's own CASE159 already established.
+        //   int main() {
+        //       char d; char c;
+        //       d = 200; c = 3;
+        //       char *cp; cp = &c;
+        //       int y;
+        //       y = 111;
+        //       int *py; py = &y;
+        //       int **ppy; ppy = &py;
+        //       int **ppz; ppz = &py;
+        //       int ***pppz;
+        //       pppz = &ppz;
+        //       return (*(cp + 8) == 200) + (***(pppz + 1) == 111) * 10;
+        //   }
+        // Hand-computed (declaration order d,c,cp,y,py,ppy,ppz,pppz):
+        // cp==&c, cp+8 reaches d's own slot, *(cp+8)==200. pppz==&ppz;
+        // pppz+1 reaches ppy's own slot (one slot over); *(pppz+1)==
+        // ppy's value==&py; **(pppz+1)==py's value==&y;
+        // ***(pppz+1)==y==111. Total: 1 + 10 = 11.
+        // -------------------------------------------------------------
+        const SRC181: &[u8] = b"int main() { char d; char c; d = 200; c = 3; char *cp; cp = &c; int y; y = 111; int *py; py = &y; int **ppy; ppy = &py; int **ppz; ppz = &py; int ***pppz; pppz = &ppz; return (*(cp + 8) == 200) + (***(pppz + 1) == 111) * 10; }";
+        let case181_result = compile_and_run_program_callable(SRC181.as_ptr() as u64, SRC181.len() as u64);
+        w(b"  case181 (char* scale-1 and int*** scale-8 arithmetic coexist with zero cross-contamination, in-process) returned=");
+        if let Some(r) = case181_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case181_ok = case181_result == Some(11);
+        write_check(b"case181_char_ptr_and_int_ptr_ptr_ptr_arithmetic_coexist_returns_11=", case181_ok);
+
+        w(b"\n");
+
+        let overall_m140 = case178_ok && case179_ok && case180_ok && case181_ok;
+        w(b"OVERALL_M140=");
+        w(if overall_m140 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 { 0 } else { 1 });
     }
 }
 

@@ -2156,6 +2156,21 @@ const TOK_CHAR: u8 = 55; // keyword "char"
 // subset's lexer has never had any other use for either byte).
 const TOK_LBRACKET: u8 = 56; // "["
 const TOK_RBRACKET: u8 = 57; // "]"
+// MILESTONE 137: real `++`/`--` -- this file's own Milestone 76 doc
+// comment (top of file) once said this subset "has no `--`/`++` at all,
+// and never will from this alone", since nothing consumed two adjacent
+// `+`/`-` tokens as one lexeme. That was true THEN (Milestone 76 only
+// ever needed unary minus); it is not a permanent limit -- adding the
+// maximal-munch check itself is the same small, mechanical shape as
+// every other multi-char operator this lexer already recognizes (`+=`,
+// `<<`, `&&`, ...), just never done for these two specific bytes before.
+// Checked in the SAME cascade position as `+=`/`-=` (2-char operators,
+// before the 1-char `+`/`-` fallback) -- `++`/`-- `and `+=`/`-=` can
+// never both match the same input (the second byte differs), so their
+// relative order against each other doesn't matter, only that both run
+// before the 1-char fallback.
+const TOK_PLUSPLUS: u8 = 58;   // "++"
+const TOK_MINUSMINUS: u8 = 59; // "--"
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -2531,6 +2546,27 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
         }
         if b == b'>' && next == Some(b'>') {
             unsafe { tok_write(toks_ptr, n, Token { kind: TOK_SHR, int_val: 0, ident_off: 0, ident_len: 0 }) };
+            n += 1;
+            i += 2;
+            continue;
+        }
+        // MILESTONE 137: "++"/"--" -- checked before the "+="/"-=" cascade
+        // just below (order between them doesn't matter, see this file's
+        // own const declarations for why; checked first here purely
+        // because it was written first). Maximal munch: "a+++b" lexes as
+        // IDENT(a) PLUSPLUS PLUS IDENT(b) here, matching real C's own
+        // notoriously surprising rule (and real C's own resulting parse
+        // error for that exact input in a context expecting an operand) --
+        // not a bug, the same lexer-does-maximal-munch-unconditionally
+        // discipline this file's own multi-char operators already follow.
+        if b == b'+' && next == Some(b'+') {
+            unsafe { tok_write(toks_ptr, n, Token { kind: TOK_PLUSPLUS, int_val: 0, ident_off: 0, ident_len: 0 }) };
+            n += 1;
+            i += 2;
+            continue;
+        }
+        if b == b'-' && next == Some(b'-') {
+            unsafe { tok_write(toks_ptr, n, Token { kind: TOK_MINUSMINUS, int_val: 0, ident_off: 0, ident_len: 0 }) };
             n += 1;
             i += 2;
             continue;
@@ -4296,6 +4332,68 @@ impl Parser {
     /// consumed by the `for` parser itself).
     unsafe fn finish_ident_assign(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
         let opk = unsafe { self.peek() }.kind;
+        // MILESTONE 137: `i++;`/`i--;` -- desugared to `i = i + 1;`/
+        // `i = i - 1;` at STATEMENT level, the narrowest possible first
+        // slice (real C's postfix `++`/`--` as a general EXPRESSION --
+        // usable inside a larger expression, with the OLD value as its
+        // result -- is real, disclosed future work, not attempted here;
+        // this milestone only recognizes `IDENT "++"/"--"` as an entire
+        // statement, exactly where a plain assignment or compound
+        // assignment already can appear). No RHS token to parse at all
+        // -- unlike every compound-assignment operator below, which
+        // reads a real expression after itself, a literal `1` is
+        // synthesized directly, then this reuses the EXACT SAME
+        // `lhs_ref`/`EXPR_BINARY`/`STMT_ASSIGN` construction the `+=`/
+        // `-=` path below already uses -- zero new codegen, since `i = i
+        // + 1` is already a real, existing STMT_ASSIGN shape.
+        if opk == TOK_PLUSPLUS || opk == TOK_MINUSMINUS {
+            let op: u8 = if opk == TOK_PLUSPLUS { b'+' } else { b'-' };
+            unsafe { self.advance() }; // consume '++' or '--'
+            if consume_semi {
+                unsafe { self.expect(TOK_SEMI) }?;
+            }
+            let lhs_ref = unsafe { alloc_expr() };
+            if lhs_ref == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    lhs_ref as *mut ExprNode,
+                    ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            let one = unsafe { alloc_expr() };
+            if one == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    one as *mut ExprNode,
+                    ExprNode { kind: EXPR_INTLIT, int_val: 1, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            let bin = unsafe { alloc_expr() };
+            if bin == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    bin as *mut ExprNode,
+                    ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: lhs_ref, right: one, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
+            let node = unsafe { alloc_stmt() };
+            if node == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    node as *mut StmtNode,
+                    StmtNode { kind: STMT_ASSIGN, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: 0, else_body: 0 },
+                )
+            };
+            return Ok(node);
+        }
         let binop: Option<u8> = if opk == TOK_PLUSEQ { Some(b'+') }
             else if opk == TOK_MINUSEQ { Some(b'-') }
             else if opk == TOK_STAREQ { Some(b'*') }
@@ -14646,7 +14744,109 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m136 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 { 0 } else { 1 });
+        // CASE 165: MILESTONE 137 -- real `i++;` as a standalone
+        // statement, the narrowest possible slice of this file's own
+        // long-disclosed "no `--`/`++` at all" gap (Milestone 76's own
+        // top-of-file doc comment). Desugars to `i = i + 1;`.
+        const SRC165: &[u8] = b"int main() { int i; i = 5; i++; return i; }";
+        let case165_result = compile_and_run_program_callable(SRC165.as_ptr() as u64, SRC165.len() as u64);
+        w(b"  case165 (i++; as a standalone statement, desugars to i = i + 1) returned=");
+        if let Some(r) = case165_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 6)\n");
+        let case165_ok = case165_result == Some(6);
+        write_check(b"case165_postfix_increment_statement_returns_6=", case165_ok);
+
+        w(b"\n");
+
+        // CASE 166: `i--;` -- the same desugaring, `-` instead of `+`.
+        const SRC166: &[u8] = b"int main() { int i; i = 5; i--; return i; }";
+        let case166_result = compile_and_run_program_callable(SRC166.as_ptr() as u64, SRC166.len() as u64);
+        w(b"  case166 (i--; as a standalone statement, desugars to i = i - 1) returned=");
+        if let Some(r) = case166_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4)\n");
+        let case166_ok = case166_result == Some(4);
+        write_check(b"case166_postfix_decrement_statement_returns_4=", case166_ok);
+
+        w(b"\n");
+
+        // CASE 167: the actual real-world motivating case -- `for (i =
+        // 0; i < 5; i++) { ... }`. Proves the `for` loop's own STEP
+        // clause (which already called `finish_ident_assign(n, false)`,
+        // completely unchanged since Milestone 86) picks up `i++`
+        // automatically, with ZERO changes at that call site -- the same
+        // "accepting the grammar plus threading it through IS the
+        // complete feature" shape this file's own pointer milestones
+        // already established repeatedly.
+        const SRC167: &[u8] = b"int main() { int i; int sum; sum = 0; for (i = 0; i < 5; i++) { sum = sum + i; } return sum; }";
+        let case167_result = compile_and_run_program_callable(SRC167.as_ptr() as u64, SRC167.len() as u64);
+        w(b"  case167 (for (i=0; i<5; i++) sum += i -- the real motivating use case, zero new call-site code) returned=");
+        if let Some(r) = case167_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 10)\n");
+        let case167_ok = case167_result == Some(10);
+        write_check(b"case167_for_loop_step_clause_increment_returns_10=", case167_ok);
+
+        w(b"\n");
+
+        // CASE 168: a REGRESSION guard -- `i += 3;` (Milestone 84's own
+        // compound-assignment feature) must still work exactly as
+        // before, now that `finish_ident_assign()` has a new early
+        // branch checked before it.
+        const SRC168: &[u8] = b"int main() { int i; i = 5; i += 3; return i; }";
+        let case168_result = compile_and_run_program_callable(SRC168.as_ptr() as u64, SRC168.len() as u64);
+        w(b"  case168 (REGRESSION: i += 3; compound assignment still works unaffected) returned=");
+        if let Some(r) = case168_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 8)\n");
+        let case168_ok = case168_result == Some(8);
+        write_check(b"case168_compound_assignment_regression_returns_8=", case168_ok);
+
+        w(b"\n");
+
+        // CASE 169: a real NEGATIVE control -- `a+++b;` as a full
+        // statement MUST fail to compile. Maximal munch lexes this as
+        // IDENT(a) PLUSPLUS PLUS IDENT(b), the exact same notoriously
+        // surprising rule real C's own lexer applies (and real C also
+        // rejects this exact input in a plain-statement context) --
+        // `finish_ident_assign()` consumes the `++`, then (since
+        // `consume_semi` is true at statement level) expects `;` but
+        // finds the leftover `+` instead, a real ParseError. Proves the
+        // maximal-munch choice this milestone's own lexer change made is
+        // real and intentional, not accidentally permissive.
+        const SRC169: &[u8] = b"int main() { int a; int b; a = 1; b = 2; a+++b; return 0; }";
+        let case169_result = compile_and_run_program_callable(SRC169.as_ptr() as u64, SRC169.len() as u64);
+        w(b"  case169 (NEGATIVE CONTROL: a+++b; -- maximal munch must reject this, matching real C's own surprising rule) returned=");
+        if let Some(r) = case169_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed, as required)");
+        }
+        w(b" (expected: compile failure)\n");
+        let case169_ok = case169_result.is_none();
+        write_check(b"case169_maximal_munch_rejects_ambiguous_input=", case169_ok);
+
+        w(b"\n");
+
+        let overall_m137 = case165_ok && case166_ok && case167_ok && case168_ok && case169_ok;
+        w(b"OVERALL_M137=");
+        w(if overall_m137 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 { 0 } else { 1 });
     }
 }
 

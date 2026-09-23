@@ -13598,7 +13598,63 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m122 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 { 0 } else { 1 });
+        // CASE 135: MILESTONE 125 -- a real PROVING case, not a new fix.
+        // Milestone 122's own "Still genuinely open" list named `pp[1]`
+        // (EXPR_INDEX through an `int **`) as untested. Read (not
+        // guessed) EXPR_INDEX's own codegen: it branches only on
+        // `is_array`/`is_char_ptr`, never checks `is_int_ptr_ptr` at all
+        // -- for a non-char-pointer base it already does
+        // `shl rcx, 3` (scale index by 8) then a single 8-byte
+        // `mov rax, [rax]`, which is EXACTLY correct for `int **`
+        // indexing too, since each element of an `int **` is itself an
+        // 8-byte pointer. Also confirmed OP_DEREF's own `is_char_pointee`
+        // check only special-cases when its operand is a bare
+        // `EXPR_IDENT` -- an `EXPR_INDEX` operand (as in `*pp[1]`) falls
+        // through to the plain 8-byte deref path, unconditionally
+        // correct here since `pp[1]` itself yields an `int *`
+        // (pointer-width) value.
+        //
+        // A first draft of this case (`pp = &c`, expecting 222) FAILED
+        // -- returned an address-shaped garbage value, not 222 -- caught
+        // by actually running it, not assumed passing. Root cause was
+        // this test's own arithmetic, not a compiler bug: EXPR_INDEX
+        // computes `base - index*8` (a real, deliberate SUBTRACTION,
+        // matching this compiler's established "index 0 = highest
+        // address, index N = N*8 lower" array convention CASE 112
+        // already proved), not `base + index*8`. With `pp = &c`,
+        // `pp[1]` = `*(pp_value - 8)` lands on `pp`'s OWN stack slot
+        // (one below `c`), not `b`'s -- explaining the address-shaped
+        // result (it read `pp`'s value, itself an address, then only
+        // dereferenced once more).
+        //
+        // Corrected: stack layout (declaration order, first local
+        // highest address, each next one 8 bytes lower -- CASE 133's
+        // own established fact): x=rbp-8, y=rbp-16, z=rbp-24, a=rbp-32,
+        // b=rbp-40, c=rbp-48, pp=rbp-56. `pp = &a` -> pp holds address
+        // rbp-32. `pp[1]` = `*(pp_value - 8)` = the pointer stored at
+        // rbp-40, which is `b`'s own value (`&y`). `*pp[1]` = `*(&y)` =
+        // 222. Re-run with this fix and confirmed PASS before trusting
+        // it (see this milestone's own commit message).
+        const SRC135: &[u8] = b"int main() { int x; int y; int z; x = 111; y = 222; z = 333; int *a; int *b; int *c; a = &x; b = &y; c = &z; int **pp; pp = &a; return *pp[1]; }";
+        let case135_result = compile_and_run_program_callable(SRC135.as_ptr() as u64, SRC135.len() as u64);
+        w(b"  case135 (PROVING: pp[1] through an int** indexes correctly, *pp[1] via pp=&c reads b's value &y, in-process) returned=");
+        if let Some(r) = case135_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 222)\n");
+        let case135_ok = case135_result == Some(222);
+        write_check(b"case135_int_ptr_ptr_index_returns_222=", case135_ok);
+
+        w(b"\n");
+
+        let overall_m125 = case135_ok;
+        w(b"OVERALL_M125=");
+        w(if overall_m125 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 { 0 } else { 1 });
     }
 }
 

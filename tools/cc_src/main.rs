@@ -4469,6 +4469,75 @@ impl Parser {
         Ok(node)
     }
 
+    /// MILESTONE 145: the single-level-pointer-dereference sibling of
+    /// `build_incr_decr_assign()`/`build_incr_decr_assign_index()` above
+    /// -- builds `*p = *p +/- 1;` (an `EXPR_UNARY { op: OP_DEREF, left:
+    /// EXPR_IDENT(p) }` READ, wrapped in an `EXPR_BINARY`, wrapped in a
+    /// `STMT_ASSIGN_DEREF` WRITE) instead of those functions' plain-
+    /// identifier or array-index shapes. Zero pointer-scaling concern
+    /// here unlike `build_incr_decr_assign()` on a POINTER-typed
+    /// identifier (Milestone 142's own verification): `ptr_operand_
+    /// scale()` only ever recognizes a bare `EXPR_IDENT` operand (its own
+    /// `if node.kind != EXPR_IDENT { return None }` guard), and the read
+    /// side built here is an `EXPR_UNARY`, not an `EXPR_IDENT` -- so
+    /// `*p + 1` correctly gets the PLAIN, unscaled add every ordinary
+    /// `int` already uses, exactly right for incrementing the pointee's
+    /// own VALUE (not the pointer itself, which `p++`/`--p` already
+    /// covers separately).
+    unsafe fn build_incr_decr_assign_deref(&mut self, name: Token, op: u8) -> Result<u64, ParseError> {
+        let ptr_ref = unsafe { alloc_expr() };
+        if ptr_ref == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                ptr_ref as *mut ExprNode,
+                ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let deref_ref = unsafe { alloc_expr() };
+        if deref_ref == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                deref_ref as *mut ExprNode,
+                ExprNode { kind: EXPR_UNARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_DEREF, left: ptr_ref, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let one = unsafe { alloc_expr() };
+        if one == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                one as *mut ExprNode,
+                ExprNode { kind: EXPR_INTLIT, int_val: 1, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let bin = unsafe { alloc_expr() };
+        if bin == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                bin as *mut ExprNode,
+                ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: deref_ref, right: one, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let node = unsafe { alloc_stmt() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut StmtNode,
+                StmtNode { kind: STMT_ASSIGN_DEREF, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: 0, else_body: 0 },
+            )
+        };
+        Ok(node)
+    }
+
     unsafe fn finish_ident_assign(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
         let opk = unsafe { self.peek() }.kind;
         // MILESTONE 137: `i++;`/`i--;` -- desugared via `build_incr_decr_
@@ -4879,6 +4948,61 @@ impl Parser {
                 }
                 unsafe { self.expect(TOK_SEMI) }?;
                 unsafe { self.build_incr_decr_assign(name, op) }
+            }
+            // MILESTONE 145: `(*p)++;`/`(*p)--;` -- the pointer-
+            // DEREFERENCE-target half of the gap Milestone 142's own
+            // closing disclosure named ("`arr[i]++`/`*p++` as targets"),
+            // the last of the three shapes that disclosure listed
+            // (array-element postfix and prefix already closed by
+            // Milestone 143/144).
+            //
+            // Deliberately spelled `(*p)++;`, WITH the parentheses, not
+            // bare `*p++;` -- checked against real C's own grammar before
+            // writing a single line of parser code, not assumed: in real
+            // C, postfix `++`/`--` bind TIGHTER than unary `*`, so `*p++`
+            // actually parses as `*(p++)` (increment the POINTER, discard
+            // the read) -- the exact opposite of what "increment the
+            // thing `p` points to" would mean, and NOT what Milestone
+            // 142's own `p++`/`--p` already covers for the pointer
+            // itself. A bare `*p++;` hook here would have silently
+            // implemented the WRONG C semantics under a name that implies
+            // the right one -- caught and reverted before boot, not
+            // shipped and found later. `(*p)++;`, with explicit
+            // parentheses forcing `*p` to bind first, is real, unambiguous
+            // C for "increment the pointee" and has no such trap.
+            //
+            // This dispatch only ever recognizes this ONE exact shape --
+            // `"(" "*" IDENT ")" ("++"|"--") ";"` -- as a whole statement;
+            // there is no general parenthesized-expression-statement
+            // grammar here (`(x);` alone is not legal in this subset, the
+            // same "this dispatch only ever sees the first token of a
+            // brand-new statement" scoping every other arm in this match
+            // already relies on). Any other token sequence after the
+            // opening `(` is a real, disclosed `UnexpectedToken` parse
+            // error, not silently accepted. Delegates to `build_incr_
+            // decr_assign_deref()` (this same milestone), the pointer-
+            // dereference sibling of Milestone 138/143's own identifier/
+            // array-index builders -- builds `*p = *p +/- 1;`, reusing
+            // `STMT_ASSIGN_DEREF`'s existing write codegen and
+            // `EXPR_UNARY`'s existing `OP_DEREF` read codegen unchanged.
+            // Single-level `int *` only, the same "narrow slice first"
+            // discipline every `++`/`--` milestone so far has kept --
+            // `(**p)++`/`(***p)++` are real, disclosed future work.
+            TOK_LPAREN => {
+                unsafe { self.advance() }; // consume '('
+                unsafe { self.expect(TOK_STAR) }?;
+                let name = unsafe { self.expect(TOK_IDENT) }?;
+                unsafe { self.expect(TOK_RPAREN) }?;
+                let op: u8 = if unsafe { self.peek() }.kind == TOK_PLUSPLUS {
+                    b'+'
+                } else if unsafe { self.peek() }.kind == TOK_MINUSMINUS {
+                    b'-'
+                } else {
+                    return Err(ParseError::UnexpectedToken(self.pos));
+                };
+                unsafe { self.advance() }; // consume '++' or '--'
+                unsafe { self.expect(TOK_SEMI) }?;
+                unsafe { self.build_incr_decr_assign_deref(name, op) }
             }
             // MILESTONE 92: `goto LABEL ;`.
             TOK_GOTO => {
@@ -15827,7 +15951,57 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m144 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 { 0 } else { 1 });
+        // CASE 195: `(*p)++;` -- the pointer-dereference-target half of
+        // the gap Milestone 142's own closing disclosure named, spelled
+        // WITH explicit parentheses (see the new `TOK_LPAREN` dispatch
+        // arm's own doc comment for why bare `*p++;` would have been the
+        // WRONG real-C semantics, not just an incomplete subset of the
+        // right one).
+        //   int main() {
+        //       int x;
+        //       x = 10;
+        //       int *p;
+        //       p = &x;
+        //       (*p)++;
+        //       return x;
+        //   }
+        // Hand-computed: 11.
+        // -------------------------------------------------------------
+        const SRC195: &[u8] = b"int main() { int x; x = 10; int *p; p = &x; (*p)++; return x; }";
+        let case195_result = compile_and_run_program_callable(SRC195.as_ptr() as u64, SRC195.len() as u64);
+        w(b"  case195 ((*p)++; a real pointer-dereference-target increment statement, in-process) returned=");
+        if let Some(r) = case195_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case195_ok = case195_result == Some(11);
+        write_check(b"case195_deref_target_increment_returns_11=", case195_ok);
+
+        w(b"\n");
+
+        // CASE 196: the decrement mirror -- `(*p)--;`.
+        const SRC196: &[u8] = b"int main() { int x; x = 10; int *p; p = &x; (*p)--; return x; }";
+        let case196_result = compile_and_run_program_callable(SRC196.as_ptr() as u64, SRC196.len() as u64);
+        w(b"  case196 ((*p)--; a real pointer-dereference-target decrement statement, in-process) returned=");
+        if let Some(r) = case196_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 9)\n");
+        let case196_ok = case196_result == Some(9);
+        write_check(b"case196_deref_target_decrement_returns_9=", case196_ok);
+
+        w(b"\n");
+
+        let overall_m145 = case195_ok && case196_ok;
+        w(b"OVERALL_M145=");
+        w(if overall_m145 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 { 0 } else { 1 });
     }
 }
 

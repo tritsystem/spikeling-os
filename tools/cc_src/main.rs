@@ -4128,7 +4128,19 @@ impl Parser {
             if has_second_star {
                 unsafe { self.advance() }; // second '*'
             }
-            let d_then_body: u64 = if has_second_star { 3 } else if has_first_star { 2 } else { 0 };
+            // MILESTONE 136: the further symmetric upgrade to `int ***`
+            // -- the last remaining direction in the full depth matrix:
+            // Milestone 129 (this same loop) already let a continuation
+            // downgrade to `*`/bare from a head `int **`; Milestone 130/
+            // 135 already let a continuation UPGRADE from a head `int *`
+            // all the way to `**`/`***`. This closes the one gap left --
+            // upgrading from a head `int **` to `***` -- completing the
+            // full 3-entry-point x 4-depth matrix.
+            let has_third_star = has_second_star && unsafe { self.peek() }.kind == TOK_STAR;
+            if has_third_star {
+                unsafe { self.advance() }; // third '*'
+            }
+            let d_then_body: u64 = if has_third_star { 4 } else if has_second_star { 3 } else if has_first_star { 2 } else { 0 };
             let nm = unsafe { self.expect(TOK_IDENT) }?;
             let d = unsafe { alloc_stmt() };
             if d == 0 {
@@ -14593,7 +14605,48 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m135 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 { 0 } else { 1 });
+        // CASE 163: MILESTONE 136 -- the last remaining direction in the
+        // full depth matrix, entered via a head `int **`: `int **p,
+        // ***q, r;` -- `p` a real `int **`, `q` UPGRADED to a real `int
+        // ***`, `r` a plain `int`. `**p + ***q + r`.
+        const SRC163: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pb; pb = &b; int **ppb; ppb = &pb; int **p, ***q, r; p = &pb; q = &ppb; r = 5; return **p + ***q + r; }";
+        let case163_result = compile_and_run_program_callable(SRC163.as_ptr() as u64, SRC163.len() as u64);
+        w(b"  case163 (int **p, ***q, r -- continuation upgraded to *** entered via a head int**, **p+***q+r) returned=");
+        if let Some(r) = case163_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 9)\n");
+        let case163_ok = case163_result == Some(9);
+        write_check(b"case163_double_pointer_list_upgraded_to_triple_returns_9=", case163_ok);
+
+        w(b"\n");
+
+        // CASE 164: a REGRESSION guard -- `int **p, *q, r;` (Milestone
+        // 129's own downgrade case, the exact SRC147 shape) must still
+        // work exactly as before, now that a continuation can ALSO
+        // upgrade to `***`.
+        const SRC164: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pa; pa = &a; int **p, *q, r; p = &pa; q = &b; r = 100; return **p + *q + r; }";
+        let case164_result = compile_and_run_program_callable(SRC164.as_ptr() as u64, SRC164.len() as u64);
+        w(b"  case164 (REGRESSION: int **p, *q, r -- Milestone 129's own downgrade case still works) returned=");
+        if let Some(r) = case164_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 103)\n");
+        let case164_ok = case164_result == Some(103);
+        write_check(b"case164_double_pointer_list_downgrade_regression_returns_103=", case164_ok);
+
+        w(b"\n");
+
+        let overall_m136 = case163_ok && case164_ok;
+        w(b"OVERALL_M136=");
+        w(if overall_m136 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 { 0 } else { 1 });
     }
 }
 

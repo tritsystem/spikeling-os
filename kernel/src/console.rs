@@ -205,12 +205,33 @@ pub fn write_char(c: char) {
     }
 }
 
+/// MILESTONE 124: also mirrors to the serial port -- the real, narrow
+/// primitive this milestone closes. Every shell command's response
+/// (`shell.rs`'s `run_command()`, ~100 call sites, all through this one
+/// function) reached ONLY the VGA framebuffer before this milestone;
+/// this kernel's own "milestone N: ..." trace lines have always gone
+/// straight to serial via `crate::serial()` directly, a completely
+/// separate path that never touched this function. An external
+/// automation harness watching only the serial log (the only channel
+/// practical to read programmatically outside QEMU -- a framebuffer
+/// needs a screenshot and OCR, or QEMU-internal VNC/display access) was
+/// therefore already able to see kernel trace output but genuinely
+/// blind to shell responses -- confirmed by reading this function
+/// before touching it, not assumed. Deliberately only `write_str`
+/// mirrors, NOT `write_char` (the per-keystroke echo in shell.rs's own
+/// input loop calls `write_char` directly, not `write_str`) -- mirroring
+/// every single typed character to serial would flood the log for no
+/// real benefit; the prompt text and full command responses (which DO
+/// go through `write_str`) are the actually useful signal for an
+/// external reader.
 pub fn write_str(s: &str) {
     if let Some(console) = CONSOLE.lock().as_mut() {
         for c in s.chars() {
             console.write_char(c);
         }
     }
+    use core::fmt::Write as _;
+    let _ = crate::serial().write_str(s);
 }
 
 pub fn backspace() {

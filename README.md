@@ -9787,6 +9787,101 @@ self-test suite, genuinely open for a future pass.
       still having exactly two real subscribers) remains unchanged,
       unrelated to this milestone.
 
+- [x] **Milestone 121**: real pointer arithmetic on an `int **` itself --
+      `pp + n` and `n + pp` -- closing the exact gap Milestone 118 first
+      named and Milestone 119/120 each re-confirmed still open. **The fix
+      is one new disjunct** in `ptr_operand_scale()`'s own classification
+      match arm: `is_int_ptr_ptr != 0` is added alongside the pre-existing
+      `is_array != 0 || is_int_ptr != 0` check that already selects
+      `Some(8)`. Zero new x86_64 encodings, zero `EXPR_BINARY` `+`/`-`
+      codegen change -- it already consumes the `Option<u8>` scale
+      generically, unaware which `VarSlot` field produced `Some(8)`.
+      Honest observation from the investigation: `is_int_ptr_ptr` was
+      already fully threaded everywhere `ptr_operand_scale()` reads from
+      (`VarSlot.is_int_ptr_ptr` for a local since M118, `ParamInfo` since
+      M119), unlike `is_int_ptr`, which needed two separate milestones
+      (M115 local, M116 parameter) to reach the same place -- so this one
+      fix unlocks `int **` arithmetic for a local, a parameter, AND
+      (transitively, via a returned `int **`, M120) all in the same
+      milestone. New self-test cases: CASE 126 (`pp + 1`, pointer on the
+      left, expected `1`), CASE 127 (`1 + pp`, pointer on the right, the
+      genuinely distinct `emit_shl_rax_imm8` path, expected `1`), CASE 128
+      (verification: an `int **` PARAMETER, `**(pp + 1)` across a real
+      function-call boundary, expected `111`), CASE 129 (verification: a
+      `char *` scale-1 and an `int **` scale-8 pointer arithmetic in the
+      SAME expression, proving the new disjunct did not disturb the
+      `is_char_ptr` branch, expected `11`). **Verified**: `cargo build`
+      clean; `cc.elf` rebuilt via the pinned-nightly recipe, 110616 bytes
+      (up from M120's 108512), 24 pages, independently re-derived
+      byte-for-byte identical; compiler warnings byte-identical to the
+      M120 baseline via `git stash` diff. Two real QEMU boots
+      (`m121_fresh_boot.log`/`m121_reused_boot.log`) against a fresh disk:
+      fresh boot CASE 126/127/128/129 return `1`/`1`/`111`/`11` exactly as
+      hand-computed, all four markers PASS, `OVERALL_M121=PASS`, zero FAIL
+      anywhere; reused boot has the same pre-existing 37-line fs
+      self-test FAIL set every milestone since 70 has recorded, plus
+      `OVERALL_M121=PASS`; every pre-existing `OVERALL_Mxxx` marker
+      byte-identical to the committed M120 logs on both boots; heap-
+      pressure gate (M104/106) and scheduler-fairness gate (M117) both at
+      their recorded baselines; zero real panics or double/triple faults.
+      **Still genuinely open**: `int **` pointer-pointer SUBTRACTION
+      (`pp1 - pp2`) is still unimplemented, the same gap M115 named for
+      `int *`/`char *` and never closed for any depth; `pp[1]` was not
+      touched or newly verified this milestone; no `char **` of any kind;
+      no `int ***` or deeper; no `int **p, *q;` mixed-declarator list; no
+      `p++`/`p--`. Pure compiler-frontend work -- correctly no
+      SNN/evidence-gate angle this milestone.
+
+- [x] **Milestone 122**: real pointer `-` pointer subtraction (`p1 - p2`,
+      real C's element-count-difference meaning), closing the exact gap
+      Milestone 115 first named and Milestone 116 through 121 each left
+      standing. **One new disjunct** in `EXPR_BINARY`'s own `-` codegen:
+      when `ptr_operand_scale()` classifies BOTH operands as pointers
+      (`(Some(sc), Some(_))`, previously routed to a plain unscaled byte
+      subtract via the `_` fall-through), the raw byte `sub` still runs,
+      then RAX is divided by the pointee size with `emit_sar_rax_imm8(3)`
+      -- this milestone's one genuinely new x86_64 encoding (`SAR r/m64,
+      imm8`, REX.W `C1` /7; both halves already independently
+      SDM-verified separately by M108/115 and M79). `sc == 1` (both
+      `char *`) takes no shift -- the byte difference already IS the
+      element count. **Arithmetic, not logical, shift is load-bearing**: a
+      valid `p1 - p2` with `p1 < p2` is a real negative count, and only
+      `SAR` sign-extends the byte difference correctly. Zero new parser
+      work -- `p1 - p2` has always parsed as an ordinary `EXPR_BINARY`,
+      identical node shape to `p - 1` since M115, only the codegen's
+      reading of a both-operands-are-pointers `-` changes. Honest
+      observation: since `is_int_ptr_ptr` was already wired to
+      `Some(8)` by M121, this ONE `-` disjunct reaches `int **`
+      pointer-pointer subtraction (`pp1 - pp2`) in the same milestone as
+      the `int *`/decayed-array case, with no `int **`-specific line
+      anywhere. New self-test cases: CASE 130 (`int *` ptr-ptr, raw byte
+      diff 24 then /8, expected `3`), CASE 131 (`char *` ptr-ptr, `sc ==
+      1`, no shift, expected `8`), CASE 132 (the SIGNED case, `p1 < p2`,
+      expected `1`, which a logical `SHR` would fail and only `SAR`
+      passes), CASE 133 (`int **` ptr-ptr, verification that the same one
+      disjunct reaches `int **` too, expected `1`), CASE 134 (a
+      regression guard, structural twin of the pre-existing CASE 112,
+      expected `3`). **Verified**: `cargo build` clean; `cc.elf` rebuilt,
+      112920 bytes (up from M121's 110616), 24 pages (same page count),
+      independently re-derived byte-for-byte identical; compiler warnings
+      byte-identical to the M121 baseline. Two real QEMU boots
+      (`m122_fresh_boot.log`/`m122_reused_boot.log`) against a genuinely
+      fresh disk, run under WHPX acceleration with `kernel-irqchip=off`
+      (this box's QEMU 11.0.50 dev build hangs milestone 66's IDE
+      slave-device probe with no slave present; a real blank slave at ide
+      index 3 lets it PASS on both boots): fresh boot CASE 130-134 all
+      PASS, `OVERALL_M122=PASS`, `OVERALL=PASS`, milestone 66 PASS, the
+      same four deliberate negative-path syscall self-tests as M121's own
+      committed fresh log (byte-parity); reused boot `OVERALL_M122=PASS`,
+      milestone 66 PASS, the identical pre-existing 54-line fs self-test
+      FAIL set every milestone since 70 has recorded (`OVERALL=FAIL` on
+      the reused boot for that reason alone, exactly as M121). **Still
+      genuinely open**: no `char **` of any kind; no `int ***` or deeper;
+      no `int **p, *q;` mixed-declarator list; no `p++`/`p--`; `pp[1]`
+      (`EXPR_INDEX` through an `int **`) still has no dedicated proving
+      case. Pure compiler-frontend work -- correctly no SNN/evidence-gate
+      angle this milestone.
+
 ## Building and running
 
 Requires:

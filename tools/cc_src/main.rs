@@ -15339,7 +15339,78 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m140 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 { 0 } else { 1 });
+        // CASE 182: a real, deliberate VERIFICATION milestone, not a new
+        // fix -- proves `EXPR_BINARY`'s own `-` codegen (Milestone 122's
+        // `pointer - pointer` element-count feature) ALREADY reaches
+        // `int ***` with zero additional code, the exact same "already
+        // wired, just never proven" observation Milestone 122 itself made
+        // for `int **` one level shallower (via Milestone 121's own
+        // `ptr_operand_scale()` fix). That codegen only ever branches on
+        // `(left_scale, right_scale)` -- both `Option<u8>` values coming
+        // out of `ptr_operand_scale()`, which Milestone 140 (this same
+        // stretch, just before) already made return `Some(8)` for
+        // `is_int_ptr_ptr_ptr` -- so `int ***` ptr-ptr subtraction was
+        // already reachable the moment Milestone 140 landed; this
+        // milestone's only real work is writing the test that proves it,
+        // not touching a single line of codegen.
+        //
+        // `ppa` declared before `ppb` (adjacent stack slots, 8 bytes
+        // apart, `ppa` at the numerically LARGER address per this
+        // compiler's own "first-declared = highest address" convention);
+        // `ppp1 = &ppa`, `ppp2 = &ppb`. `ppp1 - ppp2` is the addresses'
+        // OWN byte difference (+8) divided by 8 == 1.
+        //   int main() {
+        //       int **ppa; int **ppb;
+        //       int ***ppp1; int ***ppp2;
+        //       ppp1 = &ppa; ppp2 = &ppb;
+        //       return ppp1 - ppp2;
+        //   }
+        // Hand-computed: 1.
+        // -------------------------------------------------------------
+        const SRC182: &[u8] = b"int main() { int **ppa; int **ppb; int ***ppp1; int ***ppp2; ppp1 = &ppa; ppp2 = &ppb; return ppp1 - ppp2; }";
+        let case182_result = compile_and_run_program_callable(SRC182.as_ptr() as u64, SRC182.len() as u64);
+        w(b"  case182 (int*** pointer-minus-pointer ALREADY reaches the real element-count codegen, verification only, positive count, in-process) returned=");
+        if let Some(r) = case182_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case182_ok = case182_result == Some(1);
+        write_check(b"case182_int_ptr_ptr_ptr_minus_int_ptr_ptr_ptr_positive_count_returns_1=", case182_ok);
+
+        w(b"\n");
+
+        // CASE 183: the SIGNED case -- `ppp2 - ppp1` (the operands
+        // swapped from CASE 182) is a real NEGATIVE element count, the
+        // exact three-level mirror of Milestone 122's own CASE132. Only
+        // the ARITHMETIC `emit_sar_rax_imm8(3)` this feature already uses
+        // (unchanged since Milestone 122; a logical `SHR` would sign-
+        // corrupt this exact case) gets this right; wrapped in `== -1`
+        // to check the signed comparison directly rather than printing a
+        // negative value through `write_u64_dec`'s own unsigned decimal
+        // formatting.
+        // -------------------------------------------------------------
+        const SRC183: &[u8] = b"int main() { int **ppa; int **ppb; int ***ppp1; int ***ppp2; ppp1 = &ppa; ppp2 = &ppb; return (ppp2 - ppp1) == -1; }";
+        let case183_result = compile_and_run_program_callable(SRC183.as_ptr() as u64, SRC183.len() as u64);
+        w(b"  case183 (int*** pointer-minus-pointer, the SIGNED negative-count case, arithmetic shift required, in-process) returned=");
+        if let Some(r) = case183_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case183_ok = case183_result == Some(1);
+        write_check(b"case183_int_ptr_ptr_ptr_minus_int_ptr_ptr_ptr_negative_count_returns_1=", case183_ok);
+
+        w(b"\n");
+
+        let overall_m141 = case182_ok && case183_ok;
+        w(b"OVERALL_M141=");
+        w(if overall_m141 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 { 0 } else { 1 });
     }
 }
 

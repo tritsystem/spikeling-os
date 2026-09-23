@@ -3936,10 +3936,19 @@ impl Parser {
     /// `int` in the SAME statement. A bare continuation reuses
     /// `make_decl()`'s own scalar encoding (`then_body: 0`/`1` for
     /// int/char, `expr: 0`) rather than inventing a second one for the
-    /// same fact `collect_vars_rec()` already knows how to read. A
-    /// DIFFERENT pointer DEPTH mixed in (`int **p, *q;`,
-    /// `parse_double_pointer_decl()`'s own still-separate declarator)
-    /// remains a real, disclosed, separate gap -- not attempted here.
+    /// same fact `collect_vars_rec()` already knows how to read.
+    ///
+    /// MILESTONE 130: the symmetric OTHER direction from Milestone 129
+    /// -- entering via a head `int *` and UPGRADING a continuation to
+    /// `int **` (`int *p, **q;`). ONLY for `!is_char_pointee`: there is
+    /// no `char **` anywhere in this compiler (Milestone 118's own
+    /// scope note), so a second `*` on a `char *` list's continuation is
+    /// deliberately left unconsumed, falling through to
+    /// `self.expect(TOK_IDENT)` seeing a stray `*` and returning a real
+    /// `ParseError` -- reject a genuinely unsupported shape at compile
+    /// time rather than silently mis-encoding it. Reuses `then_body: 3`,
+    /// the exact `int **` sentinel `parse_double_pointer_decl()` already
+    /// established, for the upgraded declarator.
     unsafe fn parse_pointer_decl(&mut self, name: Token, is_char_pointee: bool) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
@@ -3973,12 +3982,27 @@ impl Parser {
             if is_ptr {
                 unsafe { self.advance() }; // consume '*'
             }
+            // MILESTONE 129: the symmetric upgrade to `int **` on a
+            // comma-continuation -- ONLY for an `int *` list
+            // (`!is_char_pointee`): there is no `char **` anywhere in
+            // this compiler (M118's own scope note), so a second `*`
+            // after a `char *` list's continuation is deliberately left
+            // unconsumed here, falling through to `self.expect(TOK_IDENT)`
+            // seeing a `*` instead and returning a real ParseError --
+            // reject, don't silently mishandle a shape nothing downstream
+            // (codegen, `collect_vars_rec`) has ever supported.
+            let is_double_ptr = is_ptr && !is_char_pointee && unsafe { self.peek() }.kind == TOK_STAR;
+            if is_double_ptr {
+                unsafe { self.advance() }; // consume second '*'
+            }
             let nm = unsafe { self.expect(TOK_IDENT) }?;
             let d = unsafe { alloc_stmt() };
             if d == 0 {
                 return Err(ParseError::OutOfMemory);
             }
-            let (d_expr, d_then_body): (u64, u64) = if is_ptr {
+            let (d_expr, d_then_body): (u64, u64) = if is_double_ptr {
+                (0, 3)
+            } else if is_ptr {
                 (if is_char_pointee { 1 } else { 0 }, if is_char_pointee { 0 } else { 2 })
             } else {
                 (0, if is_char_pointee { 1 } else { 0 })
@@ -14076,7 +14100,67 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m129 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 { 0 } else { 1 });
+        // CASE 150: MILESTONE 130 -- the symmetric OTHER direction from
+        // Milestone 129, entered via a head `int *`: `int *p, **q, r;`
+        // -- `p` a real `int *`, `q` UPGRADED to a real `int **`, `r` a
+        // plain `int`, all in one statement. `*p + **q + r`.
+        const SRC150: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pb; pb = &b; int *p, **q, r; p = &a; q = &pb; r = 100; return *p + **q + r; }";
+        let case150_result = compile_and_run_program_callable(SRC150.as_ptr() as u64, SRC150.len() as u64);
+        w(b"  case150 (int *p, **q, r -- continuation upgraded to ** entered via a head int*, *p+**q+r) returned=");
+        if let Some(r) = case150_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 103)\n");
+        let case150_ok = case150_result == Some(103);
+        write_check(b"case150_pointer_list_upgraded_to_double_returns_103=", case150_ok);
+
+        w(b"\n");
+
+        // CASE 151: a real NEGATIVE control -- `char *p, **q;` must be
+        // REJECTED at compile time (a genuine ParseError, `None` from
+        // this harness), not silently mis-encoded, since `char **` has
+        // no representation anywhere in this compiler (Milestone 118's
+        // own scope note, still true). Proves the `!is_char_pointee`
+        // guard on the new upgrade path is real, not a no-op.
+        const SRC151: &[u8] = b"int main() { char c; c = 1; char *p, **q; p = &c; return 0; }";
+        let case151_result = compile_and_run_program_callable(SRC151.as_ptr() as u64, SRC151.len() as u64);
+        w(b"  case151 (NEGATIVE CONTROL: char *p, **q -- char** must be rejected, not silently accepted) returned=");
+        if let Some(r) = case151_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed, as required)");
+        }
+        w(b" (expected: compile failure)\n");
+        let case151_ok = case151_result.is_none();
+        write_check(b"case151_char_double_pointer_correctly_rejected=", case151_ok);
+
+        w(b"\n");
+
+        // CASE 152: a REGRESSION guard -- `int *p, q;` (Milestone 127's
+        // own bare-scalar-mixed case) must still work exactly as before,
+        // now that a comma-continuation can ALSO upgrade to `**`.
+        const SRC152: &[u8] = b"int main() { int a; a = 5; int *p, q; p = &a; q = 9; return *p + q; }";
+        let case152_result = compile_and_run_program_callable(SRC152.as_ptr() as u64, SRC152.len() as u64);
+        w(b"  case152 (REGRESSION: int *p, q -- bare scalar continuation still unaffected) returned=");
+        if let Some(r) = case152_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 14)\n");
+        let case152_ok = case152_result == Some(14);
+        write_check(b"case152_bare_scalar_continuation_regression_returns_14=", case152_ok);
+
+        w(b"\n");
+
+        let overall_m130 = case150_ok && case151_ok && case152_ok;
+        w(b"OVERALL_M130=");
+        w(if overall_m130 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 { 0 } else { 1 });
     }
 }
 

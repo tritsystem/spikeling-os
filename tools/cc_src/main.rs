@@ -4851,10 +4851,32 @@ impl Parser {
             // text; the resulting `i = i +/- 1;` statement is identical
             // either way, so sharing the one helper is not just
             // convenient but semantically exact.
+            // MILESTONE 144: `++arr[i];`/`--arr[i];` -- the prefix half of
+            // the array-target gap Milestone 143 itself left open
+            // ("deliberately POSTFIX only this milestone ... mirroring
+            // the plain-identifier case's own Milestone 137-then-138
+            // split"), now closed the exact same way: one more token of
+            // lookahead (`[` right after the IDENT) routes to
+            // `build_incr_decr_assign_index()` (Milestone 143) instead of
+            // falling through to the plain-identifier
+            // `build_incr_decr_assign()` path just below. Prefix and
+            // postfix array-target forms build the IDENTICAL `arr[idx] =
+            // arr[idx] +/- 1;` statement either way -- the same "only the
+            // source order differs, the resulting AST does not" reasoning
+            // this same arm's own doc comment already gives for the
+            // plain-identifier case, now extended one grammar position
+            // further.
             TOK_PLUSPLUS | TOK_MINUSMINUS => {
                 let op: u8 = if t.kind == TOK_PLUSPLUS { b'+' } else { b'-' };
                 unsafe { self.advance() }; // consume '++' or '--'
                 let name = unsafe { self.expect(TOK_IDENT) }?;
+                if unsafe { self.peek() }.kind == TOK_LBRACKET {
+                    unsafe { self.advance() }; // consume '['
+                    let idx = unsafe { self.parse_ternary() }?;
+                    unsafe { self.expect(TOK_RBRACKET) }?;
+                    unsafe { self.expect(TOK_SEMI) }?;
+                    return unsafe { self.build_incr_decr_assign_index(name, idx, op) };
+                }
                 unsafe { self.expect(TOK_SEMI) }?;
                 unsafe { self.build_incr_decr_assign(name, op) }
             }
@@ -15703,7 +15725,109 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m143 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 { 0 } else { 1 });
+        // CASE 191: `++arr[i];` -- the prefix half of the array-target
+        // gap Milestone 143 itself left open. Same construction as
+        // Milestone 143's own CASE187 (`arr[i]++;`), just entered from
+        // the other side of the source text via the new lookahead in the
+        // `TOK_PLUSPLUS | TOK_MINUSMINUS` statement-dispatch arm.
+        //   int main() {
+        //       int arr[3];
+        //       arr[0] = 10; arr[1] = 20; arr[2] = 30;
+        //       int i;
+        //       i = 1;
+        //       ++arr[i];
+        //       return arr[1];
+        //   }
+        // Hand-computed: 21.
+        // -------------------------------------------------------------
+        const SRC191: &[u8] = b"int main() { int arr[3]; arr[0] = 10; arr[1] = 20; arr[2] = 30; int i; i = 1; ++arr[i]; return arr[1]; }";
+        let case191_result = compile_and_run_program_callable(SRC191.as_ptr() as u64, SRC191.len() as u64);
+        w(b"  case191 (++arr[i]; a real array-element prefix increment statement, in-process) returned=");
+        if let Some(r) = case191_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 21)\n");
+        let case191_ok = case191_result == Some(21);
+        write_check(b"case191_array_index_prefix_increment_returns_21=", case191_ok);
+
+        w(b"\n");
+
+        // CASE 192: the decrement mirror -- `--arr[i];`.
+        const SRC192: &[u8] = b"int main() { int arr[3]; arr[0] = 10; arr[1] = 20; arr[2] = 30; int i; i = 2; --arr[i]; return arr[2]; }";
+        let case192_result = compile_and_run_program_callable(SRC192.as_ptr() as u64, SRC192.len() as u64);
+        w(b"  case192 (--arr[i]; a real array-element prefix decrement statement, in-process) returned=");
+        if let Some(r) = case192_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 29)\n");
+        let case192_ok = case192_result == Some(29);
+        write_check(b"case192_array_index_prefix_decrement_returns_29=", case192_ok);
+
+        w(b"\n");
+
+        // CASE 193: a REGRESSION guard -- the plain-identifier prefix
+        // form (`++i;`, Milestone 138's own original feature) must still
+        // work, unaffected by the new `TOK_LBRACKET` lookahead this
+        // milestone inserted into the SAME `TOK_PLUSPLUS`/`TOK_MINUSMINUS`
+        // dispatch arm, right after the IDENT and before that arm's own
+        // pre-existing `TOK_SEMI` check.
+        const SRC193: &[u8] = b"int main() { int i; i = 5; ++i; return i; }";
+        let case193_result = compile_and_run_program_callable(SRC193.as_ptr() as u64, SRC193.len() as u64);
+        w(b"  case193 (REGRESSION: plain ++i; prefix identifier form still works) returned=");
+        if let Some(r) = case193_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 6)\n");
+        let case193_ok = case193_result == Some(6);
+        write_check(b"case193_plain_prefix_increment_regression_returns_6=", case193_ok);
+
+        w(b"\n");
+
+        // CASE 194: a real, deliberate VERIFICATION case -- all FOUR
+        // `++`/`--` shapes now supported (plain-identifier postfix
+        // Milestone 137, plain-identifier prefix Milestone 138,
+        // array-element postfix Milestone 143, array-element prefix this
+        // same milestone) used together in ONE program, proving zero
+        // cross-contamination across all four dispatch paths.
+        //   int main() {
+        //       int arr[2];
+        //       arr[0] = 100; arr[1] = 200;
+        //       int i; int j;
+        //       i = 5; j = 5;
+        //       arr[0]++;
+        //       ++arr[1];
+        //       i++;
+        //       ++j;
+        //       return arr[0] + arr[1] + i + j;
+        //   }
+        // Hand-computed: 101 + 201 + 6 + 6 = 314.
+        // -------------------------------------------------------------
+        const SRC194: &[u8] = b"int main() { int arr[2]; arr[0] = 100; arr[1] = 200; int i; int j; i = 5; j = 5; arr[0]++; ++arr[1]; i++; ++j; return arr[0] + arr[1] + i + j; }";
+        let case194_result = compile_and_run_program_callable(SRC194.as_ptr() as u64, SRC194.len() as u64);
+        w(b"  case194 (all four ++/-- shapes -- ident postfix/prefix, array postfix/prefix -- coexist with zero cross-contamination, in-process) returned=");
+        if let Some(r) = case194_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 314)\n");
+        let case194_ok = case194_result == Some(314);
+        write_check(b"case194_all_four_incr_decr_shapes_coexist_returns_314=", case194_ok);
+
+        w(b"\n");
+
+        let overall_m144 = case191_ok && case192_ok && case193_ok && case194_ok;
+        w(b"OVERALL_M144=");
+        w(if overall_m144 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 { 0 } else { 1 });
     }
 }
 

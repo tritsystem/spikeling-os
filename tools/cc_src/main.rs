@@ -4406,6 +4406,69 @@ impl Parser {
         Ok(node)
     }
 
+    /// MILESTONE 143: the array-target sibling of `build_incr_decr_
+    /// assign()` above -- builds `arr[idx] = arr[idx] +/- 1;` (an
+    /// `EXPR_INDEX` READ, wrapped in an `EXPR_BINARY`, wrapped in a
+    /// `STMT_ASSIGN_INDEX` WRITE) instead of that function's plain-
+    /// identifier `i = i +/- 1;` shape. `idx` is the ALREADY-PARSED
+    /// index expression (built once by the caller); this function reuses
+    /// the same `idx` pointer for BOTH the read side (`EXPR_INDEX.left`)
+    /// and the write side (`StmtNode.then_body`), exactly the same
+    /// "reuse before duplicate" choice `arr[i] = expr;` (Milestone 108)
+    /// already made for its own single index. A real, disclosed
+    /// consequence, honestly not hidden: `idx` is evaluated TWICE at
+    /// runtime (once for the read, once for the write's own address
+    /// computation) -- harmless for any side-effect-free index
+    /// expression (a plain variable or arithmetic, the only kind this
+    /// subset's `++`/`--` cannot itself introduce a side effect into,
+    /// since `++`/`--` is not yet a general expression usable AS an
+    /// index -- Milestone 142's own still-open list), but a real,
+    /// disclosed double-evaluation this function does not attempt to
+    /// suppress via a temporary.
+    unsafe fn build_incr_decr_assign_index(&mut self, name: Token, idx: u64, op: u8) -> Result<u64, ParseError> {
+        let read_ref = unsafe { alloc_expr() };
+        if read_ref == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                read_ref as *mut ExprNode,
+                ExprNode { kind: EXPR_INDEX, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: idx, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let one = unsafe { alloc_expr() };
+        if one == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                one as *mut ExprNode,
+                ExprNode { kind: EXPR_INTLIT, int_val: 1, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let bin = unsafe { alloc_expr() };
+        if bin == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                bin as *mut ExprNode,
+                ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: read_ref, right: one, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let node = unsafe { alloc_stmt() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut StmtNode,
+                StmtNode { kind: STMT_ASSIGN_INDEX, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: idx, else_body: 0 },
+            )
+        };
+        Ok(node)
+    }
+
     unsafe fn finish_ident_assign(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
         let opk = unsafe { self.peek() }.kind;
         // MILESTONE 137: `i++;`/`i--;` -- desugared via `build_incr_decr_
@@ -4604,15 +4667,38 @@ impl Parser {
                 // in this subset anyway, so the ordering is safe either
                 // way, but checking the newer, narrower case first keeps
                 // this dispatch reading top-to-bottom in the order each
-                // milestone added it). Only plain `=` is supported here
-                // -- `arr[i] += 1;` and friends are real, disclosed
-                // future work (Milestone 84's nine compound-assignment
-                // operators never reached array targets), not attempted
-                // in this first slice.
+                // milestone added it). Only plain `=` was supported here
+                // originally -- `arr[i] += 1;` and friends were real,
+                // disclosed future work (Milestone 84's nine compound-
+                // assignment operators never reached array targets), not
+                // attempted in that first slice.
+                //
+                // MILESTONE 143: `arr[i]++;`/`arr[i]--;` -- the array-
+                // target half of the gap Milestone 142's own closing
+                // disclosure named ("`arr[i]++`/`*p++` as targets ...
+                // `build_incr_decr_assign()` only ever accepts a `Token`
+                // identifier today"). Checked immediately after `idx`/`]`
+                // are parsed, before the pre-existing `TOK_ASSIGN` check,
+                // so `arr[i] = ...;` (Milestone 108) is unaffected.
+                // Delegates to `build_incr_decr_assign_index()` below,
+                // the array-target sibling of Milestone 138's own
+                // `build_incr_decr_assign()`. Deliberately POSTFIX only
+                // this milestone (`++arr[i];` prefix is real, disclosed
+                // future work, mirroring the identifier case's own
+                // Milestone 137-then-138 split) -- a whole STATEMENT
+                // only, same scope discipline as every `++`/`--` case so
+                // far, and still no `arr[i] += 1;` (that broader compound-
+                // assignment-on-array gap stays open too).
                 if unsafe { self.peek() }.kind == TOK_LBRACKET {
                     unsafe { self.advance() }; // consume '['
                     let idx = unsafe { self.parse_ternary() }?;
                     unsafe { self.expect(TOK_RBRACKET) }?;
+                    if unsafe { self.peek() }.kind == TOK_PLUSPLUS || unsafe { self.peek() }.kind == TOK_MINUSMINUS {
+                        let op: u8 = if unsafe { self.peek() }.kind == TOK_PLUSPLUS { b'+' } else { b'-' };
+                        unsafe { self.advance() }; // consume '++' or '--'
+                        unsafe { self.expect(TOK_SEMI) }?;
+                        return unsafe { self.build_incr_decr_assign_index(name, idx, op) };
+                    }
                     unsafe { self.expect(TOK_ASSIGN) }?;
                     let rhs = unsafe { self.parse_ternary() }?;
                     unsafe { self.expect(TOK_SEMI) }?;
@@ -15506,7 +15592,118 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m142 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 { 0 } else { 1 });
+        // CASE 187: `arr[i]++;` -- a real, NEW closure this time (not
+        // verification-only), the array-target half of the gap Milestone
+        // 142's own closing disclosure named. `build_incr_decr_assign_
+        // index()` builds `arr[i] = arr[i] + 1;`, reusing the SAME `idx`
+        // expression node for both the read and the write, exactly the
+        // "reuse before duplicate" choice its own doc comment describes.
+        //   int main() {
+        //       int arr[3];
+        //       arr[0] = 10; arr[1] = 20; arr[2] = 30;
+        //       int i;
+        //       i = 1;
+        //       arr[i]++;
+        //       return arr[1];
+        //   }
+        // Hand-computed: 21.
+        // -------------------------------------------------------------
+        const SRC187: &[u8] = b"int main() { int arr[3]; arr[0] = 10; arr[1] = 20; arr[2] = 30; int i; i = 1; arr[i]++; return arr[1]; }";
+        let case187_result = compile_and_run_program_callable(SRC187.as_ptr() as u64, SRC187.len() as u64);
+        w(b"  case187 (arr[i]++; a real array-element postfix increment statement, in-process) returned=");
+        if let Some(r) = case187_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 21)\n");
+        let case187_ok = case187_result == Some(21);
+        write_check(b"case187_array_index_postfix_increment_returns_21=", case187_ok);
+
+        w(b"\n");
+
+        // CASE 188: the decrement mirror -- `arr[i]--;`, a real DECREMENT
+        // this time, distinguishing a genuine `+`/`-` op threading from a
+        // hardcoded increment.
+        //   int main() {
+        //       int arr[3];
+        //       arr[0] = 10; arr[1] = 20; arr[2] = 30;
+        //       int i;
+        //       i = 2;
+        //       arr[i]--;
+        //       return arr[2];
+        //   }
+        // Hand-computed: 29.
+        // -------------------------------------------------------------
+        const SRC188: &[u8] = b"int main() { int arr[3]; arr[0] = 10; arr[1] = 20; arr[2] = 30; int i; i = 2; arr[i]--; return arr[2]; }";
+        let case188_result = compile_and_run_program_callable(SRC188.as_ptr() as u64, SRC188.len() as u64);
+        w(b"  case188 (arr[i]--; a real array-element postfix decrement statement, in-process) returned=");
+        if let Some(r) = case188_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 29)\n");
+        let case188_ok = case188_result == Some(29);
+        write_check(b"case188_array_index_postfix_decrement_returns_29=", case188_ok);
+
+        w(b"\n");
+
+        // CASE 189: a REGRESSION guard -- plain `arr[i] = expr;`
+        // (Milestone 108's own original feature) must still work,
+        // unaffected by this milestone's new `TOK_PLUSPLUS`/
+        // `TOK_MINUSMINUS` check being inserted right before the
+        // pre-existing `TOK_ASSIGN` check in the same dispatch arm.
+        const SRC189: &[u8] = b"int main() { int arr[2]; arr[0] = 5; arr[1] = 6; return arr[0] + arr[1]; }";
+        let case189_result = compile_and_run_program_callable(SRC189.as_ptr() as u64, SRC189.len() as u64);
+        w(b"  case189 (REGRESSION: plain arr[i] = expr; assignment still works) returned=");
+        if let Some(r) = case189_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case189_ok = case189_result == Some(11);
+        write_check(b"case189_plain_array_assignment_regression_returns_11=", case189_ok);
+
+        w(b"\n");
+
+        // CASE 190: a real, deliberate VERIFICATION case -- an array-
+        // element `++` and a plain-identifier `++` (Milestone 137) both
+        // used in the SAME program, proving zero cross-contamination
+        // between the two now-separate `build_incr_decr_assign()` /
+        // `build_incr_decr_assign_index()` call sites.
+        //   int main() {
+        //       int arr[1];
+        //       arr[0] = 100;
+        //       int j;
+        //       j = 5;
+        //       arr[0]++;
+        //       j++;
+        //       return arr[0] + j;
+        //   }
+        // Hand-computed: 101 + 6 = 107.
+        // -------------------------------------------------------------
+        const SRC190: &[u8] = b"int main() { int arr[1]; arr[0] = 100; int j; j = 5; arr[0]++; j++; return arr[0] + j; }";
+        let case190_result = compile_and_run_program_callable(SRC190.as_ptr() as u64, SRC190.len() as u64);
+        w(b"  case190 (array-element ++ and plain-identifier ++ coexist with zero cross-contamination, in-process) returned=");
+        if let Some(r) = case190_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 107)\n");
+        let case190_ok = case190_result == Some(107);
+        write_check(b"case190_array_and_ident_increment_coexist_returns_107=", case190_ok);
+
+        w(b"\n");
+
+        let overall_m143 = case187_ok && case188_ok && case189_ok && case190_ok;
+        w(b"OVERALL_M143=");
+        w(if overall_m143 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 { 0 } else { 1 });
     }
 }
 

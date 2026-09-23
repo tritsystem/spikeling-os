@@ -3989,25 +3989,41 @@ impl Parser {
             if is_ptr {
                 unsafe { self.advance() }; // consume '*'
             }
-            // MILESTONE 129: the symmetric upgrade to `int **` on a
-            // comma-continuation -- ONLY for an `int *` list
-            // (`!is_char_pointee`): there is no `char **` anywhere in
-            // this compiler (M118's own scope note), so a second `*`
-            // after a `char *` list's continuation is deliberately left
-            // unconsumed here, falling through to `self.expect(TOK_IDENT)`
-            // seeing a `*` instead and returning a real ParseError --
-            // reject, don't silently mishandle a shape nothing downstream
-            // (codegen, `collect_vars_rec`) has ever supported.
+            // MILESTONE 130 (mislabeled "129" here at the time -- fixed
+            // by Milestone 135, which touched this exact spot again):
+            // the symmetric upgrade to `int **` on a comma-continuation
+            // -- ONLY for an `int *` list (`!is_char_pointee`): there is
+            // no `char **` anywhere in this compiler (M118's own scope
+            // note), so a second `*` after a `char *` list's
+            // continuation is deliberately left unconsumed here, falling
+            // through to `self.expect(TOK_IDENT)` seeing a `*` instead
+            // and returning a real ParseError -- reject, don't silently
+            // mishandle a shape nothing downstream (codegen, `collect_
+            // vars_rec`) has ever supported.
             let is_double_ptr = is_ptr && !is_char_pointee && unsafe { self.peek() }.kind == TOK_STAR;
             if is_double_ptr {
                 unsafe { self.advance() }; // consume second '*'
+            }
+            // MILESTONE 135: the further symmetric upgrade to `int ***`
+            // -- the same gap Milestone 134 closed entered via a head
+            // `int ***`, closed here from the shallower `int *` entry
+            // point. Only checked once a second star was already seen
+            // (`is_double_ptr`, itself already `!is_char_pointee`-gated
+            // above), so this inherits that same real restriction with
+            // no separate check needed: a `char *` list still cannot
+            // reach this branch at all.
+            let is_triple_ptr = is_double_ptr && unsafe { self.peek() }.kind == TOK_STAR;
+            if is_triple_ptr {
+                unsafe { self.advance() }; // consume third '*'
             }
             let nm = unsafe { self.expect(TOK_IDENT) }?;
             let d = unsafe { alloc_stmt() };
             if d == 0 {
                 return Err(ParseError::OutOfMemory);
             }
-            let (d_expr, d_then_body): (u64, u64) = if is_double_ptr {
+            let (d_expr, d_then_body): (u64, u64) = if is_triple_ptr {
+                (0, 4)
+            } else if is_double_ptr {
                 (0, 3)
             } else if is_ptr {
                 (if is_char_pointee { 1 } else { 0 }, if is_char_pointee { 0 } else { 2 })
@@ -14536,7 +14552,48 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m134 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 { 0 } else { 1 });
+        // CASE 161: MILESTONE 135 -- the further symmetric upgrade to
+        // `int ***`, entered via a head `int *`: `int *p, ***q, r;` --
+        // `p` a real `int *`, `q` UPGRADED to a real `int ***`, `r` a
+        // plain `int`, all in one statement. `*p + ***q + r`.
+        const SRC161: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pb; pb = &b; int **ppb; ppb = &pb; int *p, ***q, r; p = &a; q = &ppb; r = 5; return *p + ***q + r; }";
+        let case161_result = compile_and_run_program_callable(SRC161.as_ptr() as u64, SRC161.len() as u64);
+        w(b"  case161 (int *p, ***q, r -- continuation upgraded to *** entered via a head int*, *p+***q+r) returned=");
+        if let Some(r) = case161_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 8)\n");
+        let case161_ok = case161_result == Some(8);
+        write_check(b"case161_pointer_list_upgraded_to_triple_returns_8=", case161_ok);
+
+        w(b"\n");
+
+        // CASE 162: a REGRESSION guard -- `int *p, **q;` (Milestone
+        // 130's own upgrade-to-double case) must still work exactly as
+        // before, now that a comma-continuation can ALSO upgrade one
+        // level further to `***`.
+        const SRC162: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pb; pb = &b; int *p, **q; p = &a; q = &pb; return *p + **q; }";
+        let case162_result = compile_and_run_program_callable(SRC162.as_ptr() as u64, SRC162.len() as u64);
+        w(b"  case162 (REGRESSION: int *p, **q -- upgrade-to-double still works unaffected by the new triple check) returned=");
+        if let Some(r) = case162_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case162_ok = case162_result == Some(3);
+        write_check(b"case162_pointer_list_upgraded_to_double_regression_returns_3=", case162_ok);
+
+        w(b"\n");
+
+        let overall_m135 = case161_ok && case162_ok;
+        w(b"OVERALL_M135=");
+        w(if overall_m135 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 { 0 } else { 1 });
     }
 }
 

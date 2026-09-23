@@ -4170,6 +4170,20 @@ impl Parser {
     /// write side, `***p = expr;` (the new `STMT_ASSIGN_DEREF3` statement
     /// kind, mirroring `STMT_ASSIGN_DEREF2`'s own one-more-dereference
     /// shape exactly).
+    /// MILESTONE 133: extended for a real comma-separated `int ***`
+    /// declarator LIST, same depth throughout (`int ***p, ***q;`) -- the
+    /// exact same real gap Milestone 126 closed for `int *` and
+    /// Milestone 128 closed for `int **`, one level deeper again. Each
+    /// comma-continuation re-consumes its own leading `***` (three
+    /// separate `TOK_STAR` expects -- this lexer has no single `***`
+    /// token, the same two-separate-stars shape Milestone 128 already
+    /// established for `**`, extended by one more) and gets its own
+    /// `then_body: 4` `STMT_DECL`. Deliberately still SAME-DEPTH ONLY --
+    /// mixing a bare/single-`*`/double-`**` declarator into this list
+    /// (the actual mixed-DEPTH case Milestone 129/130 closed for `int
+    /// **`) is real, disclosed, separate future work, mirroring how
+    /// Milestone 128 itself shipped same-depth-only before Milestone
+    /// 129/130 closed the mixed-depth gap for the shallower feature.
     unsafe fn parse_triple_pointer_decl(&mut self, name: Token) -> Result<u64, ParseError> {
         let head = unsafe { alloc_stmt() };
         if head == 0 {
@@ -4181,9 +4195,35 @@ impl Parser {
                 StmtNode { kind: STMT_DECL, ident_off: name.ident_off, ident_len: name.ident_len, expr: 0, next: 0, then_body: 4, else_body: 0 },
             )
         };
+        let mut tail = head;
         if unsafe { self.peek() }.kind == TOK_ASSIGN {
             let assign = unsafe { self.finish_ident_assign(name, false) }?;
-            unsafe { (*(head as *mut StmtNode)).next = assign };
+            unsafe { (*(tail as *mut StmtNode)).next = assign };
+            tail = assign;
+        }
+        while unsafe { self.peek() }.kind == TOK_COMMA {
+            unsafe { self.advance() }; // ','
+            unsafe { self.expect(TOK_STAR) }?; // first '*' -- same depth as the head declarator
+            unsafe { self.expect(TOK_STAR) }?; // second '*'
+            unsafe { self.expect(TOK_STAR) }?; // third '*'
+            let nm = unsafe { self.expect(TOK_IDENT) }?;
+            let d = unsafe { alloc_stmt() };
+            if d == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    d as *mut StmtNode,
+                    StmtNode { kind: STMT_DECL, ident_off: nm.ident_off, ident_len: nm.ident_len, expr: 0, next: 0, then_body: 4, else_body: 0 },
+                )
+            };
+            unsafe { (*(tail as *mut StmtNode)).next = d };
+            tail = d;
+            if unsafe { self.peek() }.kind == TOK_ASSIGN {
+                let assign = unsafe { self.finish_ident_assign(nm, false) }?;
+                unsafe { (*(tail as *mut StmtNode)).next = assign };
+                tail = assign;
+            }
         }
         unsafe { self.expect(TOK_SEMI) }?;
         Ok(head)
@@ -14363,7 +14403,64 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m132 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 { 0 } else { 1 });
+        // CASE 156: MILESTONE 133 -- a real comma-separated `int ***`
+        // declarator list, same depth (`int ***p, ***q;`), each an
+        // independent three-level pointer to its own distinct chain.
+        const SRC156: &[u8] = b"int main() { int a; int b; a = 1; b = 2; int *pa; int *pb; pa = &a; pb = &b; int **ppa; int **ppb; ppa = &pa; ppb = &pb; int ***p, ***q; p = &ppa; q = &ppb; return ***p + ***q; }";
+        let case156_result = compile_and_run_program_callable(SRC156.as_ptr() as u64, SRC156.len() as u64);
+        w(b"  case156 (int ***p, ***q comma list, two independent triple pointers, ***p+***q) returned=");
+        if let Some(r) = case156_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 3)\n");
+        let case156_ok = case156_result == Some(3);
+        write_check(b"case156_int_ptr_ptr_ptr_comma_list_returns_3=", case156_ok);
+
+        w(b"\n");
+
+        // CASE 157: a per-declarator `=` initializer INSIDE the new
+        // `int ***` comma list -- proves `finish_ident_assign()` is
+        // reached for the SECOND declarator too, not just the head one.
+        const SRC157: &[u8] = b"int main() { int a; int b; a = 10; b = 20; int *pa; int *pb; pa = &a; pb = &b; int **ppa; int **ppb; ppa = &pa; ppb = &pb; int ***p = &ppa, ***q = &ppb; return ***p + ***q; }";
+        let case157_result = compile_and_run_program_callable(SRC157.as_ptr() as u64, SRC157.len() as u64);
+        w(b"  case157 (int ***p = &ppa, ***q = &ppb -- per-declarator initializer inside the int*** comma list) returned=");
+        if let Some(r) = case157_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 30)\n");
+        let case157_ok = case157_result == Some(30);
+        write_check(b"case157_int_ptr_ptr_ptr_comma_list_initializer_returns_30=", case157_ok);
+
+        w(b"\n");
+
+        // CASE 158: a REGRESSION guard -- a single, non-comma `int
+        // ***p;` declarator (Milestone 132's own entire grammar) must
+        // still parse and run identically: the new `while TOK_COMMA`
+        // loop's condition is simply never true here.
+        const SRC158: &[u8] = b"int main() { int a; a = 7; int *pa; pa = &a; int **ppa; ppa = &pa; int ***p; p = &ppa; return ***p; }";
+        let case158_result = compile_and_run_program_callable(SRC158.as_ptr() as u64, SRC158.len() as u64);
+        w(b"  case158 (REGRESSION: single non-comma int ***p; unaffected by the new comma loop) returned=");
+        if let Some(r) = case158_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 7)\n");
+        let case158_ok = case158_result == Some(7);
+        write_check(b"case158_single_triple_pointer_declarator_regression_returns_7=", case158_ok);
+
+        w(b"\n");
+
+        let overall_m133 = case156_ok && case157_ok && case158_ok;
+        w(b"OVERALL_M133=");
+        w(if overall_m133 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 { 0 } else { 1 });
     }
 }
 

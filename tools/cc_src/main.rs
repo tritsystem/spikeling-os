@@ -2906,6 +2906,24 @@ struct ParamInfo {
     // 110/113/116 all already established for the analogous single-level
     // cases.
     is_int_ptr_ptr: u8,
+    // MILESTONE 139: 1 if this parameter was declared `int ***`, 0
+    // otherwise -- the real "declared-parameter-type bit" Milestone 138's
+    // own closing disclosure named as still missing ("`int ***` still has
+    // no parameter or return value"), mirroring `is_int_ptr_ptr`'s own
+    // identical fix (119) for the one-level-shallower case.
+    // `collect_vars_for_function()` copies this straight into the
+    // parameter's own `VarSlot.is_int_ptr_ptr_ptr` (a field that has
+    // existed on `VarSlot` since Milestone 132 for LOCAL `int ***`
+    // variables, but was unconditionally 0 for every parameter until
+    // now), so `EXPR_UNARY`'s `OP_DEREF` arm and `STMT_ASSIGN_DEREF3`
+    // (both of which already resolve a pointer operand through the
+    // ordinary `stack_off` field, with zero awareness of whether a given
+    // slot came from a parameter or a local declaration) read/write
+    // through an `int ***` PARAMETER's own real value with NO codegen
+    // change at either call site at all, the same "accepting the grammar
+    // plus threading the one flag IS the complete feature" shape
+    // Milestone 110/113/116/119 all already established.
+    is_int_ptr_ptr_ptr: u8,
 }
 
 /// MILESTONE 72: the maximum number of parameters a single function may
@@ -5211,6 +5229,20 @@ impl Parser {
             // -- genuinely different from a single-level `int *`
             // parameter, not a combination of both).
             let mut is_int_ptr_ptr = false;
+            // MILESTONE 139: a THIRD immediate `*` right after `int **`
+            // (never after `char **` -- there is no `char **`/`char ***`
+            // in this subset, mirroring `is_int_ptr_ptr`'s own `int`-only
+            // restriction above) marks an `int ***p` THREE-LEVEL pointer
+            // parameter, the exact "declared-parameter-type bit through
+            // `ParamInfo`" Milestone 138's own closing disclosure named as
+            // still missing. Mirrors the `is_int_ptr`/`is_int_ptr_ptr`
+            // branches' own shape exactly: `is_int_ptr_ptr` is reset to
+            // `false` the moment a third `*` is seen (an `int ***`
+            // parameter's own resulting `VarSlot` must have
+            // `is_int_ptr_ptr == 0`, `is_int_ptr_ptr_ptr == 1` -- genuinely
+            // different from a two-level `int **` parameter, not a
+            // combination of both).
+            let mut is_int_ptr_ptr_ptr = false;
             if unsafe { self.peek() }.kind == TOK_STAR {
                 unsafe { self.advance() };
                 if is_char {
@@ -5222,6 +5254,11 @@ impl Parser {
                         unsafe { self.advance() };
                         is_int_ptr = false;
                         is_int_ptr_ptr = true;
+                        if unsafe { self.peek() }.kind == TOK_STAR {
+                            unsafe { self.advance() };
+                            is_int_ptr_ptr = false;
+                            is_int_ptr_ptr_ptr = true;
+                        }
                     }
                 }
             }
@@ -5229,7 +5266,7 @@ impl Parser {
             if count as u64 >= MAX_PARAMS {
                 return Err(ParseError::TooManyParams);
             }
-            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 }, is_char_ptr: if is_char_ptr { 1 } else { 0 }, is_int_ptr: if is_int_ptr { 1 } else { 0 }, is_int_ptr_ptr: if is_int_ptr_ptr { 1 } else { 0 } }) };
+            unsafe { param_write(params_ptr, count as u64, ParamInfo { name_off: name.ident_off, name_len: name.ident_len, is_char: if is_char { 1 } else { 0 }, is_char_ptr: if is_char_ptr { 1 } else { 0 }, is_int_ptr: if is_int_ptr { 1 } else { 0 }, is_int_ptr_ptr: if is_int_ptr_ptr { 1 } else { 0 }, is_int_ptr_ptr_ptr: if is_int_ptr_ptr_ptr { 1 } else { 0 } }) };
             count += 1;
             if unsafe { self.peek() }.kind == TOK_COMMA {
                 unsafe { self.advance() };
@@ -5324,17 +5361,46 @@ impl Parser {
             // position. Deliberately narrow, mirroring every earlier
             // pointer-return step (`char *` return stayed single-star
             // only, Milestone 113; this branch itself stays `int`-only,
-            // no `char **`): a THIRD `*` (`int ***f(...)`) is not
-            // consumed here and falls through to `self.expect(TOK_IDENT)`
-            // just below, which will reject it as an ordinary
+            // no `char **`): a THIRD `*` (`int ***f(...)`) was, until this
+            // milestone, not consumed here and fell through to
+            // `self.expect(TOK_IDENT)` just below, rejected as an ordinary
             // `UnexpectedToken` parse error -- the same "no `int ***`, no
             // deeper" restriction Milestone 118 already established for
-            // local variables and Milestone 119 for parameters, now also
-            // true of the return-type grammar position.
+            // local variables and Milestone 119 for parameters.
+            //
+            // MILESTONE 139: a THIRD immediate `*` is now also accepted
+            // here -- `int ***f(...)`, the exact other half of the gap
+            // Milestone 138's own closing disclosure named ("`int ***`
+            // still has no parameter or return value"). Identical
+            // reasoning to the two-star case just above applies
+            // transitively one level deeper: `STMT_RETURN`'s own codegen
+            // narrows if AND ONLY IF `is_char_return` is set, and RAX
+            // already holds the correct raw 8-byte pointer value coming
+            // out of the return expression regardless of how many levels
+            // of indirection it has, so leaving `is_char_return` false
+            // after consuming all three tokens is, again, the complete,
+            // correct implementation. No new `FuncDef` field, no new
+            // codegen anywhere -- `EXPR_CALL`'s own codegen has never
+            // consulted the callee's `is_char_return` at all, only the
+            // callee's OWN `STMT_RETURN` does. A caller storing this
+            // function's result into a local `int ***q` and
+            // dereferencing through it was already reachable the moment
+            // `int ***q;` locals (Milestone 132) and `int ***` PARAMETERS
+            // (this same milestone, just above) existed; this branch's
+            // only real, new work is accepting the THIRD `*` in this one
+            // grammar position. A FOURTH `*` (`int ****f(...)`) is
+            // deliberately still not consumed here and falls through to
+            // `self.expect(TOK_IDENT)`, rejected as an ordinary parse
+            // error -- `int ****` remains out of scope by design, the
+            // same restriction this subset has never lifted for locals
+            // or parameters either.
             if unsafe { self.peek() }.kind == TOK_STAR {
                 unsafe { self.advance() };
                 if unsafe { self.peek() }.kind == TOK_STAR {
                     unsafe { self.advance() };
+                    if unsafe { self.peek() }.kind == TOK_STAR {
+                        unsafe { self.advance() };
+                    }
                 }
             }
             false
@@ -6153,12 +6219,21 @@ unsafe fn collect_vars_for_function(f: &FuncDef, vars_ptr: u64) -> Result<u64, C
         // either call site at all, the same "accepting the grammar plus
         // threading the one flag IS the complete feature" shape Milestone
         // 110/113/116 all already established.
-        // MILESTONE 132: `is_int_ptr_ptr_ptr` is unconditionally 0 here --
-        // `int ***` PARAMETERS are deliberately out of scope this
-        // milestone (ParamInfo itself was not extended), the same one-
-        // milestone-then-close-it gap `is_char_ptr`/`is_int_ptr`/`is_int_
-        // ptr_ptr` each carried before their own follow-up milestone.
-        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: p.is_int_ptr, is_int_ptr_ptr: p.is_int_ptr_ptr, is_int_ptr_ptr_ptr: 0 }) };
+        // MILESTONE 132 (superseded by 139 below): `is_int_ptr_ptr_ptr` was
+        // unconditionally 0 here -- `int ***` PARAMETERS were deliberately
+        // out of scope that milestone (ParamInfo itself was not extended),
+        // the same one-milestone-then-close-it gap `is_char_ptr`/`is_int_
+        // ptr`/`is_int_ptr_ptr` each carried before their own follow-up
+        // milestone.
+        // MILESTONE 139: `is_int_ptr_ptr_ptr` now carries straight through
+        // from `p.is_int_ptr_ptr_ptr` (the real declared-parameter-type
+        // bit `parse_params()` now records -- see
+        // `ParamInfo::is_int_ptr_ptr_ptr`'s own doc comment), the exact
+        // "thread a real declared-parameter-type bit through `ParamInfo`"
+        // step Milestone 132's own closing disclosure (via 138) named as
+        // the missing piece, mirroring Milestone 113/116/119's own
+        // identical fix for the shallower pointer depths.
+        unsafe { var_write(vars_ptr, n, VarSlot { name_off: p.name_off, name_len: p.name_len, stack_off: off, is_char: p.is_char, is_array: 0, is_char_ptr: p.is_char_ptr, is_int_ptr: p.is_int_ptr, is_int_ptr_ptr: p.is_int_ptr_ptr, is_int_ptr_ptr_ptr: p.is_int_ptr_ptr_ptr }) };
         n += 1;
         pi += 1;
     }
@@ -14955,7 +15030,133 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m138 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 { 0 } else { 1 });
+        // CASE 174: an `int ***` PARAMETER, the exact other half of the
+        // gap Milestone 138's own closing disclosure named ("`int ***`
+        // still has no parameter or return value"). `deref3()` receives a
+        // three-level pointer and reads all the way through it
+        // (`***ppp`) -- the read-side mirror of Milestone 120's own
+        // CASE123 (`int **` return read), one level deeper.
+        //   int deref3(int ***ppp) { return ***ppp; }
+        //   int main() {
+        //       int x; int *p; int **pp; int ***ppp;
+        //       x = 55; p = &x; pp = &p; ppp = &pp;
+        //       return deref3(ppp);
+        //   }
+        // Hand-computed: ppp == &pp, so *ppp == pp == &p, **ppp == *p == x
+        // == 55, ***ppp == 55.
+        // -------------------------------------------------------------
+        const SRC174: &[u8] = b"int deref3(int ***ppp) { return ***ppp; } int main() { int x; int *p; int **pp; int ***ppp; x = 55; p = &x; pp = &p; ppp = &pp; return deref3(ppp); }";
+        let case174_result = compile_and_run_program_callable(SRC174.as_ptr() as u64, SRC174.len() as u64);
+        w(b"  case174 (int*** PARAMETER, triple-deref READ through it crosses the call boundary, in-process) returned=");
+        if let Some(r) = case174_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 55)\n");
+        let case174_ok = case174_result == Some(55);
+        write_check(b"case174_int_ptr_ptr_ptr_parameter_triple_deref_read_returns_55=", case174_ok);
+
+        w(b"\n");
+
+        // CASE 175: the write-side mirror of CASE 174 -- `***ppp = 99;`
+        // (Milestone 132's own STMT_ASSIGN_DEREF3) through an `int ***`
+        // PARAMETER must reach through all three real levels of
+        // indirection and land on `x`'s own real stack slot in the
+        // CALLER, not merely inside a copy. `dummy` receives the call's
+        // (unused) return value, the same bare-call-as-statement
+        // workaround Milestone 120's own CASE124-adjacent cases use.
+        //   int set_deref3(int ***ppp) { ***ppp = 99; return 0; }
+        //   int main() {
+        //       int x; int *p; int **pp; int ***ppp; int dummy;
+        //       x = 5; p = &x; pp = &p; ppp = &pp;
+        //       dummy = set_deref3(ppp);
+        //       return x;
+        //   }
+        // Hand-computed: 99.
+        // -------------------------------------------------------------
+        const SRC175: &[u8] = b"int set_deref3(int ***ppp) { ***ppp = 99; return 0; } int main() { int x; int *p; int **pp; int ***ppp; int dummy; x = 5; p = &x; pp = &p; ppp = &pp; dummy = set_deref3(ppp); return x; }";
+        let case175_result = compile_and_run_program_callable(SRC175.as_ptr() as u64, SRC175.len() as u64);
+        w(b"  case175 (int*** PARAMETER, triple-deref WRITE through it reaches the real caller slot, in-process) returned=");
+        if let Some(r) = case175_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 99)\n");
+        let case175_ok = case175_result == Some(99);
+        write_check(b"case175_int_ptr_ptr_ptr_parameter_triple_deref_write_returns_99=", case175_ok);
+
+        w(b"\n");
+
+        // CASE 176: an `int ***` RETURN value -- `int ***f(...)`, the
+        // return-type half of this milestone's grammar extension,
+        // mirroring Milestone 120's own CASE123 one level deeper.
+        //   int ***identity_ppp(int ***ppp) { return ppp; }
+        //   int main() {
+        //       int x; int *p; int **pp; int ***ppp; int ***q;
+        //       x = 66; p = &x; pp = &p; ppp = &pp;
+        //       q = identity_ppp(ppp);
+        //       return ***q;
+        //   }
+        // Hand-computed: q == ppp == &pp, ***q == ***ppp == x == 66.
+        // -------------------------------------------------------------
+        const SRC176: &[u8] = b"int ***identity_ppp(int ***ppp) { return ppp; } int main() { int x; int *p; int **pp; int ***ppp; int ***q; x = 66; p = &x; pp = &p; ppp = &pp; q = identity_ppp(ppp); return ***q; }";
+        let case176_result = compile_and_run_program_callable(SRC176.as_ptr() as u64, SRC176.len() as u64);
+        w(b"  case176 (int*** RETURN value crosses a call boundary, ***q READ through the stored result, in-process) returned=");
+        if let Some(r) = case176_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 66)\n");
+        let case176_ok = case176_result == Some(66);
+        write_check(b"case176_int_ptr_ptr_ptr_return_value_triple_deref_read_returns_66=", case176_ok);
+
+        w(b"\n");
+
+        // CASE 177: a real, deliberate VERIFICATION case, not a new fix --
+        // proves this milestone's extended three-star lookahead (both in
+        // `parse_params()` and `parse_function()`'s return-type branch)
+        // did NOT regress the pre-existing two-star `int **`
+        // parameter/return path (Milestones 119/120), by declaring an
+        // `int **`-based function AND an `int ***`-based function in the
+        // SAME program and combining both results in one expression --
+        // the three-level mirror of Milestone 120's own CASE125.
+        //   int **identity_pp(int **pp) { return pp; }
+        //   int ***identity_ppp(int ***ppp) { return ppp; }
+        //   int main() {
+        //       int a; int *ap; int **app; int ***appp;
+        //       int **rpp; int ***rppp;
+        //       a = 10; ap = &a; app = &ap; appp = &app;
+        //       rpp = identity_pp(app);
+        //       rppp = identity_ppp(appp);
+        //       return **rpp + ***rppp;
+        //   }
+        // Hand-computed: rpp == app (address of ap), so **rpp == *ap == a
+        // == 10. rppp == appp (address of app), so *rppp == app,
+        // **rppp == *app == ap, ***rppp == *ap == a == 10. Total: 20.
+        // -------------------------------------------------------------
+        const SRC177: &[u8] = b"int **identity_pp(int **pp) { return pp; } int ***identity_ppp(int ***ppp) { return ppp; } int main() { int a; int *ap; int **app; int ***appp; int **rpp; int ***rppp; a = 10; ap = &a; app = &ap; appp = &app; rpp = identity_pp(app); rppp = identity_ppp(appp); return **rpp + ***rppp; }";
+        let case177_result = compile_and_run_program_callable(SRC177.as_ptr() as u64, SRC177.len() as u64);
+        w(b"  case177 (a two-star int** AND a three-star int*** parameter+return coexist correctly in one program, verification only, in-process) returned=");
+        if let Some(r) = case177_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 20)\n");
+        let case177_ok = case177_result == Some(20);
+        write_check(b"case177_int_ptr_ptr_and_int_ptr_ptr_ptr_coexist_returns_20=", case177_ok);
+
+        w(b"\n");
+
+        let overall_m139 = case174_ok && case175_ok && case176_ok && case177_ok;
+        w(b"OVERALL_M139=");
+        w(if overall_m139 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 { 0 } else { 1 });
     }
 }
 

@@ -4330,69 +4330,81 @@ impl Parser {
     /// semi` is true for a plain assignment statement (which ends in
     /// `;`), false for a `for` init/step clause (which ends in `;`/`)`
     /// consumed by the `for` parser itself).
+    /// MILESTONE 137: shared construction for `i++`/`i--` (either
+    /// position -- see the two callers): desugars to `i = i + 1;`/`i = i
+    /// - 1;` by synthesizing a literal `1` directly (there is no RHS
+    /// token to parse at all, unlike every compound-assignment operator)
+    /// and reusing the EXACT SAME `lhs_ref`/`EXPR_BINARY`/`STMT_ASSIGN`
+    /// construction `finish_ident_assign()`'s own compound-assignment
+    /// path already uses -- zero new codegen, since `i = i + 1` is
+    /// already a real, existing `STMT_ASSIGN` shape. Extracted as its
+    /// own helper (Milestone 138) rather than duplicated a second time
+    /// once a PREFIX caller needed the identical construction with only
+    /// the token order swapped (`++i` sees the operator BEFORE the
+    /// name, `i++` sees it after) -- the "reuse before duplicate"
+    /// discipline this file's own `naive_admit()`/`apply_stdp()`
+    /// precedents already established, applied here.
+    unsafe fn build_incr_decr_assign(&mut self, name: Token, op: u8) -> Result<u64, ParseError> {
+        let lhs_ref = unsafe { alloc_expr() };
+        if lhs_ref == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                lhs_ref as *mut ExprNode,
+                ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let one = unsafe { alloc_expr() };
+        if one == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                one as *mut ExprNode,
+                ExprNode { kind: EXPR_INTLIT, int_val: 1, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let bin = unsafe { alloc_expr() };
+        if bin == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                bin as *mut ExprNode,
+                ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: lhs_ref, right: one, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let node = unsafe { alloc_stmt() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut StmtNode,
+                StmtNode { kind: STMT_ASSIGN, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: 0, else_body: 0 },
+            )
+        };
+        Ok(node)
+    }
+
     unsafe fn finish_ident_assign(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
         let opk = unsafe { self.peek() }.kind;
-        // MILESTONE 137: `i++;`/`i--;` -- desugared to `i = i + 1;`/
-        // `i = i - 1;` at STATEMENT level, the narrowest possible first
-        // slice (real C's postfix `++`/`--` as a general EXPRESSION --
-        // usable inside a larger expression, with the OLD value as its
-        // result -- is real, disclosed future work, not attempted here;
-        // this milestone only recognizes `IDENT "++"/"--"` as an entire
+        // MILESTONE 137: `i++;`/`i--;` -- desugared via `build_incr_decr_
+        // assign()` above, the narrowest possible first slice (real C's
+        // postfix `++`/`--` as a general EXPRESSION -- usable inside a
+        // larger expression, with the OLD value as its result -- is
+        // real, disclosed future work, not attempted here; this
+        // milestone only recognizes `IDENT "++"/"--"` as an entire
         // statement, exactly where a plain assignment or compound
-        // assignment already can appear). No RHS token to parse at all
-        // -- unlike every compound-assignment operator below, which
-        // reads a real expression after itself, a literal `1` is
-        // synthesized directly, then this reuses the EXACT SAME
-        // `lhs_ref`/`EXPR_BINARY`/`STMT_ASSIGN` construction the `+=`/
-        // `-=` path below already uses -- zero new codegen, since `i = i
-        // + 1` is already a real, existing STMT_ASSIGN shape.
+        // assignment already can appear).
         if opk == TOK_PLUSPLUS || opk == TOK_MINUSMINUS {
             let op: u8 = if opk == TOK_PLUSPLUS { b'+' } else { b'-' };
             unsafe { self.advance() }; // consume '++' or '--'
             if consume_semi {
                 unsafe { self.expect(TOK_SEMI) }?;
             }
-            let lhs_ref = unsafe { alloc_expr() };
-            if lhs_ref == 0 {
-                return Err(ParseError::OutOfMemory);
-            }
-            unsafe {
-                core::ptr::write(
-                    lhs_ref as *mut ExprNode,
-                    ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
-                )
-            };
-            let one = unsafe { alloc_expr() };
-            if one == 0 {
-                return Err(ParseError::OutOfMemory);
-            }
-            unsafe {
-                core::ptr::write(
-                    one as *mut ExprNode,
-                    ExprNode { kind: EXPR_INTLIT, int_val: 1, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
-                )
-            };
-            let bin = unsafe { alloc_expr() };
-            if bin == 0 {
-                return Err(ParseError::OutOfMemory);
-            }
-            unsafe {
-                core::ptr::write(
-                    bin as *mut ExprNode,
-                    ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: lhs_ref, right: one, call_args_ptr: 0, call_argc: 0 },
-                )
-            };
-            let node = unsafe { alloc_stmt() };
-            if node == 0 {
-                return Err(ParseError::OutOfMemory);
-            }
-            unsafe {
-                core::ptr::write(
-                    node as *mut StmtNode,
-                    StmtNode { kind: STMT_ASSIGN, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: 0, else_body: 0 },
-                )
-            };
-            return Ok(node);
+            return unsafe { self.build_incr_decr_assign(name, op) };
         }
         let binop: Option<u8> = if opk == TOK_PLUSEQ { Some(b'+') }
             else if opk == TOK_MINUSEQ { Some(b'-') }
@@ -4716,6 +4728,31 @@ impl Parser {
                     )
                 };
                 Ok(node)
+            }
+            // MILESTONE 138: `++IDENT;`/`--IDENT;` -- real PREFIX
+            // increment/decrement, symmetric with Milestone 137's own
+            // postfix `IDENT++;`/`IDENT--;`. Dispatched at the very
+            // start of a statement exactly like `TOK_STAR`'s own arm
+            // just above (a statement starting with `++`/`--` can only
+            // ever be this one shape in this subset's grammar -- there
+            // is no bare expression-statement here at all, the same
+            // restriction `TOK_STAR`'s own doc comment already
+            // disclosed). Same narrow scope as the postfix form: whole
+            // STATEMENT only, not a general expression (`x = ++i;`,
+            // `f(++i)`, and prefix-as-rvalue-with-the-new-value are all
+            // real, disclosed future work). Desugars via the SAME
+            // `build_incr_decr_assign()` helper the postfix form uses --
+            // the only real difference between prefix and postfix AS
+            // WHOLE STATEMENTS is which token comes first in the source
+            // text; the resulting `i = i +/- 1;` statement is identical
+            // either way, so sharing the one helper is not just
+            // convenient but semantically exact.
+            TOK_PLUSPLUS | TOK_MINUSMINUS => {
+                let op: u8 = if t.kind == TOK_PLUSPLUS { b'+' } else { b'-' };
+                unsafe { self.advance() }; // consume '++' or '--'
+                let name = unsafe { self.expect(TOK_IDENT) }?;
+                unsafe { self.expect(TOK_SEMI) }?;
+                unsafe { self.build_incr_decr_assign(name, op) }
             }
             // MILESTONE 92: `goto LABEL ;`.
             TOK_GOTO => {
@@ -14846,7 +14883,79 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m137 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 { 0 } else { 1 });
+        // CASE 170: MILESTONE 138 -- real PREFIX `++i;` as a standalone
+        // statement, symmetric with Milestone 137's own postfix form.
+        const SRC170: &[u8] = b"int main() { int i; i = 5; ++i; return i; }";
+        let case170_result = compile_and_run_program_callable(SRC170.as_ptr() as u64, SRC170.len() as u64);
+        w(b"  case170 (++i; as a standalone statement, desugars to i = i + 1) returned=");
+        if let Some(r) = case170_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 6)\n");
+        let case170_ok = case170_result == Some(6);
+        write_check(b"case170_prefix_increment_statement_returns_6=", case170_ok);
+
+        w(b"\n");
+
+        // CASE 171: `--i;` -- the same desugaring, `-` instead of `+`.
+        const SRC171: &[u8] = b"int main() { int i; i = 5; --i; return i; }";
+        let case171_result = compile_and_run_program_callable(SRC171.as_ptr() as u64, SRC171.len() as u64);
+        w(b"  case171 (--i; as a standalone statement, desugars to i = i - 1) returned=");
+        if let Some(r) = case171_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4)\n");
+        let case171_ok = case171_result == Some(4);
+        write_check(b"case171_prefix_decrement_statement_returns_4=", case171_ok);
+
+        w(b"\n");
+
+        // CASE 172: a REGRESSION guard -- `i++;` (Milestone 137's own
+        // postfix form) must still work exactly as before, now that its
+        // construction logic moved into the shared `build_incr_decr_
+        // assign()` helper this milestone extracted.
+        const SRC172: &[u8] = b"int main() { int i; i = 5; i++; return i; }";
+        let case172_result = compile_and_run_program_callable(SRC172.as_ptr() as u64, SRC172.len() as u64);
+        w(b"  case172 (REGRESSION: i++; postfix form still works after the shared-helper refactor) returned=");
+        if let Some(r) = case172_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 6)\n");
+        let case172_ok = case172_result == Some(6);
+        write_check(b"case172_postfix_increment_regression_returns_6=", case172_ok);
+
+        w(b"\n");
+
+        // CASE 173: a REGRESSION guard -- `i += 3;` (Milestone 84's own
+        // compound-assignment feature) still works, one more check that
+        // `finish_ident_assign()`'s own early-branch reorganization
+        // didn't disturb it.
+        const SRC173: &[u8] = b"int main() { int i; i = 5; i += 3; return i; }";
+        let case173_result = compile_and_run_program_callable(SRC173.as_ptr() as u64, SRC173.len() as u64);
+        w(b"  case173 (REGRESSION: i += 3; compound assignment still works) returned=");
+        if let Some(r) = case173_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 8)\n");
+        let case173_ok = case173_result == Some(8);
+        write_check(b"case173_compound_assignment_regression_returns_8=", case173_ok);
+
+        w(b"\n");
+
+        let overall_m138 = case170_ok && case171_ok && case172_ok && case173_ok;
+        w(b"OVERALL_M138=");
+        w(if overall_m138 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 { 0 } else { 1 });
     }
 }
 

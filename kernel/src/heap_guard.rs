@@ -54,6 +54,19 @@
 //! moved, not any of the numbers that drive it. Verified behavior-
 //! preserving: see README.md's own Milestone 106 entry for the
 //! byte-identical counter comparison against Milestone 105's baseline.
+//!
+//! **MILESTONE 123 update**: `admit()`'s two internal refusal reasons
+//! (hard floor vs. gate-conservative-mode) were always computed but only
+//! ever collapsed into one `bool` before reaching a caller -- the same
+//! shape of gap named the same session in `reagent`'s
+//! `CANDIDATE_FIX_SITES_PRE_REGISTRATION.md` (a detector already
+//! computing richer structural candidates than it reported). New
+//! `AdmitVerdict` enum + `admit_ranked()` surface the real distinction;
+//! `admit()` is now a thin, behavior-preserving wrapper over it. See
+//! `admit_ranked()`'s own doc for why the distinction is genuinely
+//! actionable (one reason is self-healing/expected-to-clear, the other
+//! is not) even though today's two real callers still only consume the
+//! collapsed `bool`.
 
 use crate::allocator;
 use crate::evidence_gate::{self, GateConfig, GateKind, GateTransition};
@@ -162,6 +175,56 @@ pub fn record_teardown_sample(used_after: usize) {
     }
 }
 
+/// MILESTONE 123: `admit()` below has always internally distinguished
+/// two structurally different refusal reasons (see its own doc, carried
+/// over unchanged) but only ever surfaced a bare `bool` to callers --
+/// exactly the shape of gap this milestone's own reagent work (the same
+/// session's `CANDIDATE_FIX_SITES_PRE_REGISTRATION.md`, applied there to
+/// a static analyzer instead of a kernel) named: a decision already
+/// computes richer structural information internally, then throws it
+/// away before the caller ever sees it. Ranked here in the sense that
+/// matters for THIS decision: `DeniedHardFloor` is unconditional (more
+/// heap must be freed; retrying sooner cannot help), while
+/// `DeniedGateConservative` is a real, self-healing-relevant distinction
+/// -- the gate is expected to clear once `record_teardown_sample()`'s
+/// EMA evidence drops back under `GATE_OFF_THRESHOLD`, so a caller that
+/// can retry later (unlike today's two callers, which cannot) has a
+/// genuine reason to prefer retrying over giving up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitVerdict {
+    Admitted,
+    /// `allocator::heap_free()` genuinely does not have
+    /// `bytes_needed + SAFETY_MARGIN_BYTES` free right now, regardless
+    /// of gate state. Only more heap becoming free changes this.
+    DeniedHardFloor,
+    /// The hard floor is met, but sustained real evidence (the
+    /// evidence-gate's own EMA, see `record_teardown_sample()`) says
+    /// this boot's kernel heap has been trending toward exhaustion.
+    /// Self-healing, not permanent: expected to clear on its own once
+    /// pressure subsides, unlike `DeniedHardFloor`.
+    DeniedGateConservative,
+}
+
+/// MILESTONE 123: the real admission decision, with its two distinct
+/// refusal reasons now an actual return value instead of collapsed into
+/// one `bool`. `admit()` below is now a thin wrapper over this -- single
+/// source of truth, same "reuse before duplicate" discipline as
+/// `naive_admit()`'s own relationship to this function since Milestone
+/// 104 -- so this is a real behavior-preserving refactor for every
+/// existing caller, not a parallel, divergence-prone copy.
+pub fn admit_ranked(bytes_needed: usize) -> AdmitVerdict {
+    let free = allocator::heap_free();
+    if free < bytes_needed.saturating_add(SAFETY_MARGIN_BYTES) {
+        ADMISSIONS_DENIED.fetch_add(1, Ordering::Relaxed);
+        return AdmitVerdict::DeniedHardFloor;
+    }
+    if evidence_gate::is_conservative(GateKind::KernelHeapPressure) {
+        ADMISSIONS_DENIED.fetch_add(1, Ordering::Relaxed);
+        return AdmitVerdict::DeniedGateConservative;
+    }
+    AdmitVerdict::Admitted
+}
+
 /// MILESTONE 104: the real admission check -- `tasks.rs`'s
 /// `run_preemption_demo()`/`spawn()` call this BEFORE allocating a
 /// worker-task stack, instead of allocating first and finding out via a
@@ -178,17 +241,14 @@ pub fn record_teardown_sample(used_after: usize) {
 ///      kernel heap has been trending toward exhaustion -- proactive
 ///      degradation instead of waiting for the hard floor to be the only
 ///      thing standing between the next request and a panic.
+///
+/// MILESTONE 123: now a thin wrapper over `admit_ranked()` -- see that
+/// function's own doc for why the two refusal reasons are now a real,
+/// distinguishable return value for any caller that wants it, with this
+/// function's existing `bool` contract (and every existing caller's
+/// behavior) completely unchanged.
 pub fn admit(bytes_needed: usize) -> bool {
-    let free = allocator::heap_free();
-    if free < bytes_needed.saturating_add(SAFETY_MARGIN_BYTES) {
-        ADMISSIONS_DENIED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    if evidence_gate::is_conservative(GateKind::KernelHeapPressure) {
-        ADMISSIONS_DENIED.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    true
+    admit_ranked(bytes_needed) == AdmitVerdict::Admitted
 }
 
 /// MILESTONE 104: the conventional baseline this milestone's own
@@ -242,6 +302,7 @@ pub fn self_test_heap_pressure(stress_cycles: u32) {
     let request = crate::tasks::STACK_SIZE;
     let evidence_gated_admits = admit(request);
     let naive_admits = naive_admit(request);
+    let ranked_verdict = admit_ranked(request);
 
     let _ = writeln!(
         serial(),
@@ -257,9 +318,38 @@ pub fn self_test_heap_pressure(stress_cycles: u32) {
         serial(),
         "milestone 104: self-test -- for a real {request}-byte request right now: evidence_gated_admit={evidence_gated_admits} naive_admit={naive_admits}"
     );
+
+    // MILESTONE 123: prove the two denial reasons are genuinely
+    // distinguishable, not just two names for the same bool. `Admitted`
+    // must exactly match the pre-existing `evidence_gated_admits` bool
+    // (behavior-preserving refactor check); a request of double the
+    // WHOLE heap's budget must ALWAYS report DeniedHardFloor, regardless
+    // of whatever the evidence-gate's conservative/normal state happens
+    // to be right now -- the one deterministic, boot-order-independent
+    // case available for this real distinction.
+    let refactor_consistent = (ranked_verdict == AdmitVerdict::Admitted) == evidence_gated_admits;
+    let oversized_request = allocator::HEAP_SIZE * 2;
+    let hard_floor_verdict = admit_ranked(oversized_request);
+    let hard_floor_ok = hard_floor_verdict == AdmitVerdict::DeniedHardFloor;
+    let _ = writeln!(
+        serial(),
+        "milestone 123: self-test -- ranked verdict for the same real {request}-byte request: {ranked_verdict:?} (refactor_consistent_with_bool={refactor_consistent}); a deliberately oversized {oversized_request}-byte request: {hard_floor_verdict:?} (hard_floor_ok={hard_floor_ok})"
+    );
+    // MILESTONE 123 deliberately does NOT fold into `all_cycles_ok` /
+    // OVERALL_M104 above -- M104's own metric is specifically about the
+    // stress-cycle fork/wait loop and must keep meaning exactly what it
+    // meant at Milestone 104, unchanged, so its PASS/FAIL history stays
+    // comparable across every milestone since. This gets its own,
+    // independent OVERALL_M123 marker instead.
+
     let _ = writeln!(
         serial(),
         "milestone 104: self-test -- OVERALL_M104={}",
         if all_cycles_ok { "PASS" } else { "FAIL" }
+    );
+    let _ = writeln!(
+        serial(),
+        "milestone 123: self-test -- OVERALL_M123={}",
+        if refactor_consistent && hard_floor_ok { "PASS" } else { "FAIL" }
     );
 }

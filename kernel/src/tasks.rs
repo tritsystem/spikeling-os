@@ -201,11 +201,17 @@ static DEMO_ENTRIES: [extern "C" fn() -> !; MAX_TASKS] = [
 /// `heap_guard.rs`'s own module doc for the real evidence-gated
 /// admission design and the honest naive-vs-evidence-gated benchmark.
 pub fn run_preemption_demo() {
-    if !crate::heap_guard::admit(3 * STACK_SIZE) {
+    // MILESTONE 123: heap_guard::admit_ranked() distinguishes WHY a
+    // refusal happened -- see that function's own doc. Logged here
+    // purely for diagnostic legibility; the refuse-and-return behavior
+    // itself is unchanged (this function still cannot retry either way).
+    let verdict = crate::heap_guard::admit_ranked(3 * STACK_SIZE);
+    if verdict != crate::heap_guard::AdmitVerdict::Admitted {
         let _ = writeln!(
             crate::serial(),
-            "milestone 104: run_preemption_demo() SKIPPED -- heap_guard::admit() refused the real {} bytes this demo's 3 worker stacks need (kernel heap under real, measured pressure); see the milestone 104 heap-pressure lines above for the real evidence that led here",
-            3 * STACK_SIZE
+            "milestone 104: run_preemption_demo() SKIPPED -- heap_guard::admit() refused the real {} bytes this demo's 3 worker stacks need ({:?}); see the milestone 104 heap-pressure lines above for the real evidence that led here",
+            3 * STACK_SIZE,
+            verdict
         );
         return;
     }

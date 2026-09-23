@@ -15410,7 +15410,103 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m141 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 { 0 } else { 1 });
+        // CASE 184: a real, deliberate VERIFICATION milestone, not a new
+        // fix -- proves `p++;`/`--p;` (Milestone 137/138's own statement-
+        // only `++`/`--`) ALREADY scales correctly when `p` is a real
+        // pointer, with zero additional code. `build_incr_decr_assign()`
+        // (Milestone 138) constructs the exact same `EXPR_BINARY { op,
+        // left: EXPR_IDENT(name), right: EXPR_INTLIT(1) }` shape
+        // `finish_ident_assign()`'s own compound-assignment branch
+        // (`p += 1;`, Milestone 84) already builds -- and `EXPR_BINARY`'s
+        // `+`/`-` codegen has scaled a pointer `EXPR_IDENT` operand
+        // through `ptr_operand_scale()` since Milestone 115, generically,
+        // for any pointer depth. So `p++;` was already real pointer
+        // arithmetic (not a plain unscaled `+1`) the moment Milestone 138
+        // landed; this milestone's only real work is writing the test
+        // that proves it, not touching a single line of parser or codegen
+        // (the same "already wired, just never proven" shape Milestone
+        // 141 itself established one commit ago).
+        //
+        // `p++;` through an `int *`: declaration order `y`, `x`, `p`
+        // (`y=rbp-8`, `x=rbp-16`, `p=rbp-24`); `p = &x`; `p++` must scale
+        // by 8 (not 1), landing exactly on `y`'s own slot.
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *p;
+        //       p = &x;
+        //       p++;
+        //       return *p;
+        //   }
+        // Hand-computed: p becomes &y, *p == 111.
+        // -------------------------------------------------------------
+        const SRC184: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *p; p = &x; p++; return *p; }";
+        let case184_result = compile_and_run_program_callable(SRC184.as_ptr() as u64, SRC184.len() as u64);
+        w(b"  case184 (p++ through int* ALREADY scales by 8 via the shared build_incr_decr_assign/EXPR_BINARY path, verification only, in-process) returned=");
+        if let Some(r) = case184_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 111)\n");
+        let case184_ok = case184_result == Some(111);
+        write_check(b"case184_int_ptr_postfix_increment_scales_by_8_returns_111=", case184_ok);
+
+        w(b"\n");
+
+        // CASE 185: the prefix mirror (`--p;`, Milestone 138's own
+        // dispatch arm), a real DECREMENT this time -- distinguishes a
+        // genuine scale-by-8 from a coincidental match (an unscaled `-1`
+        // would land one byte into `y`'s own slot, not on `x`'s).
+        //   int main() {
+        //       int y; int x;
+        //       y = 111; x = 222;
+        //       int *p;
+        //       p = &y;
+        //       --p;
+        //       return *p;
+        //   }
+        // Hand-computed: p becomes &x, *p == 222.
+        // -------------------------------------------------------------
+        const SRC185: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *p; p = &y; --p; return *p; }";
+        let case185_result = compile_and_run_program_callable(SRC185.as_ptr() as u64, SRC185.len() as u64);
+        w(b"  case185 (--p prefix through int* ALREADY scales by 8, distinguishing case, verification only, in-process) returned=");
+        if let Some(r) = case185_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 222)\n");
+        let case185_ok = case185_result == Some(222);
+        write_check(b"case185_int_ptr_prefix_decrement_scales_by_8_returns_222=", case185_ok);
+
+        w(b"\n");
+
+        // CASE 186: a REGRESSION guard -- the plain, unscaled `i++;` form
+        // on an ordinary `int` (Milestone 137's own original case) must
+        // still work unaffected, proving this milestone's verification
+        // work (which touches zero code) didn't somehow coincide with a
+        // real change elsewhere.
+        const SRC186: &[u8] = b"int main() { int i; i = 5; i++; return i; }";
+        let case186_result = compile_and_run_program_callable(SRC186.as_ptr() as u64, SRC186.len() as u64);
+        w(b"  case186 (REGRESSION: plain int i++; unscaled form still works) returned=");
+        if let Some(r) = case186_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 6)\n");
+        let case186_ok = case186_result == Some(6);
+        write_check(b"case186_plain_int_postfix_increment_regression_returns_6=", case186_ok);
+
+        w(b"\n");
+
+        let overall_m142 = case184_ok && case185_ok && case186_ok;
+        w(b"OVERALL_M142=");
+        w(if overall_m142 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 { 0 } else { 1 });
     }
 }
 

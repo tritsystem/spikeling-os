@@ -45,6 +45,23 @@ use spin::Mutex;
 pub(crate) const STACK_SIZE: usize = 4096 * 4; // 16 KiB per task
 const N_TASKS: usize = 3; // original Milestone 5c fixed task count
 const MAX_TASKS: usize = 8; // Milestone 25: hard cap on concurrent task slots
+
+/// MILESTONE 131: `spawn()`'s own bounded retry budget for a
+/// `DeniedGateConservative` refusal only (never for `DeniedHardFloor`,
+/// which retrying can never fix). 3 attempts, real, deliberate: this
+/// kernel's heap-pressure gate re-evaluates only every
+/// `golden_period()` samples (a REAL process-teardown event, not a
+/// clock tick), so a single retry could easily land between the same
+/// two samples the gate is already averaging -- 3 gives real intervening
+/// activity (a background task's own teardown, a shell command
+/// completing) a genuine chance to land inside the wait window without
+/// spawn() blocking indefinitely on a boot that never recovers.
+const SPAWN_RETRY_ATTEMPTS: u32 = 3;
+/// MILESTONE 131: real `hlt()` cycles per retry -- the same "wait via
+/// real hlt, let pending interrupts actually run" shape Milestone 6's
+/// own keyboard-wait window already established (`for _ in 0..150 {
+/// hlt() }`), scaled down since this wait can repeat up to 3 times.
+const SPAWN_RETRY_HLT_CYCLES: u32 = 50;
 const MAX_TICKS: u64 = 60; // ~3.3s of real time at the default ~18.2Hz PIT rate
 
 pub type TaskId = usize;
@@ -274,8 +291,39 @@ fn current_rsp_ptr(current: usize) -> *mut u64 {
 /// request. Checked FIRST, before any scheduler-slot state is touched
 /// (revive/add_slot), so a refusal here never leaves a half-grown
 /// scheduler slot with no task behind it.
+///
+/// MILESTONE 131: this is the "future milestone" Milestone 123's own
+/// `heap_guard::AdmitVerdict` doc named -- `admit_ranked()`'s two
+/// refusal reasons are now genuinely ACTED on here, not just logged.
+/// `DeniedHardFloor` still fails immediately (unconditional -- retrying
+/// cannot help until more heap is actually freed, so a retry loop here
+/// would just waste real hlt cycles). `DeniedGateConservative` gets up
+/// to `SPAWN_RETRY_ATTEMPTS` real, bounded retries, each separated by
+/// `SPAWN_RETRY_HLT_CYCLES` real `hlt()`s -- the same "wait via real
+/// hlt cycles, not a busy loop" shape Milestone 6's own keyboard-wait
+/// window already established. A real `hlt()` lets pending interrupts
+/// (including another process's real teardown, which is what feeds
+/// `record_teardown_sample()` and can clear the gate) actually run
+/// during the wait, unlike a pure CPU spin.
 pub fn spawn() -> Option<TaskId> {
-    if !crate::heap_guard::admit(STACK_SIZE) {
+    let mut verdict = crate::heap_guard::admit_ranked(STACK_SIZE);
+    let mut retries_used: u32 = 0;
+    while verdict == crate::heap_guard::AdmitVerdict::DeniedGateConservative
+        && retries_used < SPAWN_RETRY_ATTEMPTS
+    {
+        retries_used += 1;
+        for _ in 0..SPAWN_RETRY_HLT_CYCLES {
+            x86_64::instructions::hlt();
+        }
+        verdict = crate::heap_guard::admit_ranked(STACK_SIZE);
+    }
+    if verdict != crate::heap_guard::AdmitVerdict::Admitted {
+        let _ = writeln!(
+            crate::serial(),
+            "milestone 131: spawn() refused -- {:?} after {} real retry attempt(s)",
+            verdict,
+            retries_used
+        );
         return None;
     }
     let mut tasks = TASKS.lock();

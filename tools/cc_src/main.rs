@@ -4587,6 +4587,63 @@ impl Parser {
         Ok(node)
     }
 
+    /// MILESTONE 148: the pointer-dereference sibling of `build_compound_
+    /// assign_index()` (Milestone 147) -- builds `*p = *p op rhs;` (an
+    /// `EXPR_UNARY{OP_DEREF, EXPR_IDENT(p)}` READ wrapped in an
+    /// `EXPR_BINARY` with the ALREADY-PARSED `rhs`, wrapped in a
+    /// `STMT_ASSIGN_DEREF` WRITE), the exact same shape `build_incr_
+    /// decr_assign_deref()` (Milestone 145) already established for
+    /// `(*p)++`/`(*p)--`, just with a real parsed RHS instead of a
+    /// hardcoded `EXPR_INTLIT(1)`. Zero pointer-scaling concern, the
+    /// same reasoning `build_incr_decr_assign_deref()`'s own doc comment
+    /// already gives: the read side is an `EXPR_UNARY`, not a bare
+    /// `EXPR_IDENT`, so `ptr_operand_scale()` never recognizes it and
+    /// `*p + rhs` correctly gets the plain, unscaled add appropriate for
+    /// the pointee's own value.
+    unsafe fn build_compound_assign_deref(&mut self, name: Token, op: u8, rhs: u64) -> Result<u64, ParseError> {
+        let ptr_ref = unsafe { alloc_expr() };
+        if ptr_ref == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                ptr_ref as *mut ExprNode,
+                ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let deref_ref = unsafe { alloc_expr() };
+        if deref_ref == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                deref_ref as *mut ExprNode,
+                ExprNode { kind: EXPR_UNARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_DEREF, left: ptr_ref, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let bin = unsafe { alloc_expr() };
+        if bin == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                bin as *mut ExprNode,
+                ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: deref_ref, right: rhs, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let node = unsafe { alloc_stmt() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut StmtNode,
+                StmtNode { kind: STMT_ASSIGN_DEREF, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: 0, else_body: 0 },
+            )
+        };
+        Ok(node)
+    }
+
     unsafe fn finish_ident_assign(&mut self, name: Token, consume_semi: bool) -> Result<u64, ParseError> {
         let opk = unsafe { self.peek() }.kind;
         // MILESTONE 137: `i++;`/`i--;` -- desugared via `build_incr_decr_
@@ -4968,6 +5025,28 @@ impl Parser {
                     return Ok(node);
                 }
                 let name = unsafe { self.expect(TOK_IDENT) }?;
+                // MILESTONE 148: `*p += expr;` -- the pointer-dereference-
+                // target half of the "compound assignment on a non-plain-
+                // identifier target" gap, the exact `+=`-only mirror of
+                // Milestone 147's own array-target closure one commit ago
+                // (itself mirroring Milestone 143's `++`/`--` rollout
+                // pattern). Checked here, after the single-star pointer's
+                // own IDENT, before the pre-existing plain `TOK_ASSIGN`
+                // check, so `*p = expr;` (this same arm's original
+                // Milestone 109/112 feature) is unaffected. Delegates to
+                // `build_compound_assign_deref()` below, the pointer-
+                // dereference sibling of `build_compound_assign_index()`
+                // (Milestone 147). Single-level `int *` only, the same
+                // "narrow slice first" discipline every `++`/`--` and
+                // compound-assignment milestone in this project has kept
+                // -- `**p += expr;`/`***p += expr;` are real, disclosed
+                // future work.
+                if unsafe { self.peek() }.kind == TOK_PLUSEQ {
+                    unsafe { self.advance() }; // consume '+='
+                    let rhs = unsafe { self.parse_ternary() }?;
+                    unsafe { self.expect(TOK_SEMI) }?;
+                    return unsafe { self.build_compound_assign_deref(name, b'+', rhs) };
+                }
                 unsafe { self.expect(TOK_ASSIGN) }?;
                 let rhs = unsafe { self.parse_ternary() }?;
                 unsafe { self.expect(TOK_SEMI) }?;
@@ -16254,7 +16333,58 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m147 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 { 0 } else { 1 });
+        // CASE 202: `*p += 5;` -- the pointer-dereference-target half of
+        // the compound-assignment gap, the exact `+=`-only mirror of
+        // Milestone 147's own array-target closure, one commit ago.
+        //   int main() {
+        //       int x;
+        //       x = 10;
+        //       int *p;
+        //       p = &x;
+        //       *p += 5;
+        //       return x;
+        //   }
+        // Hand-computed: 15.
+        // -------------------------------------------------------------
+        const SRC202: &[u8] = b"int main() { int x; x = 10; int *p; p = &x; *p += 5; return x; }";
+        let case202_result = compile_and_run_program_callable(SRC202.as_ptr() as u64, SRC202.len() as u64);
+        w(b"  case202 (*p += 5; a real pointer-dereference-target compound-assignment statement, in-process) returned=");
+        if let Some(r) = case202_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 15)\n");
+        let case202_ok = case202_result == Some(15);
+        write_check(b"case202_deref_target_compound_plus_assign_returns_15=", case202_ok);
+
+        w(b"\n");
+
+        // CASE 203: a REGRESSION guard -- `(*p)++;` (Milestone 145's own
+        // feature) must still work, unaffected by the new `TOK_PLUSEQ`
+        // lookahead this milestone inserted into the SAME single-star
+        // dispatch arm, between the IDENT and the pre-existing plain
+        // `TOK_ASSIGN` check.
+        const SRC203: &[u8] = b"int main() { int x; x = 10; int *p; p = &x; (*p)++; return x; }";
+        let case203_result = compile_and_run_program_callable(SRC203.as_ptr() as u64, SRC203.len() as u64);
+        w(b"  case203 (REGRESSION: (*p)++; dereference-target increment still works) returned=");
+        if let Some(r) = case203_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 11)\n");
+        let case203_ok = case203_result == Some(11);
+        write_check(b"case203_deref_target_increment_regression_returns_11=", case203_ok);
+
+        w(b"\n");
+
+        let overall_m148 = case202_ok && case203_ok;
+        w(b"OVERALL_M148=");
+        w(if overall_m148 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 { 0 } else { 1 });
     }
 }
 

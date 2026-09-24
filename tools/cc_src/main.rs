@@ -6216,13 +6216,43 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // MILESTONE 102: `s.then_body` is 0/1, written by make_decl()
             // (see that function's own doc comment for why `then_body`,
             // otherwise dead for STMT_DECL, carries this).
-            // MILESTONE 110: `is_array` is real (1) exactly when this
-            // declarator reserved more than one element (`elem_count >
-            // 1`, i.e. an array declarator, never a scalar one -- a
-            // scalar `int`/`char`/pointer declaration always has
-            // `elem_count == 1`) -- computed straight from the same
-            // `elem_count` this branch already derived above, not a
-            // second independent check.
+            // MILESTONE 110 (bug fixed at Milestone 146): `is_array` is
+            // meant to be real (1) exactly when this declarator came from
+            // `parse_array_decl()` (any REAL array, any size), never a
+            // plain scalar. Milestone 110's own original condition,
+            // `elem_count > 1`, was WRONG and shipped for 36 milestones
+            // (110 through 145) without being caught: `elem_count` is a
+            // DERIVED value (`if s.else_body == 0 { 1 } else { s.else_body
+            // }`, this same branch's own Milestone 108 line above) that
+            // defaults to exactly `1` for an ordinary SCALAR (`s.else_body
+            // == 0`) -- indistinguishable from a real, legal single-
+            // element array (`int arr[1];`, `s.else_body == 1`), which
+            // ALSO normalizes to `elem_count == 1`. `elem_count > 1`
+            // therefore silently misclassified any `int arr[1];` as a
+            // plain scalar (`is_array = 0`), causing `EXPR_INDEX`/
+            // `STMT_ASSIGN_INDEX`'s own `is_array`-gated codegen to emit
+            // `mov` (load the slot's stored VALUE) instead of `lea`
+            // (compute the slot's own ADDRESS) for `arr[0]` -- silently
+            // treating whatever integer happened to be stored in the
+            // array's own element as if it were a base pointer, then
+            // reading/writing through THAT as a real, uncontrolled wild
+            // memory access. Root-caused via a real, honest, execution-
+            // level investigation (a disassembly of the actual faulting
+            // machine-code bytes, extracted from a live kernel crash,
+            // not a code-review guess) after Milestone 144's own CASE190
+            // -- the FIRST test case in this project's entire history to
+            // declare a single-element array, `int arr[1];` -- happened
+            // to have this wild write land somewhere harmless enough to
+            // never itself visibly crash, while silently corrupting
+            // shared, reused heap/stack memory in a way that only
+            // manifested as an unrelated-looking, layout-dependent SIGSEGV
+            // in whichever DIFFERENT compile happened to run next,
+            // depending on what else was compiled earlier in the same
+            // boot. Fixed by checking the ORIGINAL `s.else_body != 0`
+            // (was this ever an array declarator at all) instead of the
+            // lossy, re-derived `elem_count`, which cannot by
+            // construction distinguish "no array" from "array of size
+            // 1" once both have already collapsed to the same `1`.
             // MILESTONE 112: `is_char_ptr` is `s.expr` (0/1, otherwise
             // dead for STMT_DECL -- see VarSlot's own `is_char_ptr` doc
             // comment for why this is a genuinely separate property from
@@ -6272,7 +6302,7 @@ unsafe fn collect_vars_rec(body_head: u64, vars_ptr: u64, n: &mut u64) -> Result
             // 8-byte load, never narrowed.
             let is_int_ptr_ptr_ptr_decl = s.then_body == 4;
             let is_char_flag: u8 = if is_int_ptr_decl || is_int_ptr_ptr_decl || is_int_ptr_ptr_ptr_decl { 0 } else { s.then_body as u8 };
-            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: is_char_flag, is_array: if elem_count > 1 { 1 } else { 0 }, is_char_ptr: s.expr as u8, is_int_ptr: if is_int_ptr_decl { 1 } else { 0 }, is_int_ptr_ptr: if is_int_ptr_ptr_decl { 1 } else { 0 }, is_int_ptr_ptr_ptr: if is_int_ptr_ptr_ptr_decl { 1 } else { 0 } }) };
+            unsafe { var_write(vars_ptr, *n, VarSlot { name_off: s.ident_off, name_len: s.ident_len, stack_off: off, is_char: is_char_flag, is_array: if s.else_body != 0 { 1 } else { 0 }, is_char_ptr: s.expr as u8, is_int_ptr: if is_int_ptr_decl { 1 } else { 0 }, is_int_ptr_ptr: if is_int_ptr_ptr_decl { 1 } else { 0 }, is_int_ptr_ptr_ptr: if is_int_ptr_ptr_ptr_decl { 1 } else { 0 } }) };
             // MILESTONE 108: an array of `elem_count` > 1 reserves
             // `elem_count` contiguous 8-byte stack slots (element `i`
             // lives at `off - 8*i`, i.e. progressively MORE negative as
@@ -16001,7 +16031,93 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m145 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 { 0 } else { 1 });
+        // CASE 197: `int arr[1];` -- a real, single-element array, basic
+        // read/write roundtrip. This exact declarator shape is what
+        // Milestone 144's own CASE190 already used (unwittingly
+        // exercising the bug this milestone fixes) -- this case proves
+        // it directly and minimally, independent of CASE190's own larger
+        // program.
+        //   int main() {
+        //       int arr[1];
+        //       arr[0] = 111;
+        //       return arr[0];
+        //   }
+        // Hand-computed: 111.
+        // -------------------------------------------------------------
+        const SRC197: &[u8] = b"int main() { int arr[1]; arr[0] = 111; return arr[0]; }";
+        let case197_result = compile_and_run_program_callable(SRC197.as_ptr() as u64, SRC197.len() as u64);
+        w(b"  case197 (int arr[1]; single-element array read/write roundtrip, the exact shape Milestone 146 fixes, in-process) returned=");
+        if let Some(r) = case197_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 111)\n");
+        let case197_ok = case197_result == Some(111);
+        write_check(b"case197_single_element_array_roundtrip_returns_111=", case197_ok);
+
+        w(b"\n");
+
+        // CASE 198: array-to-pointer DECAY on a single-element array
+        // (`p = arr;`, Milestone 110's own EXPR_IDENT decay path) --
+        // genuinely DIFFERENT codegen from CASE197's own EXPR_INDEX/
+        // STMT_ASSIGN_INDEX path, but gated by the SAME `is_array` flag
+        // this milestone fixes. Both paths agreeing on the real address
+        // is real, if not fully independent, corroborating evidence: a
+        // `is_array` misclassification would make EXPR_IDENT's own decay
+        // ALSO silently load `arr[0]`'s VALUE instead of computing its
+        // ADDRESS, so `p` would not hold a real pointer at all and `*p =
+        // 99;` would write somewhere unrelated to `arr[0]`.
+        //   int main() {
+        //       int arr[1];
+        //       arr[0] = 5;
+        //       int *p;
+        //       p = arr;
+        //       *p = 99;
+        //       return arr[0];
+        //   }
+        // Hand-computed: p decays to &arr[0]; *p = 99 writes through it;
+        // arr[0] reads back 99.
+        // -------------------------------------------------------------
+        const SRC198: &[u8] = b"int main() { int arr[1]; arr[0] = 5; int *p; p = arr; *p = 99; return arr[0]; }";
+        let case198_result = compile_and_run_program_callable(SRC198.as_ptr() as u64, SRC198.len() as u64);
+        w(b"  case198 (array-to-pointer decay on a single-element array, cross-checking a different is_array-gated code path, in-process) returned=");
+        if let Some(r) = case198_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 99)\n");
+        let case198_ok = case198_result == Some(99);
+        write_check(b"case198_single_element_array_decay_cross_check_returns_99=", case198_ok);
+
+        w(b"\n");
+
+        // CASE 199: a REGRESSION guard -- an ordinary MULTI-element array
+        // (`elem_count > 1`, already correctly classified `is_array = 1`
+        // both before and after this milestone's fix) must still work
+        // unaffected -- the fix only changes behavior for the
+        // `elem_count == 1` case this milestone's own doc comment names.
+        const SRC199: &[u8] = b"int main() { int arr[2]; arr[0] = 10; arr[1] = 20; return arr[0] + arr[1]; }";
+        let case199_result = compile_and_run_program_callable(SRC199.as_ptr() as u64, SRC199.len() as u64);
+        w(b"  case199 (REGRESSION: a real multi-element array, already-correct is_array classification, still works) returned=");
+        if let Some(r) = case199_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 30)\n");
+        let case199_ok = case199_result == Some(30);
+        write_check(b"case199_multi_element_array_regression_returns_30=", case199_ok);
+
+        w(b"\n");
+
+        let overall_m146 = case197_ok && case198_ok && case199_ok;
+        w(b"OVERALL_M146=");
+        w(if overall_m146 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 { 0 } else { 1 });
     }
 }
 

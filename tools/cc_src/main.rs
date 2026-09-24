@@ -4883,28 +4883,28 @@ impl Parser {
                     // here, after the `++`/`--` lookahead and before the
                     // pre-existing plain `TOK_ASSIGN` check, so neither
                     // `arr[i]++;` nor `arr[i] = expr;` is disturbed.
-                    // `+=` only this milestone -- the other eight
-                    // compound-assignment operators on an array target
-                    // are real, disclosed future work, the same "narrow
-                    // slice first" discipline every compound-assignment
-                    // and `++`/`--` milestone in this project has kept.
+                    // `+=` closed at Milestone 147. MILESTONE 149: `-=`
+                    // now too -- the other seven compound-assignment
+                    // operators on an array target are still real,
+                    // disclosed future work, the same "narrow slice
+                    // first" discipline every compound-assignment and
+                    // `++`/`--` milestone in this project has kept.
                     // Delegates to `build_compound_assign_index()` below,
                     // the array-target sibling of `finish_ident_assign()`'s
                     // own plain-identifier compound-assignment branch
-                    // (Milestone 84). This is a RETRY of a milestone that
-                    // was attempted once before this same session and
-                    // repeatedly crashed the self-test harness for
-                    // reasons ultimately unrelated to this feature itself
-                    // -- Milestone 146 (the immediately prior commit)
-                    // found and fixed the real root cause (an `is_array`
-                    // misclassification bug for single-element arrays,
-                    // ~36 milestones old), and this feature is being
-                    // re-attempted now that the actual bug is gone.
-                    if unsafe { self.peek() }.kind == TOK_PLUSEQ {
-                        unsafe { self.advance() }; // consume '+='
+                    // (Milestone 84). Milestone 147 was a RETRY of a
+                    // milestone that was attempted once before this same
+                    // session and repeatedly crashed the self-test
+                    // harness for reasons ultimately unrelated to this
+                    // feature itself -- Milestone 146 found and fixed the
+                    // real root cause (an `is_array` misclassification
+                    // bug for single-element arrays, ~36 milestones old).
+                    if unsafe { self.peek() }.kind == TOK_PLUSEQ || unsafe { self.peek() }.kind == TOK_MINUSEQ {
+                        let op: u8 = if unsafe { self.peek() }.kind == TOK_PLUSEQ { b'+' } else { b'-' };
+                        unsafe { self.advance() }; // consume '+=' or '-='
                         let rhs = unsafe { self.parse_ternary() }?;
                         unsafe { self.expect(TOK_SEMI) }?;
-                        return unsafe { self.build_compound_assign_index(name, idx, b'+', rhs) };
+                        return unsafe { self.build_compound_assign_index(name, idx, op, rhs) };
                     }
                     unsafe { self.expect(TOK_ASSIGN) }?;
                     let rhs = unsafe { self.parse_ternary() }?;
@@ -16384,7 +16384,57 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m148 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 { 0 } else { 1 });
+        // CASE 204: `arr[i] -= 3;` -- the second compound-assignment
+        // operator on an array target, mirroring Milestone 147's own
+        // `+=` closure with the genuinely distinct `sub` codegen path.
+        //   int main() {
+        //       int arr[3];
+        //       arr[0] = 10; arr[1] = 20; arr[2] = 30;
+        //       int i;
+        //       i = 1;
+        //       arr[i] -= 3;
+        //       return arr[1];
+        //   }
+        // Hand-computed: 17.
+        // -------------------------------------------------------------
+        const SRC204: &[u8] = b"int main() { int arr[3]; arr[0] = 10; arr[1] = 20; arr[2] = 30; int i; i = 1; arr[i] -= 3; return arr[1]; }";
+        let case204_result = compile_and_run_program_callable(SRC204.as_ptr() as u64, SRC204.len() as u64);
+        w(b"  case204 (arr[i] -= 3; a real array-element compound-subtraction statement, in-process) returned=");
+        if let Some(r) = case204_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 17)\n");
+        let case204_ok = case204_result == Some(17);
+        write_check(b"case204_array_index_compound_minus_assign_returns_17=", case204_ok);
+
+        w(b"\n");
+
+        // CASE 205: a REGRESSION guard -- `arr[i] += expr;` (Milestone
+        // 147's own feature) must still work, unaffected by the new
+        // `TOK_MINUSEQ` branch added alongside `TOK_PLUSEQ` in the same
+        // check.
+        const SRC205: &[u8] = b"int main() { int arr[2]; arr[0] = 10; arr[1] = 20; arr[0] += 5; return arr[0]; }";
+        let case205_result = compile_and_run_program_callable(SRC205.as_ptr() as u64, SRC205.len() as u64);
+        w(b"  case205 (REGRESSION: arr[i] += expr; array compound-addition still works) returned=");
+        if let Some(r) = case205_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 15)\n");
+        let case205_ok = case205_result == Some(15);
+        write_check(b"case205_array_compound_plus_assign_regression_returns_15=", case205_ok);
+
+        w(b"\n");
+
+        let overall_m149 = case204_ok && case205_ok;
+        w(b"OVERALL_M149=");
+        w(if overall_m149 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 { 0 } else { 1 });
     }
 }
 

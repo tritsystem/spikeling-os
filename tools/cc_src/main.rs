@@ -1995,6 +1995,21 @@ unsafe fn write_u64_dec(mut val: u64) {
 /// identifier's source bytes against an expected name), matching
 /// strcmp()'s own "compare via pointer reads, never slice" convention
 /// already established in libc.rs.
+/// MILESTONE 151: the compound-assignment operators recognized on an
+/// array-element (`arr[i] OP= expr;`) or pointer-dereference (`*p OP=
+/// expr;`) statement target, one shared table for both dispatch sites
+/// instead of two copies of an `||` chain. `+=` (Milestones 147/148),
+/// `-=` (149/150), `*=` (151); the remaining `/=`, `%=`, `&=`, `|=`,
+/// `^=`, `<<=`, `>>=` are real, disclosed future work. Returns the
+/// binary-operator byte `build_compound_assign_index()`/`_deref()` feed
+/// to the ordinary `EXPR_BINARY` codegen (no new codegen path).
+fn array_deref_compound_op(kind: u8) -> Option<u8> {
+    if kind == TOK_PLUSEQ { Some(b'+') }
+    else if kind == TOK_MINUSEQ { Some(b'-') }
+    else if kind == TOK_STAREQ { Some(b'*') }
+    else { None }
+}
+
 unsafe fn word_is(src_ptr: u64, off: u64, len: u64, s: &[u8]) -> bool {
     if len != s.len() as u64 {
         return false;
@@ -4899,9 +4914,10 @@ impl Parser {
                     // feature itself -- Milestone 146 found and fixed the
                     // real root cause (an `is_array` misclassification
                     // bug for single-element arrays, ~36 milestones old).
-                    if unsafe { self.peek() }.kind == TOK_PLUSEQ || unsafe { self.peek() }.kind == TOK_MINUSEQ {
-                        let op: u8 = if unsafe { self.peek() }.kind == TOK_PLUSEQ { b'+' } else { b'-' };
-                        unsafe { self.advance() }; // consume '+=' or '-='
+                    // MILESTONE 151: `*=` now too (see
+                    // `array_deref_compound_op()`).
+                    if let Some(op) = array_deref_compound_op(unsafe { self.peek() }.kind) {
+                        unsafe { self.advance() }; // consume '+=', '-=' or '*='
                         let rhs = unsafe { self.parse_ternary() }?;
                         unsafe { self.expect(TOK_SEMI) }?;
                         return unsafe { self.build_compound_assign_index(name, idx, op, rhs) };
@@ -5041,9 +5057,10 @@ impl Parser {
                 // every `++`/`--` and compound-assignment milestone in
                 // this project has kept -- `**p += expr;`/`**p -= expr;`
                 // are real, disclosed future work.
-                if unsafe { self.peek() }.kind == TOK_PLUSEQ || unsafe { self.peek() }.kind == TOK_MINUSEQ {
-                    let op: u8 = if unsafe { self.peek() }.kind == TOK_PLUSEQ { b'+' } else { b'-' };
-                    unsafe { self.advance() }; // consume '+=' or '-='
+                // MILESTONE 151: `*p *= expr;` now too, via the same
+                // shared `array_deref_compound_op()` as the array target.
+                if let Some(op) = array_deref_compound_op(unsafe { self.peek() }.kind) {
+                    unsafe { self.advance() }; // consume '+=', '-=' or '*='
                     let rhs = unsafe { self.parse_ternary() }?;
                     unsafe { self.expect(TOK_SEMI) }?;
                     return unsafe { self.build_compound_assign_deref(name, op, rhs) };
@@ -16485,7 +16502,70 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m150 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 { 0 } else { 1 });
+        // CASE 208: `arr[1] *= 4;` -- the third compound-assignment
+        // operator on an array-element target (Milestone 151).
+        //   int main() { int arr[2]; arr[0] = 1; arr[1] = 6; arr[1] *= 4; return arr[1]; }
+        // Hand-computed: 24.
+        // -------------------------------------------------------------
+        const SRC208: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 6; arr[1] *= 4; return arr[1]; }";
+        let case208_result = compile_and_run_program_callable(SRC208.as_ptr() as u64, SRC208.len() as u64);
+        w(b"  case208 (arr[1] *= 4; array-element compound-multiplication, in-process) returned=");
+        if let Some(r) = case208_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 24)
+");
+        let case208_ok = case208_result == Some(24);
+        write_check(b"case208_array_target_compound_times_assign_returns_24=", case208_ok);
+
+        w(b"
+");
+
+        // CASE 209: `*p *= 4;` -- same operator on a pointer-dereference
+        // target. Hand-computed: 24.
+        const SRC209: &[u8] = b"int main() { int x; x = 6; int *p; p = &x; *p *= 4; return x; }";
+        let case209_result = compile_and_run_program_callable(SRC209.as_ptr() as u64, SRC209.len() as u64);
+        w(b"  case209 (*p *= 4; pointer-dereference-target compound-multiplication, in-process) returned=");
+        if let Some(r) = case209_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 24)
+");
+        let case209_ok = case209_result == Some(24);
+        write_check(b"case209_deref_target_compound_times_assign_returns_24=", case209_ok);
+
+        w(b"
+");
+
+        // CASE 210: REGRESSION guard -- `arr[i] -= expr;` (Milestone 149)
+        // still works through the new shared helper. Hand-computed: 7.
+        const SRC210: &[u8] = b"int main() { int arr[2]; arr[0] = 10; arr[1] = 20; arr[0] -= 3; return arr[0]; }";
+        let case210_result = compile_and_run_program_callable(SRC210.as_ptr() as u64, SRC210.len() as u64);
+        w(b"  case210 (REGRESSION: arr[i] -= expr; still works via array_deref_compound_op) returned=");
+        if let Some(r) = case210_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 7)
+");
+        let case210_ok = case210_result == Some(7);
+        write_check(b"case210_array_compound_minus_assign_regression_returns_7=", case210_ok);
+
+        w(b"
+");
+
+        let overall_m151 = case208_ok && case209_ok && case210_ok;
+        w(b"OVERALL_M151=");
+        w(if overall_m151 { b"PASS" } else { b"FAIL" });
+        w(b"
+");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 { 0 } else { 1 });
     }
 }
 

@@ -1999,14 +1999,24 @@ unsafe fn write_u64_dec(mut val: u64) {
 /// array-element (`arr[i] OP= expr;`) or pointer-dereference (`*p OP=
 /// expr;`) statement target, one shared table for both dispatch sites
 /// instead of two copies of an `||` chain. `+=` (Milestones 147/148),
-/// `-=` (149/150), `*=` (151); the remaining `/=`, `%=`, `&=`, `|=`,
-/// `^=`, `<<=`, `>>=` are real, disclosed future work. Returns the
+/// `-=` (149/150), `*=` (151), and (Milestone 153) the remaining seven
+/// `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`. Returns the
 /// binary-operator byte `build_compound_assign_index()`/`_deref()` feed
 /// to the ordinary `EXPR_BINARY` codegen (no new codegen path).
 fn array_deref_compound_op(kind: u8) -> Option<u8> {
     if kind == TOK_PLUSEQ { Some(b'+') }
     else if kind == TOK_MINUSEQ { Some(b'-') }
     else if kind == TOK_STAREQ { Some(b'*') }
+    // MILESTONE 153: the remaining seven -- the same operator bytes
+    // `finish_ident_assign()`'s plain-identifier compound-assignment
+    // branch has used since Milestones 84/89, so no new codegen.
+    else if kind == TOK_SLASHEQ { Some(b'/') }
+    else if kind == TOK_PERCENTEQ { Some(b'%') }
+    else if kind == TOK_AMPEQ { Some(OP_BITAND) }
+    else if kind == TOK_PIPEEQ { Some(OP_BITOR) }
+    else if kind == TOK_CARETEQ { Some(OP_BITXOR) }
+    else if kind == TOK_SHLEQ { Some(OP_SHL) }
+    else if kind == TOK_SHREQ { Some(OP_SHR) }
     else { None }
 }
 
@@ -16565,7 +16575,222 @@ pub extern "C" fn _start() -> ! {
         w(b"
 ");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 { 0 } else { 1 });
+        // CASE 211: `arr[1] /= 4;` on 100 -> 25 (Milestone 153).
+        const SRC211: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 100; arr[1] /= 4; return arr[1]; }";
+        let case211_result = compile_and_run_program_callable(SRC211.as_ptr() as u64, SRC211.len() as u64);
+        w(b"  case211 (arr[1] /= 4; compound-div on a array target, in-process) returned=");
+        if let Some(r) = case211_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 25)\n");
+        let case211_ok = case211_result == Some(25);
+        write_check(b"case211_array_target_compound_div_assign_returns_25=", case211_ok);
+
+        w(b"\n");
+
+        // CASE 212: `arr[1] %= 7;` on 100 -> 2 (Milestone 153).
+        const SRC212: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 100; arr[1] %= 7; return arr[1]; }";
+        let case212_result = compile_and_run_program_callable(SRC212.as_ptr() as u64, SRC212.len() as u64);
+        w(b"  case212 (arr[1] %= 7; compound-mod on a array target, in-process) returned=");
+        if let Some(r) = case212_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 2)\n");
+        let case212_ok = case212_result == Some(2);
+        write_check(b"case212_array_target_compound_mod_assign_returns_2=", case212_ok);
+
+        w(b"\n");
+
+        // CASE 213: `arr[1] &= 12;` on 100 -> 4 (Milestone 153).
+        const SRC213: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 100; arr[1] &= 12; return arr[1]; }";
+        let case213_result = compile_and_run_program_callable(SRC213.as_ptr() as u64, SRC213.len() as u64);
+        w(b"  case213 (arr[1] &= 12; compound-and on a array target, in-process) returned=");
+        if let Some(r) = case213_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4)\n");
+        let case213_ok = case213_result == Some(4);
+        write_check(b"case213_array_target_compound_and_assign_returns_4=", case213_ok);
+
+        w(b"\n");
+
+        // CASE 214: `arr[1] |= 3;` on 100 -> 103 (Milestone 153).
+        const SRC214: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 100; arr[1] |= 3; return arr[1]; }";
+        let case214_result = compile_and_run_program_callable(SRC214.as_ptr() as u64, SRC214.len() as u64);
+        w(b"  case214 (arr[1] |= 3; compound-or on a array target, in-process) returned=");
+        if let Some(r) = case214_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 103)\n");
+        let case214_ok = case214_result == Some(103);
+        write_check(b"case214_array_target_compound_or_assign_returns_103=", case214_ok);
+
+        w(b"\n");
+
+        // CASE 215: `arr[1] ^= 5;` on 100 -> 97 (Milestone 153).
+        const SRC215: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 100; arr[1] ^= 5; return arr[1]; }";
+        let case215_result = compile_and_run_program_callable(SRC215.as_ptr() as u64, SRC215.len() as u64);
+        w(b"  case215 (arr[1] ^= 5; compound-xor on a array target, in-process) returned=");
+        if let Some(r) = case215_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 97)\n");
+        let case215_ok = case215_result == Some(97);
+        write_check(b"case215_array_target_compound_xor_assign_returns_97=", case215_ok);
+
+        w(b"\n");
+
+        // CASE 216: `arr[1] <<= 2;` on 100 -> 400 (Milestone 153).
+        const SRC216: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 100; arr[1] <<= 2; return arr[1]; }";
+        let case216_result = compile_and_run_program_callable(SRC216.as_ptr() as u64, SRC216.len() as u64);
+        w(b"  case216 (arr[1] <<= 2; compound-shl on a array target, in-process) returned=");
+        if let Some(r) = case216_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 400)\n");
+        let case216_ok = case216_result == Some(400);
+        write_check(b"case216_array_target_compound_shl_assign_returns_400=", case216_ok);
+
+        w(b"\n");
+
+        // CASE 217: `arr[1] >>= 3;` on 100 -> 12 (Milestone 153).
+        const SRC217: &[u8] = b"int main() { int arr[2]; arr[0] = 1; arr[1] = 100; arr[1] >>= 3; return arr[1]; }";
+        let case217_result = compile_and_run_program_callable(SRC217.as_ptr() as u64, SRC217.len() as u64);
+        w(b"  case217 (arr[1] >>= 3; compound-shr on a array target, in-process) returned=");
+        if let Some(r) = case217_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12)\n");
+        let case217_ok = case217_result == Some(12);
+        write_check(b"case217_array_target_compound_shr_assign_returns_12=", case217_ok);
+
+        w(b"\n");
+
+        // CASE 218: `*p /= 4;` on 100 -> 25 (Milestone 153).
+        const SRC218: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; *p /= 4; return x; }";
+        let case218_result = compile_and_run_program_callable(SRC218.as_ptr() as u64, SRC218.len() as u64);
+        w(b"  case218 (*p /= 4; compound-div on a deref target, in-process) returned=");
+        if let Some(r) = case218_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 25)\n");
+        let case218_ok = case218_result == Some(25);
+        write_check(b"case218_deref_target_compound_div_assign_returns_25=", case218_ok);
+
+        w(b"\n");
+
+        // CASE 219: `*p %= 7;` on 100 -> 2 (Milestone 153).
+        const SRC219: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; *p %= 7; return x; }";
+        let case219_result = compile_and_run_program_callable(SRC219.as_ptr() as u64, SRC219.len() as u64);
+        w(b"  case219 (*p %= 7; compound-mod on a deref target, in-process) returned=");
+        if let Some(r) = case219_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 2)\n");
+        let case219_ok = case219_result == Some(2);
+        write_check(b"case219_deref_target_compound_mod_assign_returns_2=", case219_ok);
+
+        w(b"\n");
+
+        // CASE 220: `*p &= 12;` on 100 -> 4 (Milestone 153).
+        const SRC220: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; *p &= 12; return x; }";
+        let case220_result = compile_and_run_program_callable(SRC220.as_ptr() as u64, SRC220.len() as u64);
+        w(b"  case220 (*p &= 12; compound-and on a deref target, in-process) returned=");
+        if let Some(r) = case220_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4)\n");
+        let case220_ok = case220_result == Some(4);
+        write_check(b"case220_deref_target_compound_and_assign_returns_4=", case220_ok);
+
+        w(b"\n");
+
+        // CASE 221: `*p |= 3;` on 100 -> 103 (Milestone 153).
+        const SRC221: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; *p |= 3; return x; }";
+        let case221_result = compile_and_run_program_callable(SRC221.as_ptr() as u64, SRC221.len() as u64);
+        w(b"  case221 (*p |= 3; compound-or on a deref target, in-process) returned=");
+        if let Some(r) = case221_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 103)\n");
+        let case221_ok = case221_result == Some(103);
+        write_check(b"case221_deref_target_compound_or_assign_returns_103=", case221_ok);
+
+        w(b"\n");
+
+        // CASE 222: `*p ^= 5;` on 100 -> 97 (Milestone 153).
+        const SRC222: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; *p ^= 5; return x; }";
+        let case222_result = compile_and_run_program_callable(SRC222.as_ptr() as u64, SRC222.len() as u64);
+        w(b"  case222 (*p ^= 5; compound-xor on a deref target, in-process) returned=");
+        if let Some(r) = case222_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 97)\n");
+        let case222_ok = case222_result == Some(97);
+        write_check(b"case222_deref_target_compound_xor_assign_returns_97=", case222_ok);
+
+        w(b"\n");
+
+        // CASE 223: `*p <<= 2;` on 100 -> 400 (Milestone 153).
+        const SRC223: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; *p <<= 2; return x; }";
+        let case223_result = compile_and_run_program_callable(SRC223.as_ptr() as u64, SRC223.len() as u64);
+        w(b"  case223 (*p <<= 2; compound-shl on a deref target, in-process) returned=");
+        if let Some(r) = case223_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 400)\n");
+        let case223_ok = case223_result == Some(400);
+        write_check(b"case223_deref_target_compound_shl_assign_returns_400=", case223_ok);
+
+        w(b"\n");
+
+        // CASE 224: `*p >>= 3;` on 100 -> 12 (Milestone 153).
+        const SRC224: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; *p >>= 3; return x; }";
+        let case224_result = compile_and_run_program_callable(SRC224.as_ptr() as u64, SRC224.len() as u64);
+        w(b"  case224 (*p >>= 3; compound-shr on a deref target, in-process) returned=");
+        if let Some(r) = case224_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12)\n");
+        let case224_ok = case224_result == Some(12);
+        write_check(b"case224_deref_target_compound_shr_assign_returns_12=", case224_ok);
+
+        w(b"\n");
+
+        let overall_m153 = case211_ok && case212_ok && case213_ok && case214_ok && case215_ok && case216_ok && case217_ok && case218_ok && case219_ok && case220_ok && case221_ok && case222_ok && case223_ok && case224_ok;
+        w(b"OVERALL_M153=");
+        w(if overall_m153 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 { 0 } else { 1 });
     }
 }
 

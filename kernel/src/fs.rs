@@ -1571,6 +1571,174 @@ pub fn list(dir: Option<&str>) -> Result<Vec<(String, bool, u16)>, String> {
     }
 }
 
+/// MILESTONE 155: the sector cache's benchmark, with every number
+/// pre-registered BEFORE the first run. Three configurations of the same
+/// cache code -- `Off` (the pre-M155 kernel, the baseline), `AlwaysOn`
+/// (conventional admit-every-miss LRU), `Gated` (AlwaysOn + no admission
+/// of a miss into a full cache while `GateKind::SectorCacheEviction` is
+/// conservative) -- on two workloads, each starting from a cold cache and
+/// a power-on gate:
+///
+///  P1. REAL fs workload (25x { stat, read_file, list, read_file } on a
+///      scratch dir): AlwaysOn and Gated do the IDENTICAL number of
+///      physical disk reads (the cache never fills, so the gate has
+///      nothing to protect), and both cut Off's reads by at least 90%.
+///  P2. SCAN workload (8 hot sectors x3 passes, then 120 distinct scan
+///      sectors, then 8 hot sectors x3 passes): physical reads in the
+///      final hot passes -- Off 24, AlwaysOn 8 (the scan evicted the whole
+///      hot set), Gated 0 (bypass kept it). All three modes return
+///      byte-identical data (checksum).
+///  P3. Coherence: write-through with write-update -- a write then a read
+///      through the cache returns the new bytes, and the raw disk agrees.
+///  P4. Gate: 2 trip episodes in the Gated scan run (one at cold start,
+///      harmless because the cache is not full yet; one on the scan),
+///      released again by the end; Gated evictions 0 and bypassed 96
+///      (120 scan misses - 24 free lines); AlwaysOn evictions 96.
+///      CORRECTION recorded after the first boot: that AlwaysOn figure was
+///      an arithmetic slip -- evictions are read AFTER the 3 final hot
+///      passes, whose 8 re-read misses each evict once more, so the
+///      pre-registered value should have been 96 + 8 = 104. The first
+///      run's log (m155_first_run_fresh_boot.log) shows exactly 104 and
+///      the FAIL it caused; the mechanism, not the behavior, was wrong.
+///  P5 (added AFTER seeing the first run's cycle counts, so post hoc):
+///      cycles are reported for both workloads; the shipped default is
+///      whichever of AlwaysOn/Gated is cheaper in total cycles.
+/// The result decides `ata.rs`'s `DEFAULT_CACHE_MODE`.
+pub fn self_test_sector_cache() -> bool {
+    use crate::ata::{self, CacheMode};
+    use crate::evidence_gate::{self, GateKind};
+    fn tsc() -> u64 {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    const DIR: &str = "cachebench";
+    const FA: &str = "cachebench/a";
+    const FB: &str = "cachebench/b";
+    const HOT: u32 = 1800;
+    const SCAN: u32 = 1000;
+    const COHERENCE: u32 = 1900;
+    let data_a = [0x41u8; 700];
+    let data_b = [0x42u8; 1500];
+    let modes = [CacheMode::Off, CacheMode::AlwaysOn, CacheMode::Gated];
+
+    // Fixtures. Hot sectors get distinct nonzero contents so the checksum
+    // actually proves the cache returned the right bytes.
+    ata::cache_set_mode(CacheMode::Off);
+    let _ = make_dir(DIR);
+    let _ = write_file(FA, &data_a);
+    let _ = write_file(FB, &data_b);
+    for i in 0..8u32 {
+        let _ = ata::write_sector(HOT + i, &[(0x60 + i) as u8; 512]);
+    }
+
+    // ---- P1: real fs workload
+    // On a REUSED disk the root directory (8 entries) can already be full of
+    // earlier boots' fixtures (the long-disclosed reused-boot fs artifact),
+    // so the scratch fixtures may not exist. Then P1 is SKIPPED and said so
+    // -- never silently passed or wrongly failed.
+    let fixtures_ok = read_file(FA).map(|v| v == data_a).unwrap_or(false) && read_file(FB).map(|v| v == data_b).unwrap_or(false);
+    let mut real = [(0u64, 0u64, 0u64, false); 3]; // (disk reads, cycles, hits, correct)
+    for (mi, mode) in modes.iter().enumerate() {
+        if !fixtures_ok {
+            break;
+        }
+        ata::cache_reset();
+        evidence_gate::reset(GateKind::SectorCacheEviction);
+        ata::cache_set_mode(*mode);
+        let t0 = tsc();
+        let mut correct = true;
+        for _ in 0..25 {
+            correct &= stat(FA).map(|m| m.len == 700).unwrap_or(false);
+            correct &= read_file(FA).map(|v| v == data_a).unwrap_or(false);
+            correct &= list(Some(DIR)).map(|v| v.len() == 2).unwrap_or(false);
+            correct &= read_file(FB).map(|v| v == data_b).unwrap_or(false);
+        }
+        let cycles = tsc() - t0;
+        let (disk, hits, _, _) = ata::cache_stats();
+        real[mi] = (disk, cycles, hits, correct);
+    }
+    let p1 = !fixtures_ok || (real[1].0 == real[2].0 && real[1].0 * 10 <= real[0].0 && real.iter().all(|r| r.3));
+
+    // ---- P2/P4: scan workload
+    // (hot-pass disk reads, checksum, evictions, bypassed, gate trip episodes, conservative at end)
+    let mut scan = [(0u64, 0u64, 0u64, 0u64, 0u64, false); 3];
+    let mut scan_cycles = [0u64; 3];
+    for (mi, mode) in modes.iter().enumerate() {
+        ata::cache_reset();
+        evidence_gate::reset(GateKind::SectorCacheEviction);
+        ata::cache_set_mode(*mode);
+        let scan_t0 = tsc();
+        let mut buf = [0u8; 512];
+        let mut sum: u64 = 0;
+        let mut pass = |base: u32, n: u32, sum: &mut u64| {
+            for lba in base..base + n {
+                let _ = ata::read_sector(lba, &mut buf);
+                *sum = sum.wrapping_mul(31).wrapping_add(buf.iter().map(|&b| b as u64).sum::<u64>() + lba as u64);
+            }
+        };
+        for _ in 0..3 {
+            pass(HOT, 8, &mut sum);
+        }
+        pass(SCAN, 120, &mut sum);
+        let before = ata::cache_stats().0;
+        let mut hot_sum: u64 = 0;
+        for _ in 0..3 {
+            pass(HOT, 8, &mut hot_sum);
+        }
+        scan_cycles[mi] = tsc() - scan_t0;
+        let (disk, _, bypassed, evictions) = ata::cache_stats();
+        let (_, trips) = evidence_gate::stats(GateKind::SectorCacheEviction);
+        scan[mi] = (
+            disk - before,
+            sum.wrapping_add(hot_sum),
+            evictions,
+            bypassed,
+            trips,
+            evidence_gate::is_conservative(GateKind::SectorCacheEviction),
+        );
+    }
+    let p2 = scan[0].0 == 24 && scan[1].0 == 8 && scan[2].0 == 0 && scan[0].1 == scan[1].1 && scan[1].1 == scan[2].1;
+    let p4 = scan[2].4 == 2 && !scan[2].5 && scan[2].2 == 0 && scan[2].3 == 96 && scan[1].2 == 104;
+
+    // ---- P3: coherence
+    ata::cache_reset();
+    ata::cache_set_mode(CacheMode::AlwaysOn);
+    let mut rb = [0u8; 512];
+    let p1_bytes = [0x11u8; 512];
+    let p2_bytes = [0x22u8; 512];
+    let mut p3 = ata::write_sector(COHERENCE, &p1_bytes).is_ok();
+    p3 &= ata::read_sector(COHERENCE, &mut rb).is_ok() && rb == p1_bytes; // miss, now cached
+    p3 &= ata::write_sector(COHERENCE, &p2_bytes).is_ok(); // write-update of a cached line
+    p3 &= ata::read_sector(COHERENCE, &mut rb).is_ok() && rb == p2_bytes; // hit must be the NEW bytes
+    ata::cache_set_mode(CacheMode::Off);
+    p3 &= ata::read_sector(COHERENCE, &mut rb).is_ok() && rb == p2_bytes; // raw disk agrees
+
+    // Restore shipped state and remove the fixtures.
+    ata::cache_reset();
+    evidence_gate::reset(GateKind::SectorCacheEviction);
+    ata::cache_restore_default();
+    let _ = delete_file(FA);
+    let _ = delete_file(FB);
+    let _ = remove_dir(DIR);
+
+    let ok = p1 && p2 && p3 && p4;
+    let pct = |off: u64, on: u64| if off > 0 { 100 - on * 100 / off } else { 0 };
+    let _ = writeln!(
+        serial(),
+        "milestone 155: sector-cache benchmark -- P1 real fs workload (fixtures_available={fixtures_ok}; SKIPPED if false) (disk reads / cycles / hits): Off={}/{}/{} AlwaysOn={}/{}/{} Gated={}/{}/{} (AlwaysOn cut {}% of reads, Gated cut {}%, all correct={}) -- P2 scan, hot-pass disk reads after the scan (expected 24/8/0): Off={} AlwaysOn={} Gated={} (data identical={}) -- P4 gate: Gated trips={} (expected 2) conservative_at_end={} gated evictions={} bypassed={} (expected 0/96), AlwaysOn evictions={} (expected 104, corrected from 96 -- see doc), scan cycles Off/AlwaysOn/Gated={}/{}/{} -- P3 coherence={} -- P1/P2/P3/P4 = {p1}/{p2}/{p3}/{p4} -- {}",
+        real[0].0, real[0].1, real[0].2,
+        real[1].0, real[1].1, real[1].2,
+        real[2].0, real[2].1, real[2].2,
+        pct(real[0].0, real[1].0), pct(real[0].0, real[2].0),
+        real.iter().all(|r| r.3),
+        scan[0].0, scan[1].0, scan[2].0,
+        scan[0].1 == scan[1].1 && scan[1].1 == scan[2].1,
+        scan[2].4, scan[2].5, scan[2].2, scan[2].3, scan[1].2, scan_cycles[0], scan_cycles[1], scan_cycles[2],
+        p3,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
+}
+
 /// MILESTONE 46: real, boot-time, non-interactive proof that the SECOND
 /// backing store (`RamFs`) is genuinely reachable through the identical
 /// `fs::write_file`/`fs::read_file`/`fs::list` surface `self_test_disk_write`

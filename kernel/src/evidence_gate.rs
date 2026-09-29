@@ -98,15 +98,24 @@ pub enum GateKind {
     /// Milestone 47). See `nic.rs`'s `arp_wait_counted()` and
     /// `self_test_arp_gate()` for the measured numbers.
     NetArpUnreachable,
+    /// MILESTONE 155: `ata.rs`'s sector-cache EVICTION gate -- the fourth
+    /// real subscriber. `hit` = a read missed the cache (cold / streaming
+    /// evidence); while conservative and the cache is full, a miss is
+    /// served but NOT admitted, so a long sequential scan cannot evict the
+    /// hot working set. See `ata.rs`'s module-level cache doc and
+    /// `fs.rs`'s `self_test_sector_cache()` for the pre-registered,
+    /// measured comparison against no cache and an always-on cache.
+    SectorCacheEviction,
 }
 
-const GATE_COUNT: usize = 3;
+const GATE_COUNT: usize = 4;
 
 fn index(kind: GateKind) -> usize {
     match kind {
         GateKind::KernelHeapPressure => 0,
         GateKind::SchedulerFairness => 1,
         GateKind::NetArpUnreachable => 2,
+        GateKind::SectorCacheEviction => 3,
     }
 }
 
@@ -154,7 +163,7 @@ impl GateState {
     }
 }
 
-static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new(), GateState::new(), GateState::new()]);
+static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new(), GateState::new(), GateState::new(), GateState::new()]);
 
 /// Feed one real sample into `kind`'s gate: updates the fast EMA every
 /// call (`network::update_evidence()`, the exact same formula Milestone
@@ -203,4 +212,12 @@ pub fn is_conservative(kind: GateKind) -> bool {
 pub fn stats(kind: GateKind) -> (u64, u64) {
     let g = &GATES.lock()[index(kind)];
     (g.samples_taken, g.trip_episodes)
+}
+
+/// MILESTONE 155: return `kind`'s gate to its power-on state (evidence 0,
+/// not conservative, counters 0) -- lets a benchmark give each of several
+/// compared configurations an identical starting gate instead of letting
+/// one run's history leak into the next.
+pub fn reset(kind: GateKind) {
+    GATES.lock()[index(kind)] = GateState::new();
 }

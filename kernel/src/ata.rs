@@ -85,6 +85,7 @@
 //! block_device_abstraction()`'s own disclosure of how this was
 //! confirmed).
 
+use crate::evidence_gate::{self, GateConfig, GateKind, GateTransition};
 use crate::serial;
 use crate::ternary;
 use alloc::string::{String, ToString};
@@ -164,8 +165,14 @@ impl AtaDevice {
     }
 }
 
-impl BlockDevice for AtaDevice {
-    fn read_sector(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+impl AtaDevice {
+    fn dev_id(&self) -> u32 {
+        ((self.io_base as u32) << 8) | self.drive_select_base as u32
+    }
+
+    /// The real PIO sector read this module has always done, unchanged.
+    fn raw_read_sector(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+        DISK_READS.fetch_add(1, Ordering::Relaxed);
         self.wait_not_busy();
         self.select_and_setup(lba);
         unsafe {
@@ -182,7 +189,8 @@ impl BlockDevice for AtaDevice {
         Ok(())
     }
 
-    fn write_sector(&self, lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
+    /// The real PIO sector write this module has always done, unchanged.
+    fn raw_write_sector(&self, lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
         self.wait_not_busy();
         self.select_and_setup(lba);
         unsafe {
@@ -202,6 +210,190 @@ impl BlockDevice for AtaDevice {
         }
         self.wait_not_busy();
         Ok(())
+    }
+}
+
+/// MILESTONE 155: how the sector cache behaves. `Off` is the pre-M155
+/// kernel (every read goes to the disk) and is the benchmark baseline;
+/// `AlwaysOn` is the conventional answer (admit every miss, evict the
+/// least-recently-used line when full); `Gated` is `AlwaysOn` plus one
+/// rule: while `GateKind::SectorCacheEviction` is conservative AND the
+/// cache is full, a miss is served but not admitted.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    Off,
+    AlwaysOn,
+    Gated,
+}
+
+/// Which mode ships. MEASURED, not assumed (`fs.rs::
+/// self_test_sector_cache()`, five boots): on the REAL workload `Gated`
+/// does the same physical reads as `AlwaysOn` but costs 21-25% more
+/// cycles in every run (64-67M vs 51-55M) -- per-read gate bookkeeping and
+/// transition logging with nothing to protect. On the synthetic scan it
+/// saves 8 of 136 physical reads and was 1.4-1.8% cheaper in 4 of 5 runs
+/// (0.7% dearer in the 5th): a marginal gain, not enough to offset the
+/// real-workload cost. So `AlwaysOn` ships; `Gated` stays selectable and
+/// tested.
+const DEFAULT_CACHE_MODE: CacheMode = CacheMode::AlwaysOn;
+const CACHE_LINES: usize = 32;
+/// The gate's tuning, owned here (the shared machinery lives in
+/// `evidence_gate.rs`). fast_tau=1 -> re-evaluated every 3rd read; with
+/// `EVIDENCE_BETA` 0.8, six straight misses (evidence 0.738) trip it and
+/// a run of hits releases it once evidence falls under 0.2.
+const CACHE_GATE_CONFIG: GateConfig = GateConfig {
+    gate_on_threshold: 0.5,
+    gate_off_threshold: 0.2,
+    fast_tau: 1,
+};
+
+struct SectorCache {
+    dev: [u32; CACHE_LINES],
+    lba: [u32; CACHE_LINES],
+    data: [[u8; 512]; CACHE_LINES],
+    age: [u64; CACHE_LINES],
+    valid: [bool; CACHE_LINES],
+    tick: u64,
+    mode: CacheMode,
+    hits: u64,
+    bypassed: u64,
+    evictions: u64,
+}
+
+impl SectorCache {
+    const fn new() -> Self {
+        SectorCache {
+            dev: [0; CACHE_LINES],
+            lba: [0; CACHE_LINES],
+            data: [[0; 512]; CACHE_LINES],
+            age: [0; CACHE_LINES],
+            valid: [false; CACHE_LINES],
+            tick: 0,
+            mode: DEFAULT_CACHE_MODE,
+            hits: 0,
+            bypassed: 0,
+            evictions: 0,
+        }
+    }
+
+    fn find(&self, dev: u32, lba: u32) -> Option<usize> {
+        (0..CACHE_LINES).find(|&i| self.valid[i] && self.dev[i] == dev && self.lba[i] == lba)
+    }
+}
+
+static SECTOR_CACHE: spin::Mutex<SectorCache> = spin::Mutex::new(SectorCache::new());
+static DISK_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Select the cache behavior (benchmarking; ships as `DEFAULT_CACHE_MODE`).
+pub fn cache_set_mode(mode: CacheMode) {
+    SECTOR_CACHE.lock().mode = mode;
+}
+
+/// Drop every cached line and zero the cache's own counters and the
+/// physical-read counter, so a benchmark starts each configuration cold.
+pub fn cache_reset() {
+    let mut c = SECTOR_CACHE.lock();
+    for v in c.valid.iter_mut() {
+        *v = false;
+    }
+    c.tick = 0;
+    c.hits = 0;
+    c.bypassed = 0;
+    c.evictions = 0;
+    DISK_READS.store(0, Ordering::Relaxed);
+}
+
+/// Put the cache back to the shipped `DEFAULT_CACHE_MODE`.
+pub fn cache_restore_default() {
+    SECTOR_CACHE.lock().mode = DEFAULT_CACHE_MODE;
+}
+
+/// (physical disk reads, cache hits, bypassed admissions, evictions).
+pub fn cache_stats() -> (u64, u64, u64, u64) {
+    let c = SECTOR_CACHE.lock();
+    (DISK_READS.load(Ordering::Relaxed), c.hits, c.bypassed, c.evictions)
+}
+
+fn note_gate_sample(miss: bool) {
+    let (transition, evidence) = evidence_gate::record_sample(GateKind::SectorCacheEviction, &CACHE_GATE_CONFIG, miss);
+    match transition {
+        GateTransition::Entered => {
+            let _ = writeln!(serial(), "milestone 155: sector-cache gate -- entering CONSERVATIVE mode (evidence={evidence:.3}, full-cache misses will bypass admission)");
+        }
+        GateTransition::Left => {
+            let _ = writeln!(serial(), "milestone 155: sector-cache gate -- leaving conservative mode (evidence={evidence:.3})");
+        }
+        GateTransition::Unchanged => {}
+    }
+}
+
+impl BlockDevice for AtaDevice {
+    fn read_sector(&self, lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+        let id = self.dev_id();
+        let mode = {
+            let mut c = SECTOR_CACHE.lock();
+            let mode = c.mode;
+            if mode != CacheMode::Off {
+                if let Some(i) = c.find(id, lba) {
+                    buf.copy_from_slice(&c.data[i]);
+                    c.tick += 1;
+                    let t = c.tick;
+                    c.age[i] = t;
+                    c.hits += 1;
+                    drop(c);
+                    if mode == CacheMode::Gated {
+                        note_gate_sample(false);
+                    }
+                    return Ok(());
+                }
+            }
+            mode
+        };
+        self.raw_read_sector(lba, buf)?;
+        if mode == CacheMode::Off {
+            return Ok(());
+        }
+        if mode == CacheMode::Gated {
+            note_gate_sample(true);
+        }
+        let mut c = SECTOR_CACHE.lock();
+        let slot = match (0..CACHE_LINES).find(|&i| !c.valid[i]) {
+            Some(i) => i,
+            None => {
+                if mode == CacheMode::Gated && evidence_gate::is_conservative(GateKind::SectorCacheEviction) {
+                    c.bypassed += 1;
+                    return Ok(());
+                }
+                c.evictions += 1;
+                (0..CACHE_LINES).min_by_key(|&i| c.age[i]).unwrap_or(0)
+            }
+        };
+        c.tick += 1;
+        let t = c.tick;
+        c.dev[slot] = id;
+        c.lba[slot] = lba;
+        c.data[slot] = *buf;
+        c.age[slot] = t;
+        c.valid[slot] = true;
+        Ok(())
+    }
+
+    /// Write-through: the disk is always written first; a cached copy of
+    /// this sector is updated in place (never allocated by a write), or
+    /// dropped if the disk write failed, so a hit can never return stale
+    /// data.
+    fn write_sector(&self, lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
+        let result = self.raw_write_sector(lba, buf);
+        let id = self.dev_id();
+        let mut c = SECTOR_CACHE.lock();
+        if let Some(i) = c.find(id, lba) {
+            if result.is_ok() {
+                c.data[i] = *buf;
+            } else {
+                c.valid[i] = false;
+            }
+        }
+        result
     }
 }
 

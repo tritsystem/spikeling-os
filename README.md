@@ -2561,6 +2561,41 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       gated cache, on the real fs workload AND a synthetic scan) before
       any SNN claim.
 
+- [x] **Milestone 155**: write-through sector cache in `ata.rs` (inside the
+      `BlockDevice` impl, keyed by device+LBA, so the master/slave and every
+      raw-trait path stay coherent), 32 LRU lines, plus the FOURTH
+      `evidence_gate` subscriber (`GateKind::SectorCacheEviction`): in
+      `Gated` mode a miss into a FULL cache is served but not admitted
+      while the gate (hit = cache miss) is conservative. Acts on M154's
+      measured 95-97% repeat reads. **Pre-registered benchmark**
+      (`fs.rs::self_test_sector_cache()`, every boot): Off vs AlwaysOn vs
+      Gated on (P1) the real fs workload and (P2) a scan that would evict
+      an 8-sector hot set. **Results**: P1 450 -> 8 physical reads (98.2%
+      fewer) for both cached modes, ~5.5x fewer cycles (298-397M -> 51-55M);
+      P2 hot-pass reads Off 24 / AlwaysOn 8 / Gated 0 exactly as predicted,
+      byte-identical data; P3 write-through coherence PASS; P4 gate trips 2,
+      Gated evictions 0, bypassed 96. **One prediction was wrong, kept on
+      record**: I wrote AlwaysOn evictions 96; the boot measured 104 -- the
+      8 post-scan hot re-reads each evict once more, my arithmetic slip
+      (`m155_first_run_fresh_boot.log` is that FAIL). Corrected in the code
+      with the reason, not silently. **The honest negative for the SNN
+      gate**: at this scale `Gated` is NOT worth shipping. Real workload:
+      same reads as AlwaysOn but 21-25% MORE cycles in every run (gate
+      bookkeeping + transition serial lines, nothing to protect); scan: 8
+      fewer reads, cycles 1.4-1.8% lower in 4 of 5 runs and 0.7% higher in
+      1 -- marginal. Shipped default: `AlwaysOn` (a rule I added after
+      seeing cycle counts -- post hoc, disclosed in the code). Gate stays
+      selectable and tested; a larger hot set or a genuinely streaming
+      workload could change this and would need its own measurement.
+      **Reused-disk caveat**: the root directory (8 entries) is already full
+      of earlier boots' fixtures, so P1's scratch files cannot be created
+      there; the benchmark detects that and reports P1 as SKIPPED
+      (`fixtures_available=false`) instead of a false pass/fail (a first
+      version wrongly failed there). Two final boots
+      (`m155_fresh_boot.log`/`m155_reused_boot.log`): 73 aggregate
+      `OVERALL` markers PASS in each, P1-P4 PASS, zero panics or faults.
+      Mean cycles per logical ATA read fell from ~590k (M154) to ~140-165k.
+
 ## Building and running
 
 Requires:

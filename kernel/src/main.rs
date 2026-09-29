@@ -938,6 +938,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // leaves the gate released (its own phase D) so nothing later
     // inherits a conservative ARP budget.
     nic::self_test_arp_gate();
+    // MILESTONE 155: sector cache benchmark (no cache vs always-on vs
+    // evidence-gated), pre-registered in fs.rs. Needs the disk and the
+    // filesystem, both live by this point.
+    fs::self_test_sector_cache();
 
     interrupts::init_pics();
     shell::init();

@@ -57,6 +57,11 @@
 //! kind of real, already-observable condition Milestone 106 declined to
 //! fabricate a stand-in for.
 //!
+//! **MILESTONE 152 update**: a third real subscriber --
+//! `GateKind::NetArpUnreachable`, `nic.rs`'s ARP wait budget (a dead host
+//! used to cost the full 200-poll wait on every call). See
+//! `nic.rs::self_test_arp_gate()` for the pre-registered, measured result.
+//!
 //! **A real, closed enum, not a runtime registry.** `GateKind` lists
 //! every subscriber at compile time rather than supporting dynamic
 //! string-keyed registration -- a deliberate choice: this kernel has a
@@ -83,14 +88,25 @@ pub enum GateKind {
     /// `scheduler.rs`'s for the real, measured structural-unfairness
     /// signal it gates on.
     SchedulerFairness,
+    /// MILESTONE 152: `nic.rs`'s ARP-resolution wait budget -- the third
+    /// real subscriber. Found, not invented: an ARP request to an address
+    /// nothing answers for (any dead/unreachable host) makes
+    /// `recv_arp_reply()` burn its ENTIRE poll budget -- 200 windows of
+    /// ~1,000,000 spin iterations each -- on every single call, with no
+    /// memory that the last call to the same kind of target just failed
+    /// too (`arp_resolve()`'s own doc has said "no retry/backoff" since
+    /// Milestone 47). See `nic.rs`'s `arp_wait_counted()` and
+    /// `self_test_arp_gate()` for the measured numbers.
+    NetArpUnreachable,
 }
 
-const GATE_COUNT: usize = 2;
+const GATE_COUNT: usize = 3;
 
 fn index(kind: GateKind) -> usize {
     match kind {
         GateKind::KernelHeapPressure => 0,
         GateKind::SchedulerFairness => 1,
+        GateKind::NetArpUnreachable => 2,
     }
 }
 
@@ -138,7 +154,7 @@ impl GateState {
     }
 }
 
-static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new(), GateState::new()]);
+static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new(), GateState::new(), GateState::new()]);
 
 /// Feed one real sample into `kind`'s gate: updates the fast EMA every
 /// call (`network::update_evidence()`, the exact same formula Milestone

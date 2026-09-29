@@ -106,6 +106,7 @@
 //! field values, not just that something arrived" standard Milestone 55's
 //! own ICMP self-test established.
 
+use crate::evidence_gate::{self, GateConfig, GateKind, GateTransition};
 use crate::pci::{self, PciDevice};
 use crate::serial;
 use alloc::format;
@@ -1010,11 +1011,21 @@ pub fn send_arp_request(target_ip: [u8; 4]) -> Result<bool, &'static str> {
 /// `continue` (try again) instead of returning, so all `max_polls`
 /// windows are genuinely available to the real reply, not just the
 /// first.
+#[allow(dead_code)] // MILESTONE 152: every in-tree caller now goes through the gate-budgeted arp_wait_counted(); kept as the count-free public API
 pub fn recv_arp_reply(max_polls: u32) -> Result<Option<ArpReply>, &'static str> {
+    recv_arp_reply_counted(max_polls).map(|(reply, _polls_used)| reply)
+}
+
+/// MILESTONE 152: `recv_arp_reply()`'s body, also reporting how many
+/// RX-descriptor poll windows (each ~1,000,000 spin iterations, see
+/// `poll_rx_descriptor()`) it actually consumed -- `max_polls` on a miss,
+/// fewer on a hit. `recv_arp_reply()` is now a thin wrapper that drops the
+/// count, so every existing caller is byte-for-byte unchanged.
+fn recv_arp_reply_counted(max_polls: u32) -> Result<(Option<ArpReply>, u32), &'static str> {
     let mut guard = NIC.lock();
     let state = guard.as_mut().ok_or("NIC not initialized")?;
 
-    for _ in 0..max_polls {
+    for polls_used in 1..=max_polls {
         let Some((frame, copy_len, errors)) = poll_rx_descriptor(state) else {
             continue;
         };
@@ -1031,9 +1042,52 @@ pub fn recv_arp_reply(max_polls: u32) -> Result<Option<ArpReply>, &'static str> 
         }
         let sender_mac = [frame[22], frame[23], frame[24], frame[25], frame[26], frame[27]];
         let sender_ip = [frame[28], frame[29], frame[30], frame[31]];
-        return Ok(Some(ArpReply { sender_mac, sender_ip }));
+        return Ok((Some(ArpReply { sender_mac, sender_ip }), polls_used));
     }
-    Ok(None)
+    Ok((None, max_polls))
+}
+
+/// MILESTONE 152: the ARP wait budget when the network looks healthy --
+/// the historical Milestone 47 number, unchanged.
+const ARP_FULL_POLLS: u32 = 200;
+/// MILESTONE 152: the ARP wait budget while `GateKind::NetArpUnreachable`
+/// is conservative: enough to still complete a resolution against a
+/// responsive peer (the self-test measures how many polls the real slirp
+/// gateway needs and checks it fits), a tenth of the cost against a dead
+/// one. This is a PROBE, not a give-up: every conservative-mode call still
+/// tries, so a peer that comes back is noticed on the very next call.
+const ARP_PROBE_POLLS: u32 = 20;
+/// Tuning owned by this subscriber. fast_tau=1 -> re-evaluated every 3rd
+/// sample (`golden_period(1)`); with `EVIDENCE_BETA` 0.8, three straight
+/// misses give evidence 0.488 > 0.4 (trips at the 3rd), and six straight
+/// hits afterwards bring it under 0.2 (releases at the 9th sample).
+const ARP_GATE_CONFIG: GateConfig = GateConfig {
+    gate_on_threshold: 0.4,
+    gate_off_threshold: 0.2,
+    fast_tau: 1,
+};
+
+/// Waits for an ARP reply using whatever budget the gate currently
+/// allows, feeds the outcome back into the gate (`hit` = no reply), and
+/// returns the reply with the poll windows consumed.
+fn arp_wait_counted() -> Result<(Option<ArpReply>, u32), &'static str> {
+    let budget = if evidence_gate::is_conservative(GateKind::NetArpUnreachable) {
+        ARP_PROBE_POLLS
+    } else {
+        ARP_FULL_POLLS
+    };
+    let (reply, used) = recv_arp_reply_counted(budget)?;
+    let (transition, evidence) = evidence_gate::record_sample(GateKind::NetArpUnreachable, &ARP_GATE_CONFIG, reply.is_none());
+    match transition {
+        GateTransition::Entered => {
+            let _ = writeln!(serial(), "milestone 152: ARP-unreachable gate -- entering CONSERVATIVE mode (evidence={evidence:.3}, ARP wait {ARP_FULL_POLLS} -> {ARP_PROBE_POLLS} polls)");
+        }
+        GateTransition::Left => {
+            let _ = writeln!(serial(), "milestone 152: ARP-unreachable gate -- leaving conservative mode (evidence={evidence:.3}, ARP wait back to {ARP_FULL_POLLS} polls)");
+        }
+        GateTransition::Unchanged => {}
+    }
+    Ok((reply, used))
 }
 
 /// MILESTONE 47: real ARP resolution over the ACTUAL (virtual) wire --
@@ -1059,10 +1113,16 @@ pub fn recv_arp_reply(max_polls: u32) -> Result<Option<ArpReply>, &'static str> 
 /// not full generality" discipline as every scope-cut milestone before
 /// this one.
 pub fn arp_resolve(target_ip: [u8; 4]) -> Result<Option<ArpReply>, &'static str> {
+    arp_resolve_counted(target_ip).map(|(reply, _polls_used)| reply)
+}
+
+/// MILESTONE 152: `arp_resolve()`'s body, also reporting the poll windows
+/// the (gate-budgeted) wait consumed. `arp_resolve()` wraps this.
+pub fn arp_resolve_counted(target_ip: [u8; 4]) -> Result<(Option<ArpReply>, u32), &'static str> {
     set_loopback(false)?;
     let send_result = send_arp_request(target_ip);
     let reply_result = match send_result {
-        Ok(_dd_confirmed) => recv_arp_reply(200),
+        Ok(_dd_confirmed) => arp_wait_counted(),
         Err(e) => {
             let _ = set_loopback(true);
             return Err(e);
@@ -1200,7 +1260,7 @@ pub fn icmp_ping(target_ip: [u8; 4]) -> Result<Option<IcmpReply>, &'static str> 
         if !arp_sent {
             return Err("ICMP ping: ARP request for the target's MAC was not confirmed transmitted");
         }
-        let target_mac = match recv_arp_reply(200)? {
+        let target_mac = match arp_wait_counted()?.0 {
             Some(reply) => reply.sender_mac,
             // Honest "no reply" outcome, not an error: without a real
             // MAC to address the echo request to, there is nothing left
@@ -1269,6 +1329,84 @@ pub fn self_test_arp() -> bool {
             false
         }
     }
+}
+
+/// MILESTONE 152: real, boot-time proof of the third `evidence_gate`
+/// subscriber, with the numbers pre-registered before the first run:
+///   A. three ARP resolves to 10.0.2.99 (nothing on QEMU slirp answers
+///      for it) while the gate is still healthy: each must cost the full
+///      200 polls (this phase IS the ungated baseline), and the gate must
+///      trip (Entered) on the 3rd.
+///   B. three more dead resolves: each must cost exactly the 20-poll
+///      probe budget (60 total vs 600 -- a 90% cut).
+///   C. one resolve to the real gateway while conservative: must still
+///      SUCCEED, and within the probe budget (prediction: 1-3 polls).
+///   D. up to 12 further gateway resolves: the gate must leave
+///      conservative mode (prediction: after 6), and one more dead
+///      resolve must cost the full 200 again (the gate is not sticky).
+/// Also reports rdtsc cycles so the poll counts are tied to real time.
+pub fn self_test_arp_gate() -> bool {
+    const DEAD_IP: [u8; 4] = [10, 0, 2, 99];
+    fn tsc() -> u64 {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    let mut polls_a: u32 = 0;
+    let t0 = tsc();
+    let mut a_ok = true;
+    for _ in 0..3 {
+        match arp_resolve_counted(DEAD_IP) {
+            Ok((None, used)) => polls_a += used,
+            _ => a_ok = false,
+        }
+    }
+    let cycles_a = tsc() - t0;
+    let tripped = evidence_gate::is_conservative(GateKind::NetArpUnreachable);
+    let phase_a_ok = a_ok && polls_a == 3 * ARP_FULL_POLLS && tripped;
+
+    let mut polls_b: u32 = 0;
+    let t1 = tsc();
+    let mut b_ok = true;
+    for _ in 0..3 {
+        match arp_resolve_counted(DEAD_IP) {
+            Ok((None, used)) => polls_b += used,
+            _ => b_ok = false,
+        }
+    }
+    let cycles_b = tsc() - t1;
+    let phase_b_ok = b_ok && polls_b == 3 * ARP_PROBE_POLLS;
+
+    let (live_found, live_polls) = match arp_resolve_counted(SPIKELING_GATEWAY_IP) {
+        Ok((Some(_), used)) => (true, used),
+        Ok((None, used)) => (false, used),
+        Err(_) => (false, 0),
+    };
+    let phase_c_ok = live_found && live_polls <= ARP_PROBE_POLLS;
+
+    let mut successes_to_release: u32 = 1; // the phase-C success already counted
+    while evidence_gate::is_conservative(GateKind::NetArpUnreachable) && successes_to_release < 13 {
+        if let Ok((Some(_), _)) = arp_resolve_counted(SPIKELING_GATEWAY_IP) {
+            successes_to_release += 1;
+        } else {
+            break;
+        }
+    }
+    let released = !evidence_gate::is_conservative(GateKind::NetArpUnreachable);
+    let polls_after = match arp_resolve_counted(DEAD_IP) {
+        Ok((None, used)) => used,
+        _ => 0,
+    };
+    let phase_d_ok = released && polls_after == ARP_FULL_POLLS;
+
+    let (samples, trips) = evidence_gate::stats(GateKind::NetArpUnreachable);
+    let ok = phase_a_ok && phase_b_ok && phase_c_ok && phase_d_ok;
+    let _ = writeln!(
+        serial(),
+        "milestone 152: ARP gate self-test -- A(healthy, dead host x3): polls={polls_a} (expected {}) cycles={cycles_a} gate_tripped={tripped} -- B(conservative, dead host x3): polls={polls_b} (expected {}) cycles={cycles_b} -- C(live gateway while conservative): found={live_found} polls={live_polls} (budget {ARP_PROBE_POLLS}) -- D(recovery): released={released} after {successes_to_release} successes, dead-host cost back to {polls_after} polls (expected {ARP_FULL_POLLS}) -- gate samples={samples} trip_episodes={trips} -- phases A/B/C/D = {phase_a_ok}/{phase_b_ok}/{phase_c_ok}/{phase_d_ok} -- {}",
+        3 * ARP_FULL_POLLS,
+        3 * ARP_PROBE_POLLS,
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
 }
 
 /// MILESTONE 55: real, boot-time, non-interactive proof of a genuine
@@ -1529,7 +1667,7 @@ pub fn udp_send_resolved(dest_ip: [u8; 4], src_port: u16, dst_port: u16, payload
         if !arp_sent {
             return Err("UDP send: ARP request for the target's MAC was not confirmed transmitted");
         }
-        let target_mac = match recv_arp_reply(200)? {
+        let target_mac = match arp_wait_counted()?.0 {
             Some(reply) => reply.sender_mac,
             None => return Err("UDP send: no ARP reply for the target's MAC within timeout"),
         };

@@ -2494,6 +2494,40 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       case. Pure compiler-frontend work -- correctly no SNN/evidence-gate
       angle this milestone.
 
+- [x] **Milestone 152**: `evidence_gate.rs`'s THIRD real subscriber --
+      the NIC's ARP wait budget (`GateKind::NetArpUnreachable`), the
+      first milestone since M123 with an SNN / self-healing angle
+      (Milestones 124-151 were compiler-frontend only, against the
+      standing "SNN + self-healing every direction" instruction). **Found,
+      not invented** (the rule M106 set): `arp_resolve()`/`icmp_ping()`/
+      `udp_send_resolved()` waited up to 200 poll windows of ~1,000,000
+      spins for a reply on EVERY call, with no memory that the previous
+      call to a dead host had just burned the same budget (`no retry/
+      backoff` since M47). Measured, ungated: 600 polls for three
+      resolves to 10.0.2.99 (nothing on QEMU slirp answers) =
+      ~2.5e11 TSC cycles (2.55e11 fresh boot, 2.54e11 reused boot), i.e.
+      ~8.3e10 cycles per dead-host resolve. **Mechanism**: same
+      EMA-then-hysteresis state machine as M104/M117 (`fast_tau=1`, ON
+      0.4 / OFF 0.2; `hit` = no reply). Conservative mode shrinks the
+      wait to a 20-poll PROBE (never a give-up: every call still tries,
+      so a peer that returns is noticed on the next call). **Pre-registered
+      predictions, all met exactly on both boots**: A) three dead resolves
+      healthy cost 600 polls and trip the gate on the 3rd (evidence
+      0.488); B) three more cost 60 polls (2.5e10 cycles, ~10x cheaper,
+      matching the 10x poll cut); C) the real gateway still resolves while
+      conservative, in 1 poll (budget 20); D) six further successes
+      release the gate (evidence 0.193) and the next dead resolve costs
+      200 again -- not sticky, and the self-test leaves the gate released.
+      Baseline is the ungated phase A itself (gate cannot trip before its
+      3rd sample), not an assumed number. **Honest limits**: one global
+      gate, not per-host -- a healthy host mixed into a stream of dead ones
+      keeps the gate conservative, and a genuinely SLOW live peer needing
+      more than 20 polls would be missed in conservative mode (the slirp
+      gateway needs 1; no slow peer exists to measure). ICMP/UDP receive
+      waits are unchanged. Two real QEMU boots (`m152_fresh_boot.log`/
+      `m152_reused_boot.log`): 72 aggregate `OVERALL` markers all PASS on
+      both, M47/M55/M56 NIC self-tests unchanged, zero panics or faults.
+
 ## Building and running
 
 Requires:

@@ -932,6 +932,12 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // this proves THAT code path genuinely reaches the real netdev
     // backend, same ordering reasoning as every self-test in this block.
     nic::self_test_udp_send_realwire();
+    // MILESTONE 152: evidence_gate.rs's THIRD real subscriber -- the ARP
+    // wait budget. Runs after every other NIC self-test so their
+    // successful gateway resolves seed the gate's history first, and
+    // leaves the gate released (its own phase D) so nothing later
+    // inherits a conservative ARP budget.
+    nic::self_test_arp_gate();
 
     interrupts::init_pics();
     shell::init();

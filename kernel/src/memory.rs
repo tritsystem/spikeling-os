@@ -99,6 +99,32 @@ impl BootInfoFrameAllocator {
     pub fn free_list_len(&self) -> usize {
         self.free_list.len()
     }
+
+    /// MILESTONE 154 MEASUREMENT: total 4 KiB frames the bootloader reported usable.
+    pub fn total_usable_frames(&self) -> u64 {
+        self.memory_regions
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::Usable)
+            .map(|r| (r.end - r.start) / 4096)
+            .sum()
+    }
+}
+
+static FRAME_FRESH_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static FRAME_FREELIST_ALLOCS: AtomicU64 = AtomicU64::new(0);
+static FRAME_FRESH_CYCLES: AtomicU64 = AtomicU64::new(0);
+static FRAME_LAST_CYCLES: AtomicU64 = AtomicU64::new(0);
+
+/// MILESTONE 154 MEASUREMENT: (fresh_allocs, freelist_allocs, total_fresh_cycles,
+/// last_fresh_cycles, total_usable_frames).
+pub fn frame_stats(total_usable: u64) -> (u64, u64, u64, u64, u64) {
+    (
+        FRAME_FRESH_ALLOCS.load(Ordering::Relaxed),
+        FRAME_FREELIST_ALLOCS.load(Ordering::Relaxed),
+        FRAME_FRESH_CYCLES.load(Ordering::Relaxed),
+        FRAME_LAST_CYCLES.load(Ordering::Relaxed),
+        total_usable,
+    )
 }
 
 unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
@@ -109,9 +135,17 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
         // repeated fork()/exit()/exec() cycles instead of only ever
         // growing.
         if let Some(frame) = self.free_list.pop() {
+            FRAME_FREELIST_ALLOCS.fetch_add(1, Ordering::Relaxed);
             return Some(frame);
         }
+        // MILESTONE 154 MEASUREMENT (instrumentation only): cycles the
+        // O(next) `usable_frames().nth(next)` walk costs per fresh frame.
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
         let frame = self.usable_frames().nth(self.next);
+        let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+        FRAME_FRESH_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        FRAME_FRESH_CYCLES.fetch_add(t1 - t0, Ordering::Relaxed);
+        FRAME_LAST_CYCLES.store(t1 - t0, Ordering::Relaxed);
         self.next += 1;
         frame
     }

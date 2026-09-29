@@ -2528,6 +2528,39 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       `m152_reused_boot.log`): 72 aggregate `OVERALL` markers all PASS on
       both, M47/M55/M56 NIC self-tests unchanged, zero panics or faults.
 
+- [x] **Milestone 154**: MEASUREMENT milestone -- does a real I/O or paging
+      condition exist that an `evidence_gate` subscriber could honestly
+      gate? (M106's rule: found, not invented.) Read-only instrumentation
+      (rdtsc + counters in `ata::read_sector`/`write_sector` and
+      `BootInfoFrameAllocator::allocate_frame`), printed once at end of
+      boot as `milestone 154 measure:`; no behavior change, all 73 aggregate
+      `OVERALL` markers PASS on a fresh and a reused disk
+      (`m154_fresh_boot.log`/`m154_reused_boot.log`), zero panics or faults.
+      **Measured, both boots agree**: (1) **Physical frames: NO pressure.**
+      29,546 usable frames; only 594 fresh + 1,954 free-list reuses over the
+      whole boot (2% ever touched). A frame-pressure gate would be
+      invented scarcity, so none was built. (2) **ATA reads: a real
+      condition.** Fresh boot 3,373 reads / 143 writes, 3,225 (95.6%) of the
+      reads hit an LBA read within the previous 32 distinct reads with no
+      write to it in between; reused boot 3,082 / 72 / 3,003 (97.4%).
+      Mean ~570-590k TSC cycles per read, ~1.75-1.98e9 cycles of read time
+      per boot, of which ~95% is repeat reads. Cause: `fs.rs` has no block
+      cache -- every path lookup re-reads the root meta and each directory
+      table sector. Caveat: this is the boot-time self-test workload
+      (fixtures hammer the same directories), not a general workload; and
+      ~2e9 cycles is small next to M152's 2.5e11 for dead-host ARP. (3)
+      **Incidental**: `usable_frames().nth(self.next)` is an O(next) walk
+      per fresh frame -- mean ~346k cycles, last ~600k at next=594, linear in
+      `next`; harmless at 594 but ~30M cycles per allocation if the pool
+      were ever consumed. A conventional cursor fix, not a gate candidate.
+      **Decision**: the ATA condition is real, but a write-through sector
+      cache is the conventional answer and would capture nearly all of it;
+      an evidence gate on top only pays off if a streaming (low-reuse)
+      workload exists to protect the cache from, and none does yet. That
+      needs its own pre-registered benchmark (no cache vs always-on cache vs
+      gated cache, on the real fs workload AND a synthetic scan) before
+      any SNN claim.
+
 ## Building and running
 
 Requires:

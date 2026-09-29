@@ -1317,6 +1317,21 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         }
     )
     .unwrap();
+    {
+        // MILESTONE 154 MEASUREMENT (read-only): does a real I/O or paging
+        // condition exist worth an evidence gate? Numbers, not a feature.
+        let (reads, writes, repeats, read_cycles) = ata::io_stats();
+        let total = memory::with_frame_allocator(|fa| fa.total_usable_frames()).unwrap_or(0);
+        let free_now = memory::with_frame_allocator(|fa| fa.free_list_len()).unwrap_or(0);
+        let (fresh, from_free, fresh_cycles, last_cycles, _) = memory::frame_stats(total);
+        writeln!(
+            port,
+            "milestone 154 measure: ATA reads={reads} writes={writes} repeat_reads(within last 32 distinct, no write between)={repeats} read_cycles_total={read_cycles} mean_cycles_per_read={} -- frames: usable={total} fresh_allocs={fresh} freelist_allocs={from_free} free_list_now={free_now} fresh_cycles_total={fresh_cycles} last_fresh_alloc_cycles={last_cycles} mean_fresh_alloc_cycles={}",
+            if reads > 0 { read_cycles / reads } else { 0 },
+            if fresh > 0 { fresh_cycles / fresh } else { 0 }
+        )
+        .unwrap();
+    }
     writeln!(port, "milestone 8: interactive shell active -- see framebuffer for real typed session").unwrap();
 
     // MILESTONE 25: dynamic task spawn/kill needs the scheduler to keep

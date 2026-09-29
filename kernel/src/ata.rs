@@ -90,6 +90,7 @@ use crate::ternary;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
 const STATUS_ERR: u8 = 0x01;
@@ -225,12 +226,55 @@ pub static SECONDARY_SLAVE: AtaDevice = AtaDevice::new(0x170, 0xF0);
 /// `SECONDARY_MASTER` through the `BlockDevice` trait instead of a
 /// standalone hardcoded implementation.
 pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
-    SECONDARY_MASTER.read_sector(lba, buf)
+    // MILESTONE 154 MEASUREMENT (instrumentation only, no behavior change):
+    // count reads, cycles per read, and how many reads hit an LBA read
+    // within the last RECENT_LBAS distinct reads with no write in between
+    // -- the fraction a block cache could have absorbed.
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+    let r = SECONDARY_MASTER.read_sector(lba, buf);
+    let t1 = unsafe { core::arch::x86_64::_rdtsc() };
+    IO_READS.fetch_add(1, Ordering::Relaxed);
+    IO_READ_CYCLES.fetch_add(t1 - t0, Ordering::Relaxed);
+    let mut ring = RECENT.lock();
+    if ring.0.iter().any(|&x| x == lba) {
+        IO_REPEAT_READS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        let i = ring.1;
+        ring.0[i] = lba;
+        ring.1 = (i + 1) % RECENT_LBAS;
+    }
+    r
+}
+
+const RECENT_LBAS: usize = 32;
+static IO_READS: AtomicU64 = AtomicU64::new(0);
+static IO_WRITES: AtomicU64 = AtomicU64::new(0);
+static IO_REPEAT_READS: AtomicU64 = AtomicU64::new(0);
+static IO_READ_CYCLES: AtomicU64 = AtomicU64::new(0);
+static RECENT: spin::Mutex<([u32; RECENT_LBAS], usize)> = spin::Mutex::new(([u32::MAX; RECENT_LBAS], 0));
+
+/// MILESTONE 154 MEASUREMENT: (reads, writes, repeat_reads, read_cycles).
+pub fn io_stats() -> (u64, u64, u64, u64) {
+    (
+        IO_READS.load(Ordering::Relaxed),
+        IO_WRITES.load(Ordering::Relaxed),
+        IO_REPEAT_READS.load(Ordering::Relaxed),
+        IO_READ_CYCLES.load(Ordering::Relaxed),
+    )
 }
 
 /// See `read_sector()`'s doc comment above -- same "unchanged for
 /// existing callers" guarantee.
 pub fn write_sector(lba: u32, buf: &[u8; 512]) -> Result<(), &'static str> {
+    IO_WRITES.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut ring = RECENT.lock();
+        for x in ring.0.iter_mut() {
+            if *x == lba {
+                *x = u32::MAX;
+            }
+        }
+    }
     SECONDARY_MASTER.write_sector(lba, buf)
 }
 

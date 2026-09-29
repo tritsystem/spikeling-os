@@ -5027,25 +5027,26 @@ impl Parser {
                 let name = unsafe { self.expect(TOK_IDENT) }?;
                 // MILESTONE 148: `*p += expr;` -- the pointer-dereference-
                 // target half of the "compound assignment on a non-plain-
-                // identifier target" gap, the exact `+=`-only mirror of
-                // Milestone 147's own array-target closure one commit ago
-                // (itself mirroring Milestone 143's `++`/`--` rollout
-                // pattern). Checked here, after the single-star pointer's
+                // identifier target" gap. MILESTONE 150: `*p -= expr;`
+                // now too, the exact `-=`-only mirror of Milestone 149's
+                // own array-target closure one commit ago, widening this
+                // same check the identical way (one more `||` disjunct,
+                // no new helper function -- `build_compound_assign_deref()`
+                // was already parameterized on the operator byte from the
+                // start). Checked here, after the single-star pointer's
                 // own IDENT, before the pre-existing plain `TOK_ASSIGN`
                 // check, so `*p = expr;` (this same arm's original
-                // Milestone 109/112 feature) is unaffected. Delegates to
-                // `build_compound_assign_deref()` below, the pointer-
-                // dereference sibling of `build_compound_assign_index()`
-                // (Milestone 147). Single-level `int *` only, the same
-                // "narrow slice first" discipline every `++`/`--` and
-                // compound-assignment milestone in this project has kept
-                // -- `**p += expr;`/`***p += expr;` are real, disclosed
-                // future work.
-                if unsafe { self.peek() }.kind == TOK_PLUSEQ {
-                    unsafe { self.advance() }; // consume '+='
+                // Milestone 109/112 feature) is unaffected. Single-level
+                // `int *` only, the same "narrow slice first" discipline
+                // every `++`/`--` and compound-assignment milestone in
+                // this project has kept -- `**p += expr;`/`**p -= expr;`
+                // are real, disclosed future work.
+                if unsafe { self.peek() }.kind == TOK_PLUSEQ || unsafe { self.peek() }.kind == TOK_MINUSEQ {
+                    let op: u8 = if unsafe { self.peek() }.kind == TOK_PLUSEQ { b'+' } else { b'-' };
+                    unsafe { self.advance() }; // consume '+=' or '-='
                     let rhs = unsafe { self.parse_ternary() }?;
                     unsafe { self.expect(TOK_SEMI) }?;
-                    return unsafe { self.build_compound_assign_deref(name, b'+', rhs) };
+                    return unsafe { self.build_compound_assign_deref(name, op, rhs) };
                 }
                 unsafe { self.expect(TOK_ASSIGN) }?;
                 let rhs = unsafe { self.parse_ternary() }?;
@@ -16434,7 +16435,57 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m149 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 { 0 } else { 1 });
+        // CASE 206: `*p -= 3;` -- the second compound-assignment
+        // operator on a pointer-dereference target, mirroring Milestone
+        // 149's own array-target `-=` closure one commit ago.
+        //   int main() {
+        //       int x;
+        //       x = 10;
+        //       int *p;
+        //       p = &x;
+        //       *p -= 3;
+        //       return x;
+        //   }
+        // Hand-computed: 7.
+        // -------------------------------------------------------------
+        const SRC206: &[u8] = b"int main() { int x; x = 10; int *p; p = &x; *p -= 3; return x; }";
+        let case206_result = compile_and_run_program_callable(SRC206.as_ptr() as u64, SRC206.len() as u64);
+        w(b"  case206 (*p -= 3; a real pointer-dereference-target compound-subtraction statement, in-process) returned=");
+        if let Some(r) = case206_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 7)\n");
+        let case206_ok = case206_result == Some(7);
+        write_check(b"case206_deref_target_compound_minus_assign_returns_7=", case206_ok);
+
+        w(b"\n");
+
+        // CASE 207: a REGRESSION guard -- `*p += expr;` (Milestone 148's
+        // own feature) must still work, unaffected by the new
+        // `TOK_MINUSEQ` branch added alongside `TOK_PLUSEQ` in the same
+        // check.
+        const SRC207: &[u8] = b"int main() { int x; x = 10; int *p; p = &x; *p += 5; return x; }";
+        let case207_result = compile_and_run_program_callable(SRC207.as_ptr() as u64, SRC207.len() as u64);
+        w(b"  case207 (REGRESSION: *p += expr; dereference-target compound-addition still works) returned=");
+        if let Some(r) = case207_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 15)\n");
+        let case207_ok = case207_result == Some(15);
+        write_check(b"case207_deref_compound_plus_assign_regression_returns_15=", case207_ok);
+
+        w(b"\n");
+
+        let overall_m150 = case206_ok && case207_ok;
+        w(b"OVERALL_M150=");
+        w(if overall_m150 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 { 0 } else { 1 });
     }
 }
 

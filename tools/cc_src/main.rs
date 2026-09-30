@@ -4625,7 +4625,12 @@ impl Parser {
     /// `EXPR_IDENT`, so `ptr_operand_scale()` never recognizes it and
     /// `*p + rhs` correctly gets the plain, unscaled add appropriate for
     /// the pointee's own value.
-    unsafe fn build_compound_assign_deref(&mut self, name: Token, op: u8, rhs: u64) -> Result<u64, ParseError> {
+    /// MILESTONE 158: `levels` (1, 2 or 3) is how many `*` the target has --
+    /// `*p op= e;`, `**pp op= e;`, `***ppp op= e;` -- selecting the matching
+    /// `STMT_ASSIGN_DEREF`/`_DEREF2`/`_DEREF3` write and wrapping the read
+    /// side in that many `OP_DEREF`s; everything else is the pre-existing
+    /// single-level helper unchanged.
+    unsafe fn build_compound_assign_deref(&mut self, name: Token, op: u8, rhs: u64, levels: u32) -> Result<u64, ParseError> {
         let ptr_ref = unsafe { alloc_expr() };
         if ptr_ref == 0 {
             return Err(ParseError::OutOfMemory);
@@ -4636,16 +4641,20 @@ impl Parser {
                 ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
             )
         };
-        let deref_ref = unsafe { alloc_expr() };
-        if deref_ref == 0 {
-            return Err(ParseError::OutOfMemory);
+        let mut deref_ref = ptr_ref;
+        for _ in 0..levels {
+            let inner = deref_ref;
+            deref_ref = unsafe { alloc_expr() };
+            if deref_ref == 0 {
+                return Err(ParseError::OutOfMemory);
+            }
+            unsafe {
+                core::ptr::write(
+                    deref_ref as *mut ExprNode,
+                    ExprNode { kind: EXPR_UNARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_DEREF, left: inner, right: 0, call_args_ptr: 0, call_argc: 0 },
+                )
+            };
         }
-        unsafe {
-            core::ptr::write(
-                deref_ref as *mut ExprNode,
-                ExprNode { kind: EXPR_UNARY, int_val: 0, ident_off: 0, ident_len: 0, op: OP_DEREF, left: ptr_ref, right: 0, call_args_ptr: 0, call_argc: 0 },
-            )
-        };
         let bin = unsafe { alloc_expr() };
         if bin == 0 {
             return Err(ParseError::OutOfMemory);
@@ -4663,7 +4672,7 @@ impl Parser {
         unsafe {
             core::ptr::write(
                 node as *mut StmtNode,
-                StmtNode { kind: STMT_ASSIGN_DEREF, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: 0, else_body: 0 },
+                StmtNode { kind: if levels >= 3 { STMT_ASSIGN_DEREF3 } else if levels == 2 { STMT_ASSIGN_DEREF2 } else { STMT_ASSIGN_DEREF }, ident_off: name.ident_off, ident_len: name.ident_len, expr: bin, next: 0, then_body: 0, else_body: 0 },
             )
         };
         Ok(node)
@@ -5019,6 +5028,13 @@ impl Parser {
                     if unsafe { self.peek() }.kind == TOK_STAR {
                         unsafe { self.advance() }; // consume third '*'
                         let name = unsafe { self.expect(TOK_IDENT) }?;
+                        // MILESTONE 158: `***ppp op= expr;` (all ten operators).
+                        if let Some(op) = array_deref_compound_op(unsafe { self.peek() }.kind) {
+                            unsafe { self.advance() };
+                            let rhs = unsafe { self.parse_ternary() }?;
+                            unsafe { self.expect(TOK_SEMI) }?;
+                            return unsafe { self.build_compound_assign_deref(name, op, rhs, 3) };
+                        }
                         unsafe { self.expect(TOK_ASSIGN) }?;
                         let rhs = unsafe { self.parse_ternary() }?;
                         unsafe { self.expect(TOK_SEMI) }?;
@@ -5035,6 +5051,13 @@ impl Parser {
                         return Ok(node);
                     }
                     let name = unsafe { self.expect(TOK_IDENT) }?;
+                    // MILESTONE 158: `**pp op= expr;` (all ten operators).
+                    if let Some(op) = array_deref_compound_op(unsafe { self.peek() }.kind) {
+                        unsafe { self.advance() };
+                        let rhs = unsafe { self.parse_ternary() }?;
+                        unsafe { self.expect(TOK_SEMI) }?;
+                        return unsafe { self.build_compound_assign_deref(name, op, rhs, 2) };
+                    }
                     unsafe { self.expect(TOK_ASSIGN) }?;
                     let rhs = unsafe { self.parse_ternary() }?;
                     unsafe { self.expect(TOK_SEMI) }?;
@@ -5073,7 +5096,7 @@ impl Parser {
                     unsafe { self.advance() }; // consume '+=', '-=' or '*='
                     let rhs = unsafe { self.parse_ternary() }?;
                     unsafe { self.expect(TOK_SEMI) }?;
-                    return unsafe { self.build_compound_assign_deref(name, op, rhs) };
+                    return unsafe { self.build_compound_assign_deref(name, op, rhs, 1) };
                 }
                 unsafe { self.expect(TOK_ASSIGN) }?;
                 let rhs = unsafe { self.parse_ternary() }?;
@@ -16790,7 +16813,342 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m153 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 { 0 } else { 1 });
+        // CASE 225: `**pp += 5;` on 100 -> 105 (Milestone 158).
+        const SRC225: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp += 5; return x; }";
+        let case225_result = compile_and_run_program_callable(SRC225.as_ptr() as u64, SRC225.len() as u64);
+        w(b"  case225 (**pp += 5; compound-add through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case225_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 105)\n");
+        let case225_ok = case225_result == Some(105);
+        write_check(b"case225_deref2_compound_add_assign_returns_105=", case225_ok);
+
+        w(b"\n");
+
+        // CASE 226: `**pp -= 3;` on 100 -> 97 (Milestone 158).
+        const SRC226: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp -= 3; return x; }";
+        let case226_result = compile_and_run_program_callable(SRC226.as_ptr() as u64, SRC226.len() as u64);
+        w(b"  case226 (**pp -= 3; compound-sub through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case226_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 97)\n");
+        let case226_ok = case226_result == Some(97);
+        write_check(b"case226_deref2_compound_sub_assign_returns_97=", case226_ok);
+
+        w(b"\n");
+
+        // CASE 227: `**pp *= 3;` on 100 -> 300 (Milestone 158).
+        const SRC227: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp *= 3; return x; }";
+        let case227_result = compile_and_run_program_callable(SRC227.as_ptr() as u64, SRC227.len() as u64);
+        w(b"  case227 (**pp *= 3; compound-mul through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case227_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 300)\n");
+        let case227_ok = case227_result == Some(300);
+        write_check(b"case227_deref2_compound_mul_assign_returns_300=", case227_ok);
+
+        w(b"\n");
+
+        // CASE 228: `**pp /= 4;` on 100 -> 25 (Milestone 158).
+        const SRC228: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp /= 4; return x; }";
+        let case228_result = compile_and_run_program_callable(SRC228.as_ptr() as u64, SRC228.len() as u64);
+        w(b"  case228 (**pp /= 4; compound-div through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case228_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 25)\n");
+        let case228_ok = case228_result == Some(25);
+        write_check(b"case228_deref2_compound_div_assign_returns_25=", case228_ok);
+
+        w(b"\n");
+
+        // CASE 229: `**pp %= 7;` on 100 -> 2 (Milestone 158).
+        const SRC229: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp %= 7; return x; }";
+        let case229_result = compile_and_run_program_callable(SRC229.as_ptr() as u64, SRC229.len() as u64);
+        w(b"  case229 (**pp %= 7; compound-mod through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case229_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 2)\n");
+        let case229_ok = case229_result == Some(2);
+        write_check(b"case229_deref2_compound_mod_assign_returns_2=", case229_ok);
+
+        w(b"\n");
+
+        // CASE 230: `**pp &= 12;` on 100 -> 4 (Milestone 158).
+        const SRC230: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp &= 12; return x; }";
+        let case230_result = compile_and_run_program_callable(SRC230.as_ptr() as u64, SRC230.len() as u64);
+        w(b"  case230 (**pp &= 12; compound-and through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case230_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4)\n");
+        let case230_ok = case230_result == Some(4);
+        write_check(b"case230_deref2_compound_and_assign_returns_4=", case230_ok);
+
+        w(b"\n");
+
+        // CASE 231: `**pp |= 3;` on 100 -> 103 (Milestone 158).
+        const SRC231: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp |= 3; return x; }";
+        let case231_result = compile_and_run_program_callable(SRC231.as_ptr() as u64, SRC231.len() as u64);
+        w(b"  case231 (**pp |= 3; compound-or through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case231_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 103)\n");
+        let case231_ok = case231_result == Some(103);
+        write_check(b"case231_deref2_compound_or_assign_returns_103=", case231_ok);
+
+        w(b"\n");
+
+        // CASE 232: `**pp ^= 5;` on 100 -> 97 (Milestone 158).
+        const SRC232: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp ^= 5; return x; }";
+        let case232_result = compile_and_run_program_callable(SRC232.as_ptr() as u64, SRC232.len() as u64);
+        w(b"  case232 (**pp ^= 5; compound-xor through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case232_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 97)\n");
+        let case232_ok = case232_result == Some(97);
+        write_check(b"case232_deref2_compound_xor_assign_returns_97=", case232_ok);
+
+        w(b"\n");
+
+        // CASE 233: `**pp <<= 2;` on 100 -> 400 (Milestone 158).
+        const SRC233: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp <<= 2; return x; }";
+        let case233_result = compile_and_run_program_callable(SRC233.as_ptr() as u64, SRC233.len() as u64);
+        w(b"  case233 (**pp <<= 2; compound-shl through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case233_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 400)\n");
+        let case233_ok = case233_result == Some(400);
+        write_check(b"case233_deref2_compound_shl_assign_returns_400=", case233_ok);
+
+        w(b"\n");
+
+        // CASE 234: `**pp >>= 3;` on 100 -> 12 (Milestone 158).
+        const SRC234: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; **pp >>= 3; return x; }";
+        let case234_result = compile_and_run_program_callable(SRC234.as_ptr() as u64, SRC234.len() as u64);
+        w(b"  case234 (**pp >>= 3; compound-shr through 2 pointer levels, in-process) returned=");
+        if let Some(r) = case234_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12)\n");
+        let case234_ok = case234_result == Some(12);
+        write_check(b"case234_deref2_compound_shr_assign_returns_12=", case234_ok);
+
+        w(b"\n");
+
+        // CASE 235: `***ppp += 5;` on 100 -> 105 (Milestone 158).
+        const SRC235: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp += 5; return x; }";
+        let case235_result = compile_and_run_program_callable(SRC235.as_ptr() as u64, SRC235.len() as u64);
+        w(b"  case235 (***ppp += 5; compound-add through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case235_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 105)\n");
+        let case235_ok = case235_result == Some(105);
+        write_check(b"case235_deref3_compound_add_assign_returns_105=", case235_ok);
+
+        w(b"\n");
+
+        // CASE 236: `***ppp -= 3;` on 100 -> 97 (Milestone 158).
+        const SRC236: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp -= 3; return x; }";
+        let case236_result = compile_and_run_program_callable(SRC236.as_ptr() as u64, SRC236.len() as u64);
+        w(b"  case236 (***ppp -= 3; compound-sub through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case236_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 97)\n");
+        let case236_ok = case236_result == Some(97);
+        write_check(b"case236_deref3_compound_sub_assign_returns_97=", case236_ok);
+
+        w(b"\n");
+
+        // CASE 237: `***ppp *= 3;` on 100 -> 300 (Milestone 158).
+        const SRC237: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp *= 3; return x; }";
+        let case237_result = compile_and_run_program_callable(SRC237.as_ptr() as u64, SRC237.len() as u64);
+        w(b"  case237 (***ppp *= 3; compound-mul through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case237_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 300)\n");
+        let case237_ok = case237_result == Some(300);
+        write_check(b"case237_deref3_compound_mul_assign_returns_300=", case237_ok);
+
+        w(b"\n");
+
+        // CASE 238: `***ppp /= 4;` on 100 -> 25 (Milestone 158).
+        const SRC238: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp /= 4; return x; }";
+        let case238_result = compile_and_run_program_callable(SRC238.as_ptr() as u64, SRC238.len() as u64);
+        w(b"  case238 (***ppp /= 4; compound-div through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case238_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 25)\n");
+        let case238_ok = case238_result == Some(25);
+        write_check(b"case238_deref3_compound_div_assign_returns_25=", case238_ok);
+
+        w(b"\n");
+
+        // CASE 239: `***ppp %= 7;` on 100 -> 2 (Milestone 158).
+        const SRC239: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp %= 7; return x; }";
+        let case239_result = compile_and_run_program_callable(SRC239.as_ptr() as u64, SRC239.len() as u64);
+        w(b"  case239 (***ppp %= 7; compound-mod through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case239_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 2)\n");
+        let case239_ok = case239_result == Some(2);
+        write_check(b"case239_deref3_compound_mod_assign_returns_2=", case239_ok);
+
+        w(b"\n");
+
+        // CASE 240: `***ppp &= 12;` on 100 -> 4 (Milestone 158).
+        const SRC240: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp &= 12; return x; }";
+        let case240_result = compile_and_run_program_callable(SRC240.as_ptr() as u64, SRC240.len() as u64);
+        w(b"  case240 (***ppp &= 12; compound-and through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case240_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4)\n");
+        let case240_ok = case240_result == Some(4);
+        write_check(b"case240_deref3_compound_and_assign_returns_4=", case240_ok);
+
+        w(b"\n");
+
+        // CASE 241: `***ppp |= 3;` on 100 -> 103 (Milestone 158).
+        const SRC241: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp |= 3; return x; }";
+        let case241_result = compile_and_run_program_callable(SRC241.as_ptr() as u64, SRC241.len() as u64);
+        w(b"  case241 (***ppp |= 3; compound-or through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case241_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 103)\n");
+        let case241_ok = case241_result == Some(103);
+        write_check(b"case241_deref3_compound_or_assign_returns_103=", case241_ok);
+
+        w(b"\n");
+
+        // CASE 242: `***ppp ^= 5;` on 100 -> 97 (Milestone 158).
+        const SRC242: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp ^= 5; return x; }";
+        let case242_result = compile_and_run_program_callable(SRC242.as_ptr() as u64, SRC242.len() as u64);
+        w(b"  case242 (***ppp ^= 5; compound-xor through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case242_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 97)\n");
+        let case242_ok = case242_result == Some(97);
+        write_check(b"case242_deref3_compound_xor_assign_returns_97=", case242_ok);
+
+        w(b"\n");
+
+        // CASE 243: `***ppp <<= 2;` on 100 -> 400 (Milestone 158).
+        const SRC243: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp <<= 2; return x; }";
+        let case243_result = compile_and_run_program_callable(SRC243.as_ptr() as u64, SRC243.len() as u64);
+        w(b"  case243 (***ppp <<= 2; compound-shl through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case243_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 400)\n");
+        let case243_ok = case243_result == Some(400);
+        write_check(b"case243_deref3_compound_shl_assign_returns_400=", case243_ok);
+
+        w(b"\n");
+
+        // CASE 244: `***ppp >>= 3;` on 100 -> 12 (Milestone 158).
+        const SRC244: &[u8] = b"int main() { int x; x = 100; int *p; p = &x; int **pp; pp = &p; int ***ppp; ppp = &pp; ***ppp >>= 3; return x; }";
+        let case244_result = compile_and_run_program_callable(SRC244.as_ptr() as u64, SRC244.len() as u64);
+        w(b"  case244 (***ppp >>= 3; compound-shr through 3 pointer levels, in-process) returned=");
+        if let Some(r) = case244_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 12)\n");
+        let case244_ok = case244_result == Some(12);
+        write_check(b"case244_deref3_compound_shr_assign_returns_12=", case244_ok);
+
+        w(b"\n");
+
+        // CASE 245: REGRESSION: **pp = expr; still works.
+        const SRC245: &[u8] = b"int main() { int x; x = 1; int *p; p = &x; int **pp; pp = &p; **pp = 77; return x; }";
+        let case245_result = compile_and_run_program_callable(SRC245.as_ptr() as u64, SRC245.len() as u64);
+        w(b"  case245 (REGRESSION: **pp = expr; still works) returned=");
+        if let Some(r) = case245_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 77)\n");
+        let case245_ok = case245_result == Some(77);
+        write_check(b"case245_deref2_plain_assign_regression_returns_77=", case245_ok);
+
+        w(b"\n");
+
+        // CASE 246: REGRESSION: *p += expr; still works via the levels-parameterized helper.
+        const SRC246: &[u8] = b"int main() { int x; x = 10; int *p; p = &x; *p += 5; return x; }";
+        let case246_result = compile_and_run_program_callable(SRC246.as_ptr() as u64, SRC246.len() as u64);
+        w(b"  case246 (REGRESSION: *p += expr; still works via the levels-parameterized helper) returned=");
+        if let Some(r) = case246_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 15)\n");
+        let case246_ok = case246_result == Some(15);
+        write_check(b"case246_deref1_compound_regression_returns_15=", case246_ok);
+
+        w(b"\n");
+
+        let overall_m158 = case225_ok && case226_ok && case227_ok && case228_ok && case229_ok && case230_ok && case231_ok && case232_ok && case233_ok && case234_ok && case235_ok && case236_ok && case237_ok && case238_ok && case239_ok && case240_ok && case241_ok && case242_ok && case243_ok && case244_ok && case245_ok && case246_ok;
+        w(b"OVERALL_M158=");
+        w(if overall_m158 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 { 0 } else { 1 });
     }
 }
 

@@ -945,6 +945,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // evidence-gated), pre-registered in fs.rs. Needs the disk and the
     // filesystem, both live by this point.
     fs::self_test_sector_cache();
+    // MILESTONE 157: the O(1) frame cursor must yield the identical frame
+    // sequence as the O(k) walk it replaced, and be far cheaper.
+    memory::self_test_frame_cursor();
 
     interrupts::init_pics();
     shell::init();

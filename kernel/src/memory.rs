@@ -51,6 +51,50 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
     unsafe { &mut *page_table_ptr }
 }
 
+/// MILESTONE 157: an O(1)-amortized cursor over the same frame sequence
+/// the old `usable_frames()` defined (usable regions in map order, 4 KiB steps from
+/// each region's start). The old `allocate_frame()` did
+/// `usable_frames().nth(self.next)` -- restarting the walk at the first
+/// region on EVERY fresh frame, so the k-th frame cost O(k): Milestone 154
+/// measured ~346k cycles per fresh frame at only ~600 frames in use, and
+/// the cost grows linearly with the index (~30M cycles per frame near the
+/// end of the ~29.5k-frame pool). The cursor remembers which usable region
+/// it is in and the next address inside it.
+struct FrameCursor {
+    usable_idx: usize,
+    addr: u64,
+    end: u64,
+    loaded: bool,
+}
+
+impl FrameCursor {
+    const fn new() -> Self {
+        FrameCursor { usable_idx: 0, addr: 0, end: 0, loaded: false }
+    }
+
+    /// The next frame in exactly the order the reference definition
+    /// (`reference_nth_frame(regions, k)` for k = 0, 1, 2, ...) yields
+    /// them -- `None` once the pool is exhausted. The current region's
+    /// bounds are cached, so the region list is only re-filtered when a
+    /// region runs out (the first version re-filtered on every call and
+    /// measured 8,010 cycles/frame against a pre-registered < 5,000).
+    fn next_frame(&mut self, regions: &MemoryRegions) -> Option<PhysFrame> {
+        loop {
+            if self.loaded && self.addr < self.end {
+                let frame = PhysFrame::containing_address(PhysAddr::new(self.addr));
+                self.addr += 4096;
+                return Some(frame);
+            }
+            let idx = if self.loaded { self.usable_idx + 1 } else { self.usable_idx };
+            let r = regions.iter().filter(|r| r.kind == MemoryRegionKind::Usable).nth(idx)?;
+            self.usable_idx = idx;
+            self.addr = r.start;
+            self.end = r.end;
+            self.loaded = true;
+        }
+    }
+}
+
 /// A frame allocator that returns usable frames from the bootloader's
 /// memory map -- real physical memory the firmware reported as free,
 /// not a synthetic pool. Bump-allocates from `next` for genuinely new
@@ -65,6 +109,9 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 pub struct BootInfoFrameAllocator {
     memory_regions: &'static MemoryRegions,
     next: usize,
+    /// MILESTONE 157: where the next fresh frame comes from, so fetching it
+    /// is O(1) instead of re-walking the whole frame list from the start.
+    cursor: FrameCursor,
     free_list: Vec<PhysFrame<Size4KiB>>,
 }
 
@@ -79,17 +126,9 @@ impl BootInfoFrameAllocator {
         BootInfoFrameAllocator {
             memory_regions,
             next: 0,
+            cursor: FrameCursor::new(),
             free_list: Vec::new(),
         }
-    }
-
-    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
-        self.memory_regions
-            .iter()
-            .filter(|r| r.kind == MemoryRegionKind::Usable)
-            .map(|r| r.start..r.end)
-            .flat_map(|r| r.step_by(4096))
-            .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
     }
 
     /// MILESTONE 54: real count of frames currently sitting on the free
@@ -100,12 +139,20 @@ impl BootInfoFrameAllocator {
         self.free_list.len()
     }
 
+    /// The reference (pre-M157) definition of the k-th fresh frame -- the
+    /// O(k) walk, kept ONLY so `self_test_frame_cursor()` can prove the
+    /// cursor yields the identical sequence.
+    #[allow(dead_code)]
+    fn reference_nth(&self, k: usize) -> Option<PhysFrame> {
+        reference_nth_frame(self.memory_regions, k)
+    }
+
     /// MILESTONE 154 MEASUREMENT: total 4 KiB frames the bootloader reported usable.
     pub fn total_usable_frames(&self) -> u64 {
         self.memory_regions
             .iter()
             .filter(|r| r.kind == MemoryRegionKind::Usable)
-            .map(|r| (r.end - r.start) / 4096)
+            .map(|r| (r.end - r.start + 4095) / 4096)
             .sum()
     }
 }
@@ -138,10 +185,12 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
             FRAME_FREELIST_ALLOCS.fetch_add(1, Ordering::Relaxed);
             return Some(frame);
         }
-        // MILESTONE 154 MEASUREMENT (instrumentation only): cycles the
-        // O(next) `usable_frames().nth(next)` walk costs per fresh frame.
+        // MILESTONE 154 MEASUREMENT (instrumentation only): cycles one fresh
+        // frame costs. Milestone 154 measured ~346k cycles per frame here
+        // (an O(next) `usable_frames().nth(next)` walk); Milestone 157
+        // replaced it with `FrameCursor`.
         let t0 = unsafe { core::arch::x86_64::_rdtsc() };
-        let frame = self.usable_frames().nth(self.next);
+        let frame = self.cursor.next_frame(self.memory_regions);
         let t1 = unsafe { core::arch::x86_64::_rdtsc() };
         FRAME_FRESH_ALLOCS.fetch_add(1, Ordering::Relaxed);
         FRAME_FRESH_CYCLES.fetch_add(t1 - t0, Ordering::Relaxed);
@@ -211,4 +260,84 @@ pub fn phys_mem_offset() -> VirtAddr {
 pub fn with_frame_allocator<R>(f: impl FnOnce(&mut BootInfoFrameAllocator) -> R) -> Option<R> {
     let mut guard = FRAME_ALLOCATOR.lock();
     guard.as_mut().map(f)
+}
+
+/// MILESTONE 157: boot-time proof that `FrameCursor` yields EXACTLY the
+/// frame sequence the old `usable_frames().nth(k)` did, and is far cheaper.
+/// Pre-registered: (1) the cursor's full walk visits exactly
+/// `total_usable_frames()` frames and then returns `None`; (2) at k = 0, 1,
+/// 100, 5000, 15000 and the last index it returns the same frame as the
+/// reference `nth(k)`, and the first 2000 frames match one-for-one; (3) the
+/// cursor costs under 5,000 cycles per frame over the full walk while the
+/// reference `nth(k)` near the end costs at least 100x that.
+fn reference_nth_frame(regions: &MemoryRegions, k: usize) -> Option<PhysFrame> {
+    regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+        .map(|r| r.start..r.end)
+        .flat_map(|r| r.step_by(4096))
+        .map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+        .nth(k)
+}
+
+pub fn self_test_frame_cursor() -> bool {
+    use core::fmt::Write;
+    fn tsc() -> u64 {
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+    let Some((regions, counted)) = with_frame_allocator(|fa| (fa.memory_regions, fa.total_usable_frames())) else {
+        return false;
+    };
+    // Independent count from the reference definition itself, cross-checked
+    // against `total_usable_frames()` (the first boot's floor-division
+    // undercount by one -- 29,502 vs the iterator's 29,503 -- is fixed).
+    let total = regions
+        .iter()
+        .filter(|r| r.kind == MemoryRegionKind::Usable)
+        .map(|r| r.start..r.end)
+        .flat_map(|r| r.step_by(4096))
+        .count();
+    let counted_agrees = counted as usize == total;
+
+    // Full cursor walk, timed, comparing against the reference definition
+    // as it goes (no big stack arrays): probes, first 2000, last, exhaustion.
+    const PROBES: [usize; 5] = [0, 1, 100, 5000, 15000];
+    let mut cursor = FrameCursor::new();
+    let mut matches_ok = total > 0;
+    let mut last_frame: Option<PhysFrame> = None;
+    let mut cursor_cycles: u64 = 0;
+    let mut walked = 0usize;
+    loop {
+        let t = tsc();
+        let f = cursor.next_frame(regions);
+        cursor_cycles += tsc() - t;
+        let Some(f) = f else { break };
+        if walked < 2000 || PROBES.contains(&walked) {
+            matches_ok &= reference_nth_frame(regions, walked) == Some(f);
+        }
+        last_frame = Some(f);
+        walked += 1;
+    }
+    let exhausted_none = cursor.next_frame(regions).is_none();
+    let count_ok = walked == total && exhausted_none && counted_agrees;
+    matches_ok &= total > 0 && reference_nth_frame(regions, total - 1) == last_frame;
+    matches_ok &= reference_nth_frame(regions, total).is_none();
+
+    // Cost of the reference walk near the end of the pool.
+    let t1 = tsc();
+    let ref_last = reference_nth_frame(regions, total.saturating_sub(1));
+    let ref_cycles = tsc() - t1;
+    let _ = ref_last;
+
+    let cursor_per_frame = if walked > 0 { cursor_cycles / walked as u64 } else { 0 };
+    let cost_ok = cursor_per_frame < 5_000 && ref_cycles >= cursor_per_frame * 100;
+    let ok = count_ok && matches_ok && cost_ok;
+    let _ = writeln!(
+        crate::serial(),
+        "milestone 157: frame cursor self-test -- walked {walked} of {total} usable frames then None={exhausted_none} (count_ok={count_ok}) -- identical to reference nth(k) at probes {PROBES:?}, last index, past-the-end, and first 2000 (matches_ok={matches_ok}) -- cursor {cursor_per_frame} cycles/frame over the full walk vs reference nth({}) = {ref_cycles} cycles for ONE frame ({}x the cursor's per-frame cost) -- {}",
+        total.saturating_sub(1),
+        if cursor_per_frame > 0 { ref_cycles / cursor_per_frame } else { 0 },
+        if ok { "PASS" } else { "FAIL" }
+    );
+    ok
 }

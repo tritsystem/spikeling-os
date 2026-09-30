@@ -2622,6 +2622,38 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       ever overwritten, never read back across boots); persistence of the
       real data (network weights, the M11 persistence test) is unaffected.
 
+- [x] **Milestone 157**: O(1) frame cursor replacing the frame allocator's
+      O(k) walk -- the incidental finding of Milestone 154. **Before**:
+      `allocate_frame()` did `usable_frames().nth(self.next)`, restarting at
+      the first region on every fresh frame; M154 measured a mean ~346k
+      cycles per fresh frame with only 594 frames in use, growing linearly
+      (~31M cycles for the last of ~29.5k frames). **Change**: `FrameCursor`
+      remembers the current usable region and next address (bounds cached so
+      the region list is only re-filtered on a region change); the old walk
+      survives only as `reference_nth_frame()` for the proof.
+      **Pre-registered** (`memory::self_test_frame_cursor()`, every boot):
+      the cursor's full walk visits exactly the reference count of frames
+      then returns None; it yields the identical frame to `nth(k)` at probes
+      0/1/100/5000/15000, the last index, past-the-end, and the first 2000;
+      and costs < 5,000 cycles/frame while the reference `nth(last)` costs
+      >= 100x that. **Results**: count and identity checks pass; cursor 798-
+      823 cycles/frame vs reference nth(last) ~3.1e7 cycles (38,755-40,894x);
+      production `mean_fresh_alloc_cycles` 346k -> ~7.4-7.6k (~46x), last
+      fresh alloc ~1.5k. **Two things that did not go to plan, kept on
+      record** (`m157_first_run_reused_boot.log` is that run): (1) my first
+      cursor re-filtered the region list on every call and measured 8,010
+      cycles/frame against the < 5,000 prediction -- fixed by caching the
+      region bounds, not by relaxing the threshold; (2) the same run showed
+      `total_usable_frames()` (used by M154 and this test) floor-divided
+      each region and undercounted by one (29,502 vs the iterator's 29,503)
+      -- fixed to round up, and the test now cross-checks it against an
+      independent count of the reference iterator. Frames served are
+      unchanged (same order), so nothing else in the kernel sees a
+      difference. Two boots (`m157_fresh_boot.log`/`m157_reused_boot.log`):
+      73 aggregate `OVERALL` markers PASS, fs self-tests 0 FAIL / 82 PASS,
+      zero panics or faults. Pure conventional performance work -- no SNN
+      angle, correctly.
+
 ## Building and running
 
 Requires:

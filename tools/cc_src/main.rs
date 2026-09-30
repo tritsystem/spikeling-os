@@ -2693,6 +2693,19 @@ const EXPR_TERNARY: u8 = 6; // MILESTONE 90: `cond ? then : else` -- `left` = co
 // follows.
 const EXPR_INDEX: u8 = 7;
 
+// MILESTONE 159: `++`/`--` as a real EXPRESSION on a plain variable:
+// postfix `i++`/`i--` (value = the OLD value) and prefix `++i`/`--i`
+// (value = the NEW value), usable anywhere an expression is (`x = i++;`,
+// `arr[i++]`, `while (i++ < n)`, `*p++`). `ident_off`/`ident_len` name the
+// variable, `op` is b'+' or b'-', `int_val` is 1 for prefix and 0 for
+// postfix, and `right` holds a prebuilt `IDENT op 1` EXPR_BINARY -- the
+// very same read-modify-write expression the statement forms
+// (`build_incr_decr_assign()`) already store, so pointer scaling
+// (`p++` steps by the pointee size) comes for free from the ordinary
+// binary-op codegen. The statement forms (`i++;`, `++i;`) are dispatched
+// earlier and are untouched.
+const EXPR_INCDEC: u8 = 8;
+
 // MILESTONE 70: comparison-operator sentinels for ExprNode.op, deliberately
 // NOT reusing raw ASCII bytes the way the four arithmetic ops do (b'+' etc)
 // -- '<' (0x3C) and '>' (0x3E) are real ASCII printable bytes too and
@@ -3319,6 +3332,13 @@ impl Parser {
                             },
                         )
                     };
+                    // MILESTONE 159: `IDENT "++"` / `IDENT "--"` as a real
+                    // expression (postfix: value is the OLD value).
+                    let nk = unsafe { self.peek() }.kind;
+                    if nk == TOK_PLUSPLUS || nk == TOK_MINUSMINUS {
+                        unsafe { self.advance() };
+                        return unsafe { self.build_incdec_expr(name, if nk == TOK_PLUSPLUS { b'+' } else { b'-' }, false) };
+                    }
                     Ok(node)
                 }
             }
@@ -3367,6 +3387,14 @@ impl Parser {
     /// (`!!x`, `!-x`, `-!x`, `~!x` are all real, legal parses here).
     unsafe fn parse_unary(&mut self) -> Result<u64, ParseError> {
         let k = unsafe { self.peek() }.kind;
+        // MILESTONE 159: `"++" IDENT` / `"--" IDENT` as a real expression
+        // (prefix: value is the NEW value). Statement-position `++i;` is
+        // dispatched before expression parsing and never reaches here.
+        if k == TOK_PLUSPLUS || k == TOK_MINUSMINUS {
+            unsafe { self.advance() };
+            let name = unsafe { self.expect(TOK_IDENT) }?;
+            return unsafe { self.build_incdec_expr(name, if k == TOK_PLUSPLUS { b'+' } else { b'-' }, true) };
+        }
         // MILESTONE 98: unary `+` is a genuine no-op on this subset's
         // only type (`int`) -- consume the token and return the
         // operand's own parse directly, with NO EXPR_UNARY node and NO
@@ -4362,6 +4390,53 @@ impl Parser {
         }
         unsafe { self.expect(TOK_SEMI) }?;
         Ok(head)
+    }
+
+    /// MILESTONE 159: builds the `EXPR_INCDEC` node for `name++`/`name--`
+    /// (`prefix == false`) or `++name`/`--name` (`prefix == true`) -- see
+    /// `EXPR_INCDEC`'s own const doc comment for the node layout.
+    unsafe fn build_incdec_expr(&mut self, name: Token, op: u8, prefix: bool) -> Result<u64, ParseError> {
+        let lhs_ref = unsafe { alloc_expr() };
+        if lhs_ref == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                lhs_ref as *mut ExprNode,
+                ExprNode { kind: EXPR_IDENT, int_val: 0, ident_off: name.ident_off, ident_len: name.ident_len, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let one = unsafe { alloc_expr() };
+        if one == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                one as *mut ExprNode,
+                ExprNode { kind: EXPR_INTLIT, int_val: 1, ident_off: 0, ident_len: 0, op: 0, left: 0, right: 0, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let bin = unsafe { alloc_expr() };
+        if bin == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                bin as *mut ExprNode,
+                ExprNode { kind: EXPR_BINARY, int_val: 0, ident_off: 0, ident_len: 0, op, left: lhs_ref, right: one, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        let node = unsafe { alloc_expr() };
+        if node == 0 {
+            return Err(ParseError::OutOfMemory);
+        }
+        unsafe {
+            core::ptr::write(
+                node as *mut ExprNode,
+                ExprNode { kind: EXPR_INCDEC, int_val: if prefix { 1 } else { 0 }, ident_off: name.ident_off, ident_len: name.ident_len, op, left: 0, right: bin, call_args_ptr: 0, call_argc: 0 },
+            )
+        };
+        Ok(node)
     }
 
     /// MILESTONE 84 logic, extracted at MILESTONE 86 so `for`'s init and
@@ -6855,7 +6930,7 @@ unsafe fn find_var(src_ptr: u64, vars_ptr: u64, nvars: u64, ident_off: u64, iden
 // same "both prerequisites were already in place" shape Milestone 121
 // itself observed for `int **`.
 unsafe fn ptr_operand_scale(src_ptr: u64, vars_ptr: u64, nvars: u64, node: &ExprNode) -> Option<u8> {
-    if node.kind != EXPR_IDENT {
+    if node.kind != EXPR_IDENT && node.kind != EXPR_INCDEC {
         return None;
     }
     match unsafe { find_var(src_ptr, vars_ptr, nvars, node.ident_off as u64, node.ident_len as u64) } {
@@ -7588,6 +7663,7 @@ impl CodeBuf {
 // just extended one register further (RCX for a real 4th argument,
 // genuine standard SysV x86_64 order) rather than inventing a new,
 // unrelated one.
+const REG_RAX: u8 = 0;
 const REG_RCX: u8 = 1;
 const REG_RDX: u8 = 2;
 const REG_RSI: u8 = 6;
@@ -8075,10 +8151,49 @@ unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, f
         // "resolved by operand SHAPE, not attempted for every expression"
         // precedent Milestone 109's own `&` restriction already
         // established for this exact operator family.
+        // MILESTONE 159: `i++`/`i--`/`++i`/`--i` as an expression.
+        //   postfix:  load old -> push rax -> <i op 1> -> store -> pop rax
+        //             (RAX = the OLD value the expression evaluates to)
+        //   prefix:   <i op 1> -> store -> reload
+        //             (RAX = the NEW value; the reload also narrows a `char`)
+        // The store is STMT_ASSIGN's own full-width write; the load is
+        // EXPR_IDENT's own (byte-narrowing for `char`). An array name is
+        // rejected exactly like `arr = expr;` is.
+        EXPR_INCDEC => {
+            let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
+            let (o, is_char) = match slot {
+                Some((o, is_char, is_array, _a, _b, _c, _d)) => {
+                    if is_array != 0 {
+                        return Err(CodeGenError::ArrayNotAssignable(e.ident_off as u64));
+                    }
+                    (o, is_char != 0)
+                }
+                None => return Err(CodeGenError::UndeclaredVariable(e.ident_off as u64)),
+            };
+            if e.int_val == 0 {
+                if is_char {
+                    unsafe { buf.emit_movsx_rax_rbp_off_byte(o) };
+                } else {
+                    unsafe { buf.emit_mov_rax_rbp_off(o) };
+                }
+                unsafe { buf.emit_push_rax() };
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.right) }?;
+                unsafe { buf.emit_mov_rbp_off_rax(o) };
+                unsafe { buf.emit_pop_reg(REG_RAX) };
+            } else {
+                unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.right) }?;
+                unsafe { buf.emit_mov_rbp_off_rax(o) };
+                if is_char {
+                    unsafe { buf.emit_movsx_rax_rbp_off_byte(o) };
+                } else {
+                    unsafe { buf.emit_mov_rax_rbp_off(o) };
+                }
+            }
+        }
         EXPR_UNARY if e.op == OP_DEREF => {
             unsafe { gen_expr(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, e.left) }?;
             let operand = unsafe { core::ptr::read(e.left as *const ExprNode) };
-            let is_char_pointee = if operand.kind == EXPR_IDENT {
+            let is_char_pointee = if operand.kind == EXPR_IDENT || operand.kind == EXPR_INCDEC {
                 match unsafe { find_var(src_ptr, vars_ptr, nvars, operand.ident_off as u64, operand.ident_len as u64) } {
                     Some((_, _, _, is_char_ptr, _, _is_int_ptr_ptr, _is_int_ptr_ptr_ptr)) => is_char_ptr != 0,
                     None => false,
@@ -17148,7 +17263,177 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m158 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 { 0 } else { 1 });
+        // CASE 247: postfix: x = i++ -> old value, i incremented. Hand-computed: 56.
+        const SRC247: &[u8] = b"int main() { int i; i = 5; int x; x = i++; return x * 10 + i; }";
+        let case247_result = compile_and_run_program_callable(SRC247.as_ptr() as u64, SRC247.len() as u64);
+        w(b"  case247 (postfix: x = i++ -> old value, i incremented, in-process) returned=");
+        if let Some(r) = case247_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 56)\n");
+        let case247_ok = case247_result == Some(56);
+        write_check(b"case247_incdec_expr_returns_56=", case247_ok);
+
+        w(b"\n");
+
+        // CASE 248: prefix: x = ++i -> new value. Hand-computed: 66.
+        const SRC248: &[u8] = b"int main() { int i; i = 5; int x; x = ++i; return x * 10 + i; }";
+        let case248_result = compile_and_run_program_callable(SRC248.as_ptr() as u64, SRC248.len() as u64);
+        w(b"  case248 (prefix: x = ++i -> new value, in-process) returned=");
+        if let Some(r) = case248_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 66)\n");
+        let case248_ok = case248_result == Some(66);
+        write_check(b"case248_incdec_expr_returns_66=", case248_ok);
+
+        w(b"\n");
+
+        // CASE 249: postfix decrement: x = i-- -> old value. Hand-computed: 54.
+        const SRC249: &[u8] = b"int main() { int i; i = 5; int x; x = i--; return x * 10 + i; }";
+        let case249_result = compile_and_run_program_callable(SRC249.as_ptr() as u64, SRC249.len() as u64);
+        w(b"  case249 (postfix decrement: x = i-- -> old value, in-process) returned=");
+        if let Some(r) = case249_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 54)\n");
+        let case249_ok = case249_result == Some(54);
+        write_check(b"case249_incdec_expr_returns_54=", case249_ok);
+
+        w(b"\n");
+
+        // CASE 250: prefix decrement: x = --i -> new value. Hand-computed: 44.
+        const SRC250: &[u8] = b"int main() { int i; i = 5; int x; x = --i; return x * 10 + i; }";
+        let case250_result = compile_and_run_program_callable(SRC250.as_ptr() as u64, SRC250.len() as u64);
+        w(b"  case250 (prefix decrement: x = --i -> new value, in-process) returned=");
+        if let Some(r) = case250_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 44)\n");
+        let case250_ok = case250_result == Some(44);
+        write_check(b"case250_incdec_expr_returns_44=", case250_ok);
+
+        w(b"\n");
+
+        // CASE 251: arr[i++] as an index expression (two sequential reads). Hand-computed: 302.
+        const SRC251: &[u8] = b"int main() { int a[3]; a[0] = 10; a[1] = 20; a[2] = 30; int i; i = 0; int y; y = a[i++]; y = y + a[i++]; return y * 10 + i; }";
+        let case251_result = compile_and_run_program_callable(SRC251.as_ptr() as u64, SRC251.len() as u64);
+        w(b"  case251 (arr[i++] as an index expression (two sequential reads), in-process) returned=");
+        if let Some(r) = case251_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 302)\n");
+        let case251_ok = case251_result == Some(302);
+        write_check(b"case251_incdec_expr_returns_302=", case251_ok);
+
+        w(b"\n");
+
+        // CASE 252: while (i++ < 5): condition side effect. Hand-computed: 56.
+        const SRC252: &[u8] = b"int main() { int n; n = 0; int i; i = 0; while (i++ < 5) { n = n + 1; } return n * 10 + i; }";
+        let case252_result = compile_and_run_program_callable(SRC252.as_ptr() as u64, SRC252.len() as u64);
+        w(b"  case252 (while (i++ < 5): condition side effect, in-process) returned=");
+        if let Some(r) = case252_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 56)\n");
+        let case252_ok = case252_result == Some(56);
+        write_check(b"case252_incdec_expr_returns_56=", case252_ok);
+
+        w(b"\n");
+
+        // CASE 253: *p++ over an int pointer: reads x (222), then p steps +8 to the previously declared y (111) -- this compiler's documented downward convention, so `p + 1` is NOT the next array element. Hand-computed: 222 * 1000 + 111 = 222111.
+        const SRC253: &[u8] = b"int main() { int y; int x; y = 111; x = 222; int *p; p = &x; int r; r = *p++; r = r * 1000 + *p; return r; }";
+        let case253_result = compile_and_run_program_callable(SRC253.as_ptr() as u64, SRC253.len() as u64);
+        w(b"  case253 (*p++ over an int pointer: reads x (222), then p steps +8 to the previously declared y (111) -- this compiler's documented downward convention, so `p + 1` is NOT the next array element, in-process) returned=");
+        if let Some(r) = case253_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 222111)\n");
+        let case253_ok = case253_result == Some(222111);
+        write_check(b"case253_incdec_expr_returns_222111=", case253_ok);
+
+        w(b"\n");
+
+        // CASE 254: *p++ over a char pointer derefs a BYTE (-56), not 8 bytes. Hand-computed: 1.
+        const SRC254: &[u8] = b"int main() { char c; c = 200; char *p = &c; return *p++ == -56; }";
+        let case254_result = compile_and_run_program_callable(SRC254.as_ptr() as u64, SRC254.len() as u64);
+        w(b"  case254 (*p++ over a char pointer derefs a BYTE (-56), not 8 bytes, in-process) returned=");
+        if let Some(r) = case254_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case254_ok = case254_result == Some(1);
+        write_check(b"case254_incdec_expr_returns_1=", case254_ok);
+
+        w(b"\n");
+
+        // CASE 255: postfix on a char variable: old value narrowed (c = 200 reads as -56). Hand-computed: 1.
+        const SRC255: &[u8] = b"int main() { char c; c = 200; int x; x = c++; return x == -56; }";
+        let case255_result = compile_and_run_program_callable(SRC255.as_ptr() as u64, SRC255.len() as u64);
+        w(b"  case255 (postfix on a char variable: old value narrowed (c = 200 reads as -56), in-process) returned=");
+        if let Some(r) = case255_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case255_ok = case255_result == Some(1);
+        write_check(b"case255_incdec_expr_returns_1=", case255_ok);
+
+        w(b"\n");
+
+        // CASE 256: REGRESSION: statement i++; still works. Hand-computed: 42.
+        const SRC256: &[u8] = b"int main() { int i; i = 41; i++; return i; }";
+        let case256_result = compile_and_run_program_callable(SRC256.as_ptr() as u64, SRC256.len() as u64);
+        w(b"  case256 (REGRESSION: statement i++; still works, in-process) returned=");
+        if let Some(r) = case256_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 42)\n");
+        let case256_ok = case256_result == Some(42);
+        write_check(b"case256_incdec_expr_returns_42=", case256_ok);
+
+        w(b"\n");
+
+        // CASE 257: REGRESSION: unary minus on a decremented-looking pair `- -x` still parses. Hand-computed: 7.
+        const SRC257: &[u8] = b"int main() { int x; x = 7; return - -x; }";
+        let case257_result = compile_and_run_program_callable(SRC257.as_ptr() as u64, SRC257.len() as u64);
+        w(b"  case257 (REGRESSION: unary minus on a decremented-looking pair `- -x` still parses, in-process) returned=");
+        if let Some(r) = case257_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 7)\n");
+        let case257_ok = case257_result == Some(7);
+        write_check(b"case257_incdec_expr_returns_7=", case257_ok);
+
+        w(b"\n");
+
+        let overall_m159 = case247_ok && case248_ok && case249_ok && case250_ok && case251_ok && case252_ok && case253_ok && case254_ok && case255_ok && case256_ok && case257_ok;
+        w(b"OVERALL_M159=");
+        w(if overall_m159 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 { 0 } else { 1 });
     }
 }
 

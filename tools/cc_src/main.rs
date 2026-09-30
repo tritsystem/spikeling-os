@@ -9945,6 +9945,14 @@ unsafe fn compile_program_standalone_elf(src_ptr: u64, src_len: u64) -> (u64, u6
 // divisors are `((x & 7) | 1)` (in 1,3,5,7 -- never 0 or -1), shift counts
 // are `(x & 7)`.
 //
+// MILESTONE 161 extension: beyond arithmetic, expressions now also contain
+// (a) calls to three fixed helper functions f1(x), f2(x,y), f3(x,y,z) with
+// arbitrary expression arguments (nested calls -> argument-register saves),
+// (b) reads of a 2-element array through a COMPUTED index `t[(e & 1)]`
+// (sized to fit MAX_VARS = 8 slots per function: a,b,c + t[2] + ch + p),
+// (c) a pointer dereference `*p` (p = &a), and (d) a `char` variable whose
+// stored value is narrowed on read (assigned 0..255, read back signed).
+//
 // Link-time constraint (same reason this file avoids runtime-indexed `[]`
 // everywhere): cc.elf must not reference core's precompiled panic/fmt
 // machinery -- its relocations don't reach from USER_CODE_ADDR. So: raw-
@@ -9960,6 +9968,8 @@ struct FuzzExpr {
 struct FuzzGen {
     rng: u64,
     vars: [i64; 3],
+    t: [i64; 2],
+    ch: i64, // the value a `char` read yields (already narrowed)
     minimal: bool,
 }
 
@@ -10009,10 +10019,19 @@ fn fz_push_child(e: &mut FuzzExpr, child: &FuzzExpr, wrap: bool) {
 
 fn fz_leaf(g: &mut FuzzGen) -> FuzzExpr {
     let mut e = fz_new();
-    let pick = g.rnd(6);
+    let pick = g.rnd(10);
     if pick < 3 {
         fz_push(&mut e, &[b'a' + pick as u8]);
         e.val = unsafe { *g.vars.as_ptr().add(pick as usize) };
+    } else if pick == 8 {
+        // `*p`, with p = &a
+        fz_push(&mut e, b"*p");
+        e.val = unsafe { *g.vars.as_ptr() };
+        e.level = 11;
+        return e;
+    } else if pick == 9 {
+        fz_push(&mut e, b"ch");
+        e.val = g.ch;
     } else {
         let n = g.rnd(31);
         if n >= 10 {
@@ -10060,7 +10079,7 @@ fn fz_gen(g: &mut FuzzGen, depth: u32) -> FuzzExpr {
     }
     let minimal = g.minimal;
     // 0..=2 unary, 3 ternary, else binary
-    let kind = g.rnd(20);
+    let kind = g.rnd(26);
     if kind < 3 {
         let child = fz_gen(g, depth - 1);
         let mut e = fz_new();
@@ -10098,6 +10117,48 @@ fn fz_gen(g: &mut FuzzGen, depth: u32) -> FuzzExpr {
         if !minimal {
             return fz_wrap_all(&e);
         }
+        return e;
+    }
+    if kind == 4 {
+        // array read through a computed index: t[(e & 1)]
+        let ix = fz_gen(g, depth - 1);
+        let mut e = fz_new();
+        fz_push(&mut e, b"t[(");
+        fz_push_child(&mut e, &ix, !minimal || ix.level <= 5);
+        fz_push(&mut e, b" & 1)]");
+        e.val = unsafe { *g.t.as_ptr().add((ix.val & 1) as usize) };
+        e.level = 12;
+        return e;
+    }
+    if kind >= 5 && kind <= 7 {
+        // helper calls: f1(x) / f2(x, y) / f3(x, y, z)
+        let n = (kind - 4) as usize; // 1, 2 or 3 arguments
+        let a0 = fz_gen(g, depth - 1);
+        let a1 = if n >= 2 { fz_gen(g, depth - 1) } else { fz_new() };
+        let a2 = if n >= 3 { fz_gen(g, depth - 1) } else { fz_new() };
+        if a0.len + a1.len + a2.len > 440 {
+            return a0;
+        }
+        let mut e = fz_new();
+        fz_push(&mut e, if n == 1 { b"f1(" } else if n == 2 { b"f2(" } else { b"f3(" });
+        fz_push(&mut e, fz_bytes(&a0));
+        if n >= 2 {
+            fz_push(&mut e, b", ");
+            fz_push(&mut e, fz_bytes(&a1));
+        }
+        if n >= 3 {
+            fz_push(&mut e, b", ");
+            fz_push(&mut e, fz_bytes(&a2));
+        }
+        fz_push(&mut e, b")");
+        e.val = if n == 1 {
+            a0.val.wrapping_add(1)
+        } else if n == 2 {
+            a0.val.wrapping_mul(3).wrapping_sub(a1.val)
+        } else {
+            (a0.val ^ a1.val).wrapping_add(a2.val.wrapping_mul(2))
+        };
+        e.level = 12;
         return e;
     }
     // binary
@@ -10183,7 +10244,97 @@ fn fz_gen(g: &mut FuzzGen, depth: u32) -> FuzzExpr {
     e
 }
 
-fn fz_put(prog: &mut [u8; 768], pl: &mut usize, s: &[u8]) {
+/// Append a decimal integer; a negative one as `-` + the magnitude literal
+/// (the unary minus is the compiler's own).
+fn fz_put_signed(prog: &mut [u8; 1024], pl: &mut usize, val: i64) {
+    let (neg, mag) = if val < 0 { (true, val.wrapping_neg() as u64) } else { (false, val as u64) };
+    if neg {
+        fz_put(prog, pl, b"-");
+    }
+    let mut digits = [0u8; 20];
+    let mut nd = 0usize;
+    let mut m = mag;
+    if m == 0 {
+        digits[0] = b'0';
+        nd = 1;
+    }
+    while m > 0 {
+        unsafe { *digits.as_mut_ptr().add(nd) = b'0' + (m % 10) as u8 };
+        nd += 1;
+        m /= 10;
+    }
+    let mut k = nd;
+    while k > 0 {
+        k -= 1;
+        let d = unsafe { *digits.as_ptr().add(k) };
+        fz_put(prog, pl, &[d]);
+    }
+}
+
+/// Estimate how many tokens the compiler's lexer will produce for `s`
+/// (identifier/number runs count once, the two-character operators count
+/// once, every other non-space byte counts once).
+fn fz_token_count(s: &[u8]) -> usize {
+    let mut i = 0usize;
+    let mut n = 0usize;
+    while i < s.len() {
+        let c = unsafe { *s.as_ptr().add(i) };
+        if c == b' ' {
+            i += 1;
+            continue;
+        }
+        if (c >= b'0' && c <= b'9') || (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_' {
+            while i < s.len() {
+                let d = unsafe { *s.as_ptr().add(i) };
+                if (d >= b'0' && d <= b'9') || (d >= b'a' && d <= b'z') || (d >= b'A' && d <= b'Z') || d == b'_' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            n += 1;
+            continue;
+        }
+        if i + 1 < s.len() {
+            let d = unsafe { *s.as_ptr().add(i + 1) };
+            let two = (c == b'<' && (d == b'<' || d == b'='))
+                || (c == b'>' && (d == b'>' || d == b'='))
+                || (c == b'=' && d == b'=')
+                || (c == b'!' && d == b'=')
+                || (c == b'&' && d == b'&')
+                || (c == b'|' && d == b'|');
+            if two {
+                i += 2;
+                n += 1;
+                continue;
+            }
+        }
+        i += 1;
+        n += 1;
+    }
+    n
+}
+
+/// Does `hay` contain `needle`? (naive, unchecked -- see the link-time note)
+fn fz_has(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > hay.len() {
+        return false;
+    }
+    let mut i = 0usize;
+    while i + needle.len() <= hay.len() {
+        let mut j = 0usize;
+        while j < needle.len() && unsafe { *hay.as_ptr().add(i + j) == *needle.as_ptr().add(j) } {
+            j += 1;
+        }
+        if j == needle.len() {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn fz_put(prog: &mut [u8; 1024], pl: &mut usize, s: &[u8]) {
     let mut i = 0;
     while i < s.len() {
         unsafe { *prog.as_mut_ptr().add(*pl) = *s.as_ptr().add(i) };
@@ -10192,16 +10343,22 @@ fn fz_put(prog: &mut [u8; 768], pl: &mut usize, s: &[u8]) {
     }
 }
 
-unsafe fn fuzz_expr_differential() -> (u32, [u32; 4]) {
+unsafe fn fuzz_expr_differential() -> (u32, [u32; 4], u32, [u32; 5]) {
     // (cases run, [mismatch_small, mismatch_large, compile_fail_small, compile_fail_large])
     // "large" = some variable held a constant needing more than 32 bits.
     const CASES_PER_MODE: u32 = 400;
     let mut ran = 0u32;
     let mut counts = [0u32; 4];
     let mut rep = [0u32; 4];
+    let mut skipped = 0u32;
+    // coverage: programs whose expression contains a call / a nested call / an array read / *p / ch
+    let mut cov = [0u32; 5];
     for mode in 0..2u32 {
-        let mut g = FuzzGen { rng: 0x9E37_79B9_7F4A_7C15 ^ ((mode as u64 + 1).wrapping_mul(0x1234_5678_9ABC_DEF1)), vars: [0; 3], minimal: mode == 1 };
-        for _case in 0..CASES_PER_MODE {
+        let mut g = FuzzGen { rng: 0x9E37_79B9_7F4A_7C15 ^ ((mode as u64 + 1).wrapping_mul(0x1234_5678_9ABC_DEF1)), vars: [0; 3], t: [0; 2], ch: 0, minimal: mode == 1 };
+        let mut produced = 0u32;
+        let mut attempts = 0u32;
+        while produced < CASES_PER_MODE && attempts < CASES_PER_MODE * 8 {
+            attempts += 1;
             // variables: mostly small signed, occasionally large (exercises wraparound)
             let mut large = false;
             for v in 0..3usize {
@@ -10218,44 +10375,61 @@ unsafe fn fuzz_expr_differential() -> (u32, [u32; 4]) {
                 };
                 unsafe { *g.vars.as_mut_ptr().add(v) = val };
             }
+            for i in 0..2usize {
+                let tv = g.rnd(41) as i64 - 20;
+                unsafe { *g.t.as_mut_ptr().add(i) = tv };
+            }
+            let ch_raw = g.rnd(256) as i64; // assigned as 0..255 ...
+            g.ch = (ch_raw as u8) as i8 as i64; // ... and read back sign-extended
             let e = fz_gen(&mut g, 4);
-            // int main() { int a; int b; int c; a = A; b = B; c = C; return <expr>; }
-            let mut prog = [0u8; 768];
+            // f1/f2/f3 helpers, then:
+            // int main() { int a; int b; int c; int t[2]; char ch; int *p; a = A; ...; t[i] = T; ch = K; p = &a; return <expr>; }
+            let mut prog = [0u8; 1024];
             let mut pl = 0usize;
-            fz_put(&mut prog, &mut pl, b"int main() { int a; int b; int c; ");
+            fz_put(&mut prog, &mut pl, b"int f1(int x) { return x + 1; } int f2(int x, int y) { return x * 3 - y; } int f3(int x, int y, int z) { return (x ^ y) + z * 2; } ");
+            fz_put(&mut prog, &mut pl, b"int main() { int a; int b; int c; int t[2]; char ch; int *p; ");
             for v in 0..3usize {
                 fz_put(&mut prog, &mut pl, &[b'a' + v as u8]);
                 fz_put(&mut prog, &mut pl, b" = ");
-                let val = unsafe { *g.vars.as_ptr().add(v) };
-                let (neg, mag) = if val < 0 { (true, val.wrapping_neg() as u64) } else { (false, val as u64) };
-                if neg {
-                    fz_put(&mut prog, &mut pl, b"-");
-                }
-                let mut digits = [0u8; 20];
-                let mut nd = 0usize;
-                let mut m = mag;
-                if m == 0 {
-                    digits[0] = b'0';
-                    nd = 1;
-                }
-                while m > 0 {
-                    unsafe { *digits.as_mut_ptr().add(nd) = b'0' + (m % 10) as u8 };
-                    nd += 1;
-                    m /= 10;
-                }
-                let mut k = nd;
-                while k > 0 {
-                    k -= 1;
-                    let d = unsafe { *digits.as_ptr().add(k) };
-                    fz_put(&mut prog, &mut pl, &[d]);
-                }
+                fz_put_signed(&mut prog, &mut pl, unsafe { *g.vars.as_ptr().add(v) });
                 fz_put(&mut prog, &mut pl, b"; ");
             }
-            fz_put(&mut prog, &mut pl, b"return ");
+            for i in 0..2usize {
+                fz_put(&mut prog, &mut pl, b"t[");
+                fz_put(&mut prog, &mut pl, &[b'0' + i as u8]);
+                fz_put(&mut prog, &mut pl, b"] = ");
+                fz_put_signed(&mut prog, &mut pl, unsafe { *g.t.as_ptr().add(i) });
+                fz_put(&mut prog, &mut pl, b"; ");
+            }
+            fz_put(&mut prog, &mut pl, b"ch = ");
+            fz_put_signed(&mut prog, &mut pl, ch_raw);
+            fz_put(&mut prog, &mut pl, b"; p = &a; return ");
             fz_put(&mut prog, &mut pl, fz_bytes(&e));
             fz_put(&mut prog, &mut pl, b"; }");
 
+            if fz_token_count(unsafe { core::slice::from_raw_parts(prog.as_ptr(), pl) }) > 250 {
+                skipped += 1;
+                continue;
+            }
+            produced += 1;
             ran += 1;
+            {
+                let et = fz_bytes(&e);
+                let hits = [
+                    fz_has(et, b"f1(") || fz_has(et, b"f2(") || fz_has(et, b"f3("),
+                    fz_has(et, b"f2(f") || fz_has(et, b"f3(f") || fz_has(et, b"f1(f") || fz_has(et, b", f"),
+                    fz_has(et, b"t[("),
+                    fz_has(et, b"*p"),
+                    fz_has(et, b"ch"),
+                ];
+                let mut ci = 0usize;
+                while ci < 5 {
+                    if unsafe { *hits.as_ptr().add(ci) } {
+                        unsafe { *cov.as_mut_ptr().add(ci) += 1 };
+                    }
+                    ci += 1;
+                }
+            }
             let got = unsafe { compile_and_run_program_callable(prog.as_ptr() as u64, pl as u64) };
             let want = e.val as u64;
             if got != Some(want) {
@@ -10291,7 +10465,7 @@ unsafe fn fuzz_expr_differential() -> (u32, [u32; 4]) {
             }
         }
     }
-    (ran, counts)
+    (ran, counts, skipped, cov)
 }
 #[unsafe(link_section = ".text.start")]
 #[unsafe(no_mangle)]
@@ -17907,7 +18081,7 @@ pub extern "C" fn _start() -> ! {
         w(b"\n");
 
         // MILESTONE 160: differential expression fuzz against a Rust reference evaluator.
-        let (fuzz_ran, fuzz_counts) = unsafe { fuzz_expr_differential() };
+        let (fuzz_ran, fuzz_counts, fuzz_skipped, fuzz_cov) = unsafe { fuzz_expr_differential() };
         let fc = |i: usize| unsafe { *fuzz_counts.as_ptr().add(i) } as u64;
         w(b"milestone 160: expression fuzz -- cases=");
         write_u64_dec(fuzz_ran as u64);
@@ -17919,6 +18093,18 @@ pub extern "C" fn _start() -> ! {
         write_u64_dec(fc(2));
         w(b" compile_failures(large)=");
         write_u64_dec(fc(3));
+        w(b" skipped_over_token_limit=");
+        write_u64_dec(fuzz_skipped as u64);
+        w(b" | coverage (programs containing): calls=");
+        write_u64_dec(unsafe { *fuzz_cov.as_ptr() } as u64);
+        w(b" nested-calls=");
+        write_u64_dec(unsafe { *fuzz_cov.as_ptr().add(1) } as u64);
+        w(b" array-reads=");
+        write_u64_dec(unsafe { *fuzz_cov.as_ptr().add(2) } as u64);
+        w(b" deref=");
+        write_u64_dec(unsafe { *fuzz_cov.as_ptr().add(3) } as u64);
+        w(b" char=");
+        write_u64_dec(unsafe { *fuzz_cov.as_ptr().add(4) } as u64);
         w(b"\n");
         let overall_m160 = fuzz_ran > 0 && fc(0) == 0 && fc(1) == 0 && fc(2) == 0 && fc(3) == 0 && case258_ok && case259_ok && case260_ok && case261_ok && case262_ok && case263_ok;
         w(b"OVERALL_M160=");

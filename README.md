@@ -2596,6 +2596,32 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       `OVERALL` markers PASS in each, P1-P4 PASS, zero panics or faults.
       Mean cycles per logical ATA read fell from ~590k (M154) to ~140-165k.
 
+- [x] **Milestone 156**: root cause and fix of the long-disclosed "reused
+      boot has ~54 fs self-test FAILs" artifact (recorded on every reused
+      boot since Milestone 70 and repeated in this file as a known
+      pre-existing quirk). **Diagnosis** (decoded the persisted disk's root
+      directory sector directly): the 8-entry root directory is completely
+      full at the end of every boot -- `selftestwrite`, `altentry`,
+      `stdiotest_a`, `stdiotest_b`, `mmapf`, `argvtarget`, `ccout1`,
+      `ccout2` -- scratch files the boot self-tests create and never
+      remove. On a reused disk every self-test needing a NEW root entry
+      (`permtestdir`, `symtestdir`, M155's benchmark dir) hits "directory
+      full". Measured before: fresh boot 0 FAIL / 82 PASS `fs self-test`
+      lines, reused boot 54 FAIL / 21 PASS. **Fix**: `fs::
+      reap_selftest_artifacts()` deletes exactly those eight reserved
+      names before the fs self-tests run (a user file with one of those
+      names would be removed -- documented). **Pre-registered prediction,
+      met exactly**: a reused boot now matches a fresh one -- 0 FAIL / 82
+      PASS -- and M155's P1 no longer skips there. Measured: reused boot
+      reaped 8, 0 FAIL / 82 PASS, P1 `fixtures_available=true`, P1-P4
+      PASS; fresh boot reaped 0, 0 FAIL / 82 PASS. Both boots: 73
+      aggregate `OVERALL` markers PASS, zero panics or faults
+      (`m156_fresh_boot.log`/`m156_reused_boot.log`). **Honest note**:
+      this changes what a reused boot exercises -- it no longer proves
+      that those scratch files persist across a reboot (they were only
+      ever overwritten, never read back across boots); persistence of the
+      real data (network weights, the M11 persistence test) is unaffected.
+
 ## Building and running
 
 Requires:

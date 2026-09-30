@@ -1015,6 +1015,40 @@ fn read_file_disk(path: &str) -> Result<Vec<u8>, String> {
     Ok(data)
 }
 
+/// MILESTONE 156: the root directory holds at most `MAX_ENTRIES` (8) entries,
+/// and by the end of every boot the boot self-tests have left ALL EIGHT
+/// filled with their own scratch files (the ones below). On a fresh disk the
+/// fs self-tests run first and are unaffected; on a REUSED disk the root is
+/// already full, so every self-test that needs a new root entry
+/// (`permtestdir`, `symtestdir`, the M155 benchmark's scratch dir) cannot
+/// create it -- the long-disclosed "reused boot has ~54 fs self-test FAILs"
+/// artifact (measured: 54 FAIL / 21 PASS reused vs 0 FAIL / 82 PASS fresh).
+/// This removes exactly those self-test scratch names before the fs
+/// self-tests run, so a reused boot starts from the same root as a fresh
+/// one. Only these reserved self-test names are touched; nothing else on the
+/// disk (a user file with one of these names WOULD be removed -- they are
+/// reserved for the self-tests). Returns how many existed and were removed.
+pub fn reap_selftest_artifacts() -> usize {
+    const NAMES: [&str; 8] = [
+        "selftestwrite",
+        "altentry",
+        "stdiotest_a",
+        "stdiotest_b",
+        "mmapf",
+        "argvtarget",
+        "ccout1",
+        "ccout2",
+    ];
+    let mut reaped = 0;
+    for name in NAMES {
+        if delete_file(name).is_ok() {
+            reaped += 1;
+        }
+    }
+    let _ = writeln!(serial(), "milestone 156: reaped {reaped} stale self-test artifact(s) from the root directory before the fs self-tests");
+    reaped
+}
+
 /// Real, boot-time, non-interactive proof that write_file()/read_file()
 /// actually reach the disk -- every prior "verified" disk write in this
 /// kernel's history relied on an interactive shell command (`write`,

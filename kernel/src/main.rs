@@ -446,6 +446,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // missing secondary-ATA-drive QEMU argument shows up in the serial
     // log immediately rather than only when someone remembers to test
     // it by hand.
+    // MILESTONE 156: start a reused disk's root directory from the same
+    // state a fresh disk has (see fs.rs::reap_selftest_artifacts()).
+    fs::reap_selftest_artifacts();
     fs::self_test_disk_write();
     // MILESTONE 66: real block-device abstraction -- proves the new
     // `ata::BlockDevice` trait genuinely routes `read_sector()`/

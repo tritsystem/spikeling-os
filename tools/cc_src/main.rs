@@ -7069,6 +7069,18 @@ impl CodeBuf {
         unsafe { self.push(0xB8) }; // mov eax, imm32 (zero-extends into rax)
         unsafe { self.push_bytes(&v.to_le_bytes()) };
     }
+    /// MILESTONE 160: `mov rax, imm64` -- the full-width literal load
+    /// `emit_mov_eax_imm32()` cannot express. Derived against the Intel SDM
+    /// (Vol. 2, MOV): `REX.W + B8+ rd io  MOV r64, imm64`. REX.W = 0100_1000
+    /// = 0x48 (64-bit operand size); the opcode is 0xB8 plus the register
+    /// number, and RAX is register 0, so 0xB8; `io` is the 8-byte
+    /// little-endian immediate. 10 bytes: 48 B8 <imm64>. (The 5-byte
+    /// `mov eax, imm32` form zero-extends a 32-bit value, so it was silently
+    /// keeping only the LOW 32 bits of any literal >= 2^32.)
+    unsafe fn emit_mov_rax_imm64(&mut self, v: u64) {
+        unsafe { self.push_bytes(&[0x48, 0xB8]) };
+        unsafe { self.push_bytes(&v.to_le_bytes()) };
+    }
     unsafe fn emit_mov_rax_rbp_off(&mut self, off: i32) {
         unsafe { self.push_bytes(&[0x48, 0x8B, 0x45, off as i8 as u8]) }; // mov rax, [rbp+disp8]
     }
@@ -7763,7 +7775,17 @@ unsafe fn emit_epilogue(buf: &mut CodeBuf, mode: CodegenMode) {
 unsafe fn gen_expr(buf: &mut CodeBuf, src_ptr: u64, vars_ptr: u64, nvars: u64, funcs_ptr: u64, nfuncs: u64, pending_ptr: u64, pending_count_ptr: u64, node: u64) -> Result<(), CodeGenError> {
     let e = unsafe { core::ptr::read(node as *const ExprNode) };
     match e.kind {
-        EXPR_INTLIT => unsafe { buf.emit_mov_eax_imm32(e.int_val as u32) },
+        // MILESTONE 160: a literal above u32::MAX needs the 64-bit form; the
+        // 32-bit `mov eax, imm32` used to silently truncate it to its low
+        // 32 bits (found by the M160 expression fuzz: `a = 1099511627776;
+        // return a;` returned 0). Literals up to u32::MAX are unchanged.
+        EXPR_INTLIT => {
+            if e.int_val > 0xFFFF_FFFF {
+                unsafe { buf.emit_mov_rax_imm64(e.int_val) };
+            } else {
+                unsafe { buf.emit_mov_eax_imm32(e.int_val as u32) };
+            }
+        }
         EXPR_IDENT => {
             let slot = unsafe { find_var(src_ptr, vars_ptr, nvars, e.ident_off as u64, e.ident_len as u64) };
             match slot {
@@ -9910,6 +9932,367 @@ unsafe fn compile_program_standalone_elf(src_ptr: u64, src_len: u64) -> (u64, u6
 // process, against this file's own real lex()/parse_function().
 // =======================================================================
 
+// MILESTONE 160: differential fuzzing of the subset-C compiler's expression
+// grammar. A seeded generator builds a random expression over three
+// variables while a Rust reference evaluator computes its value with the
+// semantics this compiler documents (64-bit two's-complement `int`,
+// truncating `/` and `%`, arithmetic `>>`, 0/1 comparisons, short-circuit
+// `&&`/`||`); the expression is then compiled and run by the REAL in-kernel
+// compiler and the two values compared. Two text modes: FULLY parenthesized
+// (tests codegen) and MINIMAL-parentheses per C's precedence/associativity
+// table (also tests the parser: left-associativity, precedence ladder, the
+// right-associative `?:`). Undefined behaviour is avoided by construction:
+// divisors are `((x & 7) | 1)` (in 1,3,5,7 -- never 0 or -1), shift counts
+// are `(x & 7)`.
+//
+// Link-time constraint (same reason this file avoids runtime-indexed `[]`
+// everywhere): cc.elf must not reference core's precompiled panic/fmt
+// machinery -- its relocations don't reach from USER_CODE_ADDR. So: raw-
+// pointer byte access (no bounds checks), multiply-shift range reduction
+// instead of a variable `%`, and division only by the constants 1/3/5/7.
+struct FuzzExpr {
+    text: [u8; 512],
+    len: usize,
+    level: u8, // C precedence: ?:=0 ||=1 &&=2 |=3 ^=4 &=5 ==,!=6 relational=7 shift=8 add=9 mul=10 unary=11 leaf/paren=12
+    val: i64,
+}
+
+struct FuzzGen {
+    rng: u64,
+    vars: [i64; 3],
+    minimal: bool,
+}
+
+impl FuzzGen {
+    /// Uniform-enough value in 0..n without a variable division.
+    fn rnd(&mut self, n: u64) -> u64 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng = x;
+        ((x >> 32) * n) >> 32
+    }
+}
+
+fn fz_new() -> FuzzExpr {
+    FuzzExpr { text: [0u8; 512], len: 0, level: 12, val: 0 }
+}
+
+fn fz_bytes(e: &FuzzExpr) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(e.text.as_ptr(), e.len) }
+}
+
+fn fz_first(e: &FuzzExpr) -> u8 {
+    e.text[0]
+}
+
+fn fz_push(e: &mut FuzzExpr, s: &[u8]) {
+    let mut i = 0;
+    while i < s.len() {
+        unsafe { *e.text.as_mut_ptr().add(e.len) = *s.as_ptr().add(i) };
+        e.len += 1;
+        i += 1;
+    }
+}
+
+/// Append `child`, wrapped in parentheses when `wrap` is true.
+fn fz_push_child(e: &mut FuzzExpr, child: &FuzzExpr, wrap: bool) {
+    if wrap {
+        fz_push(e, b"(");
+    }
+    fz_push(e, fz_bytes(child));
+    if wrap {
+        fz_push(e, b")");
+    }
+}
+
+fn fz_leaf(g: &mut FuzzGen) -> FuzzExpr {
+    let mut e = fz_new();
+    let pick = g.rnd(6);
+    if pick < 3 {
+        fz_push(&mut e, &[b'a' + pick as u8]);
+        e.val = unsafe { *g.vars.as_ptr().add(pick as usize) };
+    } else {
+        let n = g.rnd(31);
+        if n >= 10 {
+            fz_push(&mut e, &[b'0' + (n / 10) as u8]);
+        }
+        fz_push(&mut e, &[b'0' + (n % 10) as u8]);
+        e.val = n as i64;
+    }
+    e.level = 12;
+    e
+}
+
+fn fz_wrap_all(e: &FuzzExpr) -> FuzzExpr {
+    let mut w = fz_new();
+    fz_push(&mut w, b"(");
+    fz_push(&mut w, fz_bytes(e));
+    fz_push(&mut w, b")");
+    w.level = 12;
+    w.val = e.val;
+    w
+}
+
+/// Truncating division/remainder by a divisor known to be 1, 3, 5 or 7.
+fn fz_div(l: i64, d: i64) -> i64 {
+    match d {
+        3 => l.wrapping_div(3),
+        5 => l.wrapping_div(5),
+        7 => l.wrapping_div(7),
+        _ => l,
+    }
+}
+
+fn fz_rem(l: i64, d: i64) -> i64 {
+    match d {
+        3 => l.wrapping_rem(3),
+        5 => l.wrapping_rem(5),
+        7 => l.wrapping_rem(7),
+        _ => 0,
+    }
+}
+
+fn fz_gen(g: &mut FuzzGen, depth: u32) -> FuzzExpr {
+    if depth == 0 || g.rnd(100) < 22 {
+        return fz_leaf(g);
+    }
+    let minimal = g.minimal;
+    // 0..=2 unary, 3 ternary, else binary
+    let kind = g.rnd(20);
+    if kind < 3 {
+        let child = fz_gen(g, depth - 1);
+        let mut e = fz_new();
+        let (op, val): (&[u8], i64) = match kind {
+            0 => (b"-", child.val.wrapping_neg()),
+            1 => (b"~", !child.val),
+            _ => (b"!", (child.val == 0) as i64),
+        };
+        // a sign-leading operand would print `--x` / `-+x`; always parenthesize those
+        let first = fz_first(&child);
+        let starts_sign = first == b'-' || first == b'+';
+        let wrap = !minimal || child.level < 11 || starts_sign;
+        fz_push(&mut e, op);
+        fz_push_child(&mut e, &child, wrap);
+        e.level = 11;
+        e.val = val;
+        return e;
+    }
+    if kind == 3 {
+        let c = fz_gen(g, depth - 1);
+        let t = fz_gen(g, depth - 1);
+        let f = fz_gen(g, depth - 1);
+        if c.len + t.len + f.len > 470 {
+            return c;
+        }
+        let mut e = fz_new();
+        fz_push_child(&mut e, &c, !minimal || c.level <= 0);
+        fz_push(&mut e, b" ? ");
+        fz_push_child(&mut e, &t, !minimal || t.level <= 0);
+        fz_push(&mut e, b" : ");
+        // the else arm is right-associative: an unparenthesized nested ?: is legal C
+        fz_push_child(&mut e, &f, !minimal);
+        e.level = 0;
+        e.val = if c.val != 0 { t.val } else { f.val };
+        if !minimal {
+            return fz_wrap_all(&e);
+        }
+        return e;
+    }
+    // binary
+    let l = fz_gen(g, depth - 1);
+    let r = fz_gen(g, depth - 1);
+    if l.len + r.len > 440 {
+        return l;
+    }
+    let idx = g.rnd(19);
+    let (op, level): (&[u8], u8) = match idx {
+        0 => (b"+", 9),
+        1 => (b"-", 9),
+        2 => (b"*", 10),
+        3 => (b"/", 10),
+        4 => (b"%", 10),
+        5 => (b"&", 5),
+        6 => (b"|", 3),
+        7 => (b"^", 4),
+        8 => (b"<<", 8),
+        9 => (b">>", 8),
+        10 => (b"<", 7),
+        11 => (b"<=", 7),
+        12 => (b">", 7),
+        13 => (b">=", 7),
+        14 => (b"==", 6),
+        15 => (b"!=", 6),
+        16 => (b"&&", 2),
+        17 => (b"||", 1),
+        _ => (b"+", 9),
+    };
+    let mut e = fz_new();
+    // This compiler's grammar is `cond_expr := shift_expr (relop shift_expr)?` --
+    // ONE non-chaining comparison level covering both relational and equality
+    // operators (documented: "no comparison chaining"). So a comparison operand
+    // that is itself a comparison must be parenthesized; `a < b < c` is a
+    // compile error here by design, not a miscompile.
+    let cmp_level = level == 6 || level == 7;
+    fz_push_child(&mut e, &l, !minimal || l.level < level || (cmp_level && (l.level == 6 || l.level == 7)));
+    fz_push(&mut e, b" ");
+    fz_push(&mut e, op);
+    fz_push(&mut e, b" ");
+    let rv: i64 = if idx == 3 || idx == 4 {
+        // divisor: ((r & 7) | 1)
+        fz_push(&mut e, b"((");
+        fz_push_child(&mut e, &r, !minimal || r.level <= 5);
+        fz_push(&mut e, b" & 7) | 1)");
+        (r.val & 7) | 1
+    } else if idx == 8 || idx == 9 {
+        // shift count: (r & 7)
+        fz_push(&mut e, b"(");
+        fz_push_child(&mut e, &r, !minimal || r.level <= 5);
+        fz_push(&mut e, b" & 7)");
+        r.val & 7
+    } else {
+        fz_push_child(&mut e, &r, !minimal || r.level <= level || (cmp_level && (r.level == 6 || r.level == 7)));
+        r.val
+    };
+    e.val = match idx {
+        0 => l.val.wrapping_add(rv),
+        1 => l.val.wrapping_sub(rv),
+        2 => l.val.wrapping_mul(rv),
+        3 => fz_div(l.val, rv),
+        4 => fz_rem(l.val, rv),
+        5 => l.val & rv,
+        6 => l.val | rv,
+        7 => l.val ^ rv,
+        8 => l.val.wrapping_shl(rv as u32),
+        9 => l.val.wrapping_shr(rv as u32),
+        10 => (l.val < rv) as i64,
+        11 => (l.val <= rv) as i64,
+        12 => (l.val > rv) as i64,
+        13 => (l.val >= rv) as i64,
+        14 => (l.val == rv) as i64,
+        15 => (l.val != rv) as i64,
+        16 => (l.val != 0 && rv != 0) as i64,
+        17 => (l.val != 0 || rv != 0) as i64,
+        _ => l.val.wrapping_add(rv),
+    };
+    e.level = level;
+    if !minimal {
+        return fz_wrap_all(&e);
+    }
+    e
+}
+
+fn fz_put(prog: &mut [u8; 768], pl: &mut usize, s: &[u8]) {
+    let mut i = 0;
+    while i < s.len() {
+        unsafe { *prog.as_mut_ptr().add(*pl) = *s.as_ptr().add(i) };
+        *pl += 1;
+        i += 1;
+    }
+}
+
+unsafe fn fuzz_expr_differential() -> (u32, [u32; 4]) {
+    // (cases run, [mismatch_small, mismatch_large, compile_fail_small, compile_fail_large])
+    // "large" = some variable held a constant needing more than 32 bits.
+    const CASES_PER_MODE: u32 = 400;
+    let mut ran = 0u32;
+    let mut counts = [0u32; 4];
+    let mut rep = [0u32; 4];
+    for mode in 0..2u32 {
+        let mut g = FuzzGen { rng: 0x9E37_79B9_7F4A_7C15 ^ ((mode as u64 + 1).wrapping_mul(0x1234_5678_9ABC_DEF1)), vars: [0; 3], minimal: mode == 1 };
+        for _case in 0..CASES_PER_MODE {
+            // variables: mostly small signed, occasionally large (exercises wraparound)
+            let mut large = false;
+            for v in 0..3usize {
+                let val = match g.rnd(8) {
+                    0 => {
+                        large = true;
+                        1i64 << 40
+                    }
+                    1 => {
+                        large = true;
+                        -(1i64 << 33)
+                    }
+                    _ => g.rnd(101) as i64 - 50,
+                };
+                unsafe { *g.vars.as_mut_ptr().add(v) = val };
+            }
+            let e = fz_gen(&mut g, 4);
+            // int main() { int a; int b; int c; a = A; b = B; c = C; return <expr>; }
+            let mut prog = [0u8; 768];
+            let mut pl = 0usize;
+            fz_put(&mut prog, &mut pl, b"int main() { int a; int b; int c; ");
+            for v in 0..3usize {
+                fz_put(&mut prog, &mut pl, &[b'a' + v as u8]);
+                fz_put(&mut prog, &mut pl, b" = ");
+                let val = unsafe { *g.vars.as_ptr().add(v) };
+                let (neg, mag) = if val < 0 { (true, val.wrapping_neg() as u64) } else { (false, val as u64) };
+                if neg {
+                    fz_put(&mut prog, &mut pl, b"-");
+                }
+                let mut digits = [0u8; 20];
+                let mut nd = 0usize;
+                let mut m = mag;
+                if m == 0 {
+                    digits[0] = b'0';
+                    nd = 1;
+                }
+                while m > 0 {
+                    unsafe { *digits.as_mut_ptr().add(nd) = b'0' + (m % 10) as u8 };
+                    nd += 1;
+                    m /= 10;
+                }
+                let mut k = nd;
+                while k > 0 {
+                    k -= 1;
+                    let d = unsafe { *digits.as_ptr().add(k) };
+                    fz_put(&mut prog, &mut pl, &[d]);
+                }
+                fz_put(&mut prog, &mut pl, b"; ");
+            }
+            fz_put(&mut prog, &mut pl, b"return ");
+            fz_put(&mut prog, &mut pl, fz_bytes(&e));
+            fz_put(&mut prog, &mut pl, b"; }");
+
+            ran += 1;
+            let got = unsafe { compile_and_run_program_callable(prog.as_ptr() as u64, pl as u64) };
+            let want = e.val as u64;
+            if got != Some(want) {
+                let cat = (if got.is_none() { 2 } else { 0 }) + (if large { 1 } else { 0 });
+                unsafe { *counts.as_mut_ptr().add(cat) += 1 };
+                let cap = if cat == 1 || cat == 3 { 2 } else { 5 };
+                let already = unsafe { *rep.as_ptr().add(cat) };
+                if already < cap {
+                    unsafe { *rep.as_mut_ptr().add(cat) += 1 };
+                    unsafe {
+                        w(b"  fuzz ");
+                        w(match cat {
+                            0 => b"MISMATCH(small) " as &[u8],
+                            1 => b"MISMATCH(large) ",
+                            2 => b"COMPILE-FAIL(small) ",
+                            _ => b"COMPILE-FAIL(large) ",
+                        });
+                        w(b"mode ");
+                        write_u64_dec(mode as u64);
+                        w(b": ");
+                        w(core::slice::from_raw_parts(prog.as_ptr(), pl));
+                        w(b"  got=");
+                        match got {
+                            Some(r) => write_u64_dec(r),
+                            None => w(b"(compile failed)"),
+                        }
+                        w(b" want=");
+                        write_u64_dec(want);
+                        w(b"
+");
+                    }
+                }
+            }
+        }
+    }
+    (ran, counts)
+}
 #[unsafe(link_section = ".text.start")]
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -17433,7 +17816,116 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m159 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 { 0 } else { 1 });
+        // CASE 258: literal 2^32 (needs 33 bits) survives. Hand-computed: 4294967296.
+        const SRC258: &[u8] = b"int main() { return 4294967296; }";
+        let case258_result = compile_and_run_program_callable(SRC258.as_ptr() as u64, SRC258.len() as u64);
+        w(b"  case258 (literal 2^32 (needs 33 bits) survives, in-process) returned=");
+        if let Some(r) = case258_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4294967296)\n");
+        let case258_ok = case258_result == Some(4294967296);
+        write_check(b"case258_wide_literal_returns_4294967296=", case258_ok);
+
+        w(b"\n");
+
+        // CASE 259: literal u32::MAX stays positive (boundary of the 32-bit form). Hand-computed: 4294967295.
+        const SRC259: &[u8] = b"int main() { return 4294967295; }";
+        let case259_result = compile_and_run_program_callable(SRC259.as_ptr() as u64, SRC259.len() as u64);
+        w(b"  case259 (literal u32::MAX stays positive (boundary of the 32-bit form), in-process) returned=");
+        if let Some(r) = case259_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 4294967295)\n");
+        let case259_ok = case259_result == Some(4294967295);
+        write_check(b"case259_wide_literal_returns_4294967295=", case259_ok);
+
+        w(b"\n");
+
+        // CASE 260: large literal through a variable. Hand-computed: 8589934591.
+        const SRC260: &[u8] = b"int main() { int x; x = 8589934592; return x - 1; }";
+        let case260_result = compile_and_run_program_callable(SRC260.as_ptr() as u64, SRC260.len() as u64);
+        w(b"  case260 (large literal through a variable, in-process) returned=");
+        if let Some(r) = case260_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 8589934591)\n");
+        let case260_ok = case260_result == Some(8589934591);
+        write_check(b"case260_wide_literal_returns_8589934591=", case260_ok);
+
+        w(b"\n");
+
+        // CASE 261: negated large literal. Hand-computed: 1.
+        const SRC261: &[u8] = b"int main() { return -8589934592 + 8589934593; }";
+        let case261_result = compile_and_run_program_callable(SRC261.as_ptr() as u64, SRC261.len() as u64);
+        w(b"  case261 (negated large literal, in-process) returned=");
+        if let Some(r) = case261_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1)\n");
+        let case261_ok = case261_result == Some(1);
+        write_check(b"case261_wide_literal_returns_1=", case261_ok);
+
+        w(b"\n");
+
+        // CASE 262: i64::MAX literal. Hand-computed: 9223372036854775807.
+        const SRC262: &[u8] = b"int main() { return 9223372036854775807; }";
+        let case262_result = compile_and_run_program_callable(SRC262.as_ptr() as u64, SRC262.len() as u64);
+        w(b"  case262 (i64::MAX literal, in-process) returned=");
+        if let Some(r) = case262_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 9223372036854775807)\n");
+        let case262_ok = case262_result == Some(9223372036854775807);
+        write_check(b"case262_wide_literal_returns_9223372036854775807=", case262_ok);
+
+        w(b"\n");
+
+        // CASE 263: large literal in arithmetic. Hand-computed: 1073741824.
+        const SRC263: &[u8] = b"int main() { return 1099511627776 / 1024; }";
+        let case263_result = compile_and_run_program_callable(SRC263.as_ptr() as u64, SRC263.len() as u64);
+        w(b"  case263 (large literal in arithmetic, in-process) returned=");
+        if let Some(r) = case263_result {
+            write_u64_dec(r);
+        } else {
+            w(b"(compile failed)");
+        }
+        w(b" (expected 1073741824)\n");
+        let case263_ok = case263_result == Some(1073741824);
+        write_check(b"case263_wide_literal_returns_1073741824=", case263_ok);
+
+        w(b"\n");
+
+        // MILESTONE 160: differential expression fuzz against a Rust reference evaluator.
+        let (fuzz_ran, fuzz_counts) = unsafe { fuzz_expr_differential() };
+        let fc = |i: usize| unsafe { *fuzz_counts.as_ptr().add(i) } as u64;
+        w(b"milestone 160: expression fuzz -- cases=");
+        write_u64_dec(fuzz_ran as u64);
+        w(b" mismatches(small vars)=");
+        write_u64_dec(fc(0));
+        w(b" mismatches(large-constant vars)=");
+        write_u64_dec(fc(1));
+        w(b" compile_failures(small)=");
+        write_u64_dec(fc(2));
+        w(b" compile_failures(large)=");
+        write_u64_dec(fc(3));
+        w(b"\n");
+        let overall_m160 = fuzz_ran > 0 && fc(0) == 0 && fc(1) == 0 && fc(2) == 0 && fc(3) == 0 && case258_ok && case259_ok && case260_ok && case261_ok && case262_ok && case263_ok;
+        w(b"OVERALL_M160=");
+        w(if overall_m160 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 { 0 } else { 1 });
     }
 }
 

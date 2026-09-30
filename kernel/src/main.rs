@@ -25,6 +25,7 @@ mod hetero_ensemble;
 mod hetero_stdp;
 mod interrupts;
 mod keyboard;
+mod learner;
 mod loader;
 mod memory;
 mod mouse;
@@ -948,6 +949,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // MILESTONE 157: the O(1) frame cursor must yield the identical frame
     // sequence as the O(k) walk it replaced, and be far cheaper.
     memory::self_test_frame_cursor();
+    // MILESTONE 162: disk-read learner benchmark (observe/vary/select/remember, with
+    // fault injection and persistence). The learner itself ships OFF.
+    learner::self_test_learner();
 
     interrupts::init_pics();
     shell::init();

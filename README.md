@@ -2654,6 +2654,65 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       zero panics or faults. Pure conventional performance work -- no SNN
       angle, correctly.
 
+- [x] **Milestone 162**: an online, self-repairing disk-read learner
+      (`kernel/src/learner.rs`) built on observation + variation +
+      selection + memory + diversity, on top of M155's sector cache. **Off
+      by default** (`ENABLED`): nothing in the shipped kernel prefetches yet;
+      the benchmark enables it. **Mechanism**: six diverse predictors (SEQ,
+      STRIDE, MARKOV successor table, LAG(L) loops, LAGSTRIDE(L) for
+      interleaved sequential streams) are each scored on EVERY demand read
+      by exact-hit EMA; only predictors past a confidence bar may trigger an
+      idle-time prefetch; the mutable LAG/LAGSTRIDE slots are periodically
+      replaced by mutants (half local `L+/-1` around the best, half random);
+      a predictor that abstains decays; a corrupted predictor (even one
+      lying with score 1.0) is dethroned by its own scoring and re-initialised
+      once it collapses; a "do no harm" `evidence_gate` subscriber
+      (`PrefetchWaste`, the 5th) throttles prefetch when prefetched sectors
+      are evicted unused, except that a predictor with a proven score >= 0.8
+      is trusted through the throttle; the learned state is checksummed to 3
+      disk sectors and a corrupt record is refused. Prefetch is advisory: it
+      can waste work, never change what a read returns.
+      **Benchmark** (`learner::self_test_learner()`, every boot): critical-
+      path cycles (time inside demand reads; prefetch happens in idle time)
+      for A=no learner, B=conventional readahead(+1), C=learner without the
+      gate, D=learner with gate, on five workloads. Final numbers (M cycles,
+      QEMU timing varies ~5% run to run): W1 sequential A 80 / B 8 / C 21 /
+      D 16; W2 stride-7 A 53 / B 55 / C 10 / D 11; W3 40-sector loop x8
+      (thrashes the 32-line LRU) A 221 / B 222 / C 57 / D 62 (85% hits); W4
+      random A 67 / B 67 / C 71 / D 69 (the learner issues ZERO prefetches:
+      nothing earns confidence); W5 two interleaved streams A 205 / B 19 / C
+      38 / D 45, and 223 with mutation ablated. Sum over the five: A 626,
+      readahead 371, learner (D) 203 -- but readahead wins two workloads
+      outright: on plain sequential and interleaved-sequential the
+      hand-picked +1 rule beats the learner (warm-up plus ~10% bookkeeping);
+      the learner wins where the structure is NOT "next sector" and never
+      needs to be told which workload it is in. **Guarantees, all met**:
+      0 bad reads across every run including the fault run; corrupted
+      predictors self-heal (heals=2) and the run recovered within 8 reads
+      (diverse redundancy: LAGSTRIDE also predicts sequential, so the loss
+      was absorbed); save -> load -> save is byte-exact; a one-byte-flipped
+      record is refused and leaves state untouched; warm start hits 39/40 on
+      the loop's first pass vs 0/40 cold. **Pre-registered performance
+      predictions: 4 of 6 met** (stride, loop, interleave-needs-mutation,
+      adaptation <= 64 reads) **and 2 missed, kept as such**: P1 (learner
+      <= 20% of no-learner on sequential; C measured 26%, D 20% -- warm-up
+      and overhead) and P4 (random: my "readahead wastes >= 90" counted only
+      evictions so it read 79 with 16 lines still resident, a metric flaw;
+      the learner's overhead on unpredictable reads is ~3-10%, over my 5%
+      bar). **What the runs taught, in order** (each earlier log kept):
+      first run, loop learning 48% hits vs ~85% predicted -- a diagnostic
+      counter plus a simulation showed my Markov table was direct-mapped and
+      colliding keys evicted EACH OTHER every pass (160 of 320 reads
+      covered); 4-way set-associative (same 128 entries) fixed it (hits 85%,
+      warm 39/40). Second, adaptation after a phase change took 116 reads --
+      first blamed on stale scores (abstain-decay added, no effect), then
+      measured properly: the waste gate had tripped on the OLD workload's
+      predictors and throttled 70 calls, holding back the correct new one;
+      the proven-score bypass fixed it (6 throttled, 55 reads). Interleaved
+      loop at scale, longer runs and a real (non-synthetic) disk workload
+      are untested: the shipped fs workload's repeats are already absorbed
+      by the cache, so the learner would add nothing there today.
+
 ## Building and running
 
 Requires:

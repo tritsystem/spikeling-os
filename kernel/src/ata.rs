@@ -253,11 +253,17 @@ struct SectorCache {
     data: [[u8; 512]; CACHE_LINES],
     age: [u64; CACHE_LINES],
     valid: [bool; CACHE_LINES],
+    /// MILESTONE 162: filled by `prefetch_sector()`, cleared once a demand read uses it
+    prefetched: [bool; CACHE_LINES],
+    used: [bool; CACHE_LINES],
     tick: u64,
     mode: CacheMode,
     hits: u64,
     bypassed: u64,
     evictions: u64,
+    pf_issued: u64,
+    pf_useful: u64,
+    pf_wasted: u64,
 }
 
 impl SectorCache {
@@ -268,11 +274,16 @@ impl SectorCache {
             data: [[0; 512]; CACHE_LINES],
             age: [0; CACHE_LINES],
             valid: [false; CACHE_LINES],
+            prefetched: [false; CACHE_LINES],
+            used: [false; CACHE_LINES],
             tick: 0,
             mode: DEFAULT_CACHE_MODE,
             hits: 0,
             bypassed: 0,
             evictions: 0,
+            pf_issued: 0,
+            pf_useful: 0,
+            pf_wasted: 0,
         }
     }
 
@@ -296,10 +307,17 @@ pub fn cache_reset() {
     for v in c.valid.iter_mut() {
         *v = false;
     }
+    for i in 0..CACHE_LINES {
+        c.prefetched[i] = false;
+        c.used[i] = false;
+    }
     c.tick = 0;
     c.hits = 0;
     c.bypassed = 0;
     c.evictions = 0;
+    c.pf_issued = 0;
+    c.pf_useful = 0;
+    c.pf_wasted = 0;
     DISK_READS.store(0, Ordering::Relaxed);
 }
 
@@ -312,6 +330,64 @@ pub fn cache_restore_default() {
 pub fn cache_stats() -> (u64, u64, u64, u64) {
     let c = SECTOR_CACHE.lock();
     (DISK_READS.load(Ordering::Relaxed), c.hits, c.bypassed, c.evictions)
+}
+
+/// MILESTONE 162: read `lba` into the cache ahead of a demand read (advisory:
+/// it can never change what a later read returns). Returns true if a disk
+/// read was issued (false: cache off, already cached, or the read failed).
+/// The line is marked prefetched-and-unused; the cache reports it back to
+/// the learner's waste gate when it is first used or evicted unused.
+pub fn prefetch_sector(lba: u32) -> bool {
+    let id = SECONDARY_MASTER.dev_id();
+    {
+        let c = SECTOR_CACHE.lock();
+        if c.mode == CacheMode::Off || c.find(id, lba).is_some() {
+            return false;
+        }
+    }
+    let mut buf = [0u8; 512];
+    if SECONDARY_MASTER.raw_read_sector(lba, &mut buf).is_err() {
+        return false;
+    }
+    let mut wasted = false;
+    {
+        let mut c = SECTOR_CACHE.lock();
+        if c.find(id, lba).is_some() {
+            return true;
+        }
+        let slot = match (0..CACHE_LINES).find(|&i| !c.valid[i]) {
+            Some(i) => i,
+            None => {
+                c.evictions += 1;
+                let v = (0..CACHE_LINES).min_by_key(|&i| c.age[i]).unwrap_or(0);
+                if c.prefetched[v] && !c.used[v] {
+                    c.pf_wasted += 1;
+                    wasted = true;
+                }
+                v
+            }
+        };
+        c.tick += 1;
+        let t = c.tick;
+        c.dev[slot] = id;
+        c.lba[slot] = lba;
+        c.data[slot] = buf;
+        c.age[slot] = t;
+        c.valid[slot] = true;
+        c.prefetched[slot] = true;
+        c.used[slot] = false;
+        c.pf_issued += 1;
+    }
+    if wasted {
+        crate::learner::on_prefetch_resolved(true);
+    }
+    true
+}
+
+/// (prefetches issued, prefetched lines later used, prefetched lines evicted unused).
+pub fn prefetch_stats() -> (u64, u64, u64) {
+    let c = SECTOR_CACHE.lock();
+    (c.pf_issued, c.pf_useful, c.pf_wasted)
 }
 
 fn note_gate_sample(miss: bool) {
@@ -340,7 +416,16 @@ impl BlockDevice for AtaDevice {
                     let t = c.tick;
                     c.age[i] = t;
                     c.hits += 1;
+                    let mut first_use = false;
+                    if c.prefetched[i] && !c.used[i] {
+                        c.used[i] = true;
+                        c.pf_useful += 1;
+                        first_use = true;
+                    }
                     drop(c);
+                    if first_use {
+                        crate::learner::on_prefetch_resolved(false);
+                    }
                     if mode == CacheMode::Gated {
                         note_gate_sample(false);
                     }
@@ -357,6 +442,7 @@ impl BlockDevice for AtaDevice {
             note_gate_sample(true);
         }
         let mut c = SECTOR_CACHE.lock();
+        let mut wasted = false;
         let slot = match (0..CACHE_LINES).find(|&i| !c.valid[i]) {
             Some(i) => i,
             None => {
@@ -365,7 +451,12 @@ impl BlockDevice for AtaDevice {
                     return Ok(());
                 }
                 c.evictions += 1;
-                (0..CACHE_LINES).min_by_key(|&i| c.age[i]).unwrap_or(0)
+                let v = (0..CACHE_LINES).min_by_key(|&i| c.age[i]).unwrap_or(0);
+                if c.prefetched[v] && !c.used[v] {
+                    c.pf_wasted += 1;
+                    wasted = true;
+                }
+                v
             }
         };
         c.tick += 1;
@@ -375,6 +466,12 @@ impl BlockDevice for AtaDevice {
         c.data[slot] = *buf;
         c.age[slot] = t;
         c.valid[slot] = true;
+        c.prefetched[slot] = false;
+        c.used[slot] = false;
+        drop(c);
+        if wasted {
+            crate::learner::on_prefetch_resolved(true);
+        }
         Ok(())
     }
 
@@ -418,6 +515,8 @@ pub static SECONDARY_SLAVE: AtaDevice = AtaDevice::new(0x170, 0xF0);
 /// `SECONDARY_MASTER` through the `BlockDevice` trait instead of a
 /// standalone hardcoded implementation.
 pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> Result<(), &'static str> {
+    // MILESTONE 162: feed the (opt-in) disk-read learner -- a no-op unless enabled
+    crate::learner::observe(lba);
     // MILESTONE 154 MEASUREMENT (instrumentation only, no behavior change):
     // count reads, cycles per read, and how many reads hit an LBA read
     // within the last RECENT_LBAS distinct reads with no write in between

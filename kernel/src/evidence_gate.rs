@@ -106,9 +106,13 @@ pub enum GateKind {
     /// `fs.rs`'s `self_test_sector_cache()` for the pre-registered,
     /// measured comparison against no cache and an always-on cache.
     SectorCacheEviction,
+    /// MILESTONE 162: the disk-read learner's "do no harm" gate -- the fifth
+    /// subscriber. `hit` = a prefetched sector was evicted UNUSED (wasted
+    /// work); while conservative the learner throttles to occasional probes.
+    PrefetchWaste,
 }
 
-const GATE_COUNT: usize = 4;
+const GATE_COUNT: usize = 5;
 
 fn index(kind: GateKind) -> usize {
     match kind {
@@ -116,6 +120,7 @@ fn index(kind: GateKind) -> usize {
         GateKind::SchedulerFairness => 1,
         GateKind::NetArpUnreachable => 2,
         GateKind::SectorCacheEviction => 3,
+        GateKind::PrefetchWaste => 4,
     }
 }
 
@@ -163,7 +168,7 @@ impl GateState {
     }
 }
 
-static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new(), GateState::new(), GateState::new(), GateState::new()]);
+static GATES: Mutex<[GateState; GATE_COUNT]> = Mutex::new([GateState::new(), GateState::new(), GateState::new(), GateState::new(), GateState::new()]);
 
 /// Feed one real sample into `kind`'s gate: updates the fast EMA every
 /// call (`network::update_evidence()`, the exact same formula Milestone

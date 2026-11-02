@@ -2238,6 +2238,18 @@ unsafe fn tok_read(toks_ptr: u64, idx: u64) -> Token {
 enum LexError {
     UnknownChar(u64),
     TooManyTokens,
+    IntOverflow(u64), // MILESTONE 164: literal > u64::MAX, offset of its first byte
+}
+
+/// MILESTONE 164: one digit step of an integer literal, `val * base + d`,
+/// or None if it no longer fits in 64 bits. Until M164 the three literal
+/// loops used a plain `val * base + d`, which wraps silently in this
+/// build (no overflow checks), so `18446744073709551616` lexed as 0.
+fn lit_digit(val: u64, base: u64, d: u64) -> Option<u64> {
+    match val.checked_mul(base) {
+        Some(v) => v.checked_add(d),
+        None => None,
+    }
 }
 
 /// Real lexer: scans `src_len` bytes at `src_ptr`, writing tokens
@@ -2357,6 +2369,7 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
         }
         if b.is_ascii_digit() {
             let mut val: u64 = 0;
+            let lit_start = i; // MILESTONE 164: reported by IntOverflow
             // MILESTONE 95: base prefixes. A leading '0' immediately
             // followed by 'x'/'X' scans hex digits; by 'b'/'B' scans
             // binary digits. Both prefixes are unambiguous -- no
@@ -2386,7 +2399,10 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
                         } else {
                             break;
                         };
-                        val = val * 16 + d;
+                        val = match lit_digit(val, 16, d) {
+                            Some(v) => v,
+                            None => return Err(LexError::IntOverflow(lit_start)),
+                        };
                         i += 1;
                     }
                     if i == digit_start {
@@ -2405,7 +2421,10 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
                         }
                         let c = unsafe { core::ptr::read((src_ptr + i) as *const u8) };
                         if c == b'0' || c == b'1' {
-                            val = val * 2 + (c - b'0') as u64;
+                            val = match lit_digit(val, 2, (c - b'0') as u64) {
+                                Some(v) => v,
+                                None => return Err(LexError::IntOverflow(lit_start)),
+                            };
                             i += 1;
                         } else {
                             break;
@@ -2425,7 +2444,10 @@ unsafe fn lex(src_ptr: u64, src_len: u64, toks_ptr: u64, max_toks: u64) -> Resul
                 }
                 let c = unsafe { core::ptr::read((src_ptr + i) as *const u8) };
                 if c.is_ascii_digit() {
-                    val = val * 10 + (c - b'0') as u64;
+                    val = match lit_digit(val, 10, (c - b'0') as u64) {
+                        Some(v) => v,
+                        None => return Err(LexError::IntOverflow(lit_start)),
+                    };
                     i += 1;
                 } else {
                     break;
@@ -18789,7 +18811,61 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m163 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 { 0 } else { 1 });
+        // MILESTONE 164: an integer literal that does not fit in 64 bits is a
+        // real LexError::IntOverflow at the literal's first byte, not a silent
+        // wrap. Each case lexes directly so the error KIND and offset are checked.
+        // Source "x = " puts every literal at offset 4.
+        // CASE 268: 18446744073709551615 (u64::MAX) still lexes, value exact.
+        // CASE 269: 18446744073709551616 (u64::MAX + 1) -> IntOverflow(4); the
+        //           old code wrapped it to 0.
+        // CASE 270: 0xFFFFFFFFFFFFFFFF lexes; 0x10000000000000000 -> IntOverflow(4).
+        // CASE 271: 64 binary ones lex to u64::MAX; 65 -> IntOverflow(4).
+        // CASE 272: 30 leading zeros then 7 lexes to 7 -- the check is on the
+        //           value, not the digit count (a digit-count rule would reject it).
+        // CASE 273: return 18446744073709551615 == -1; runs -> 1 (int is signed
+        //           64-bit, so u64::MAX is the bit pattern of -1; regression guard
+        //           that the full-range literal still compiles).
+        let toks_m164 = malloc((MAX_TOKENS * core::mem::size_of::<Token>()) as u64);
+        let lex_m164 = |src: &[u8]| -> Result<u64, LexError> { lex(src.as_ptr() as u64, src.len() as u64, toks_m164, MAX_TOKENS as u64) };
+        let lit_ok = |src: &[u8], want: u64| -> bool {
+            match lex_m164(src) {
+                Ok(n) => n == 4 && tok_read(toks_m164, 2).kind == TOK_INTLIT && tok_read(toks_m164, 2).int_val == want,
+                Err(_) => false,
+            }
+        };
+        let overflow_at = |src: &[u8], off: u64| -> bool {
+            match lex_m164(src) {
+                Err(LexError::IntOverflow(o)) => o == off,
+                _ => false,
+            }
+        };
+        let case268_ok = lit_ok(b"x = 18446744073709551615", u64::MAX);
+        write_check(b"case268_u64_max_literal_lexes_exact=", case268_ok);
+        let case269_ok = overflow_at(b"x = 18446744073709551616", 4);
+        write_check(b"case269_u64_max_plus_1_is_int_overflow_at_4=", case269_ok);
+        let case270_ok = lit_ok(b"x = 0xFFFFFFFFFFFFFFFF", u64::MAX) && overflow_at(b"x = 0x10000000000000000", 4);
+        write_check(b"case270_hex_boundary_accept_then_overflow=", case270_ok);
+        let case271_ok = lit_ok(b"x = 0b1111111111111111111111111111111111111111111111111111111111111111", u64::MAX)
+            && overflow_at(b"x = 0b11111111111111111111111111111111111111111111111111111111111111111", 4);
+        write_check(b"case271_binary_boundary_accept_then_overflow=", case271_ok);
+        let case272_ok = lit_ok(b"x = 0000000000000000000000000000007", 7);
+        write_check(b"case272_leading_zeros_do_not_overflow=", case272_ok);
+        const SRC273: &[u8] = b"int main() { return 18446744073709551615 == -1; }";
+        let case273_result = compile_and_run_program_callable(SRC273.as_ptr() as u64, SRC273.len() as u64);
+        w(b"  case273 (u64::MAX literal == -1, in-process) returned=");
+        match case273_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 1)\n");
+        let case273_ok = case273_result == Some(1);
+        write_check(b"case273_full_range_literal_compiles=", case273_ok);
+        let overall_m164 = case268_ok && case269_ok && case270_ok && case271_ok && case272_ok && case273_ok;
+        w(b"OVERALL_M164=");
+        w(if overall_m164 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 { 0 } else { 1 });
     }
 }
 

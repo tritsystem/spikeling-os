@@ -5556,7 +5556,8 @@ impl Parser {
                 unsafe { self.expect(TOK_LBRACE) }?;
                 let mut cases_head: u64 = 0;
                 let mut cases_tail: u64 = 0;
-                let mut default_body: u64 = 0;
+                let default_body: u64 = 0; // MILESTONE 167: always 0 -- default lives in the chain
+                let mut seen_default = false;
                 loop {
                     let k = unsafe { self.peek() }.kind;
                     if k == TOK_RBRACE {
@@ -5594,9 +5595,35 @@ impl Parser {
                         }
                         cases_tail = cnode;
                     } else if k == TOK_DEFAULT {
+                        // MILESTONE 167: `default` is a label-less STMT_CASE
+                        // (expr = 0) kept at its SOURCE position in the chain,
+                        // so fall-through into and out of it follows the
+                        // text. Until M167 it was stored apart and always
+                        // lowered last. A second `default` is an error (it
+                        // used to silently replace the first).
+                        if seen_default {
+                            return Err(ParseError::UnexpectedToken(self.pos));
+                        }
+                        seen_default = true;
                         unsafe { self.advance() };
                         unsafe { self.expect(TOK_COLON) }?;
-                        default_body = unsafe { self.parse_case_body() }?;
+                        let body = unsafe { self.parse_case_body() }?;
+                        let cnode = unsafe { alloc_stmt() };
+                        if cnode == 0 {
+                            return Err(ParseError::OutOfMemory);
+                        }
+                        unsafe {
+                            core::ptr::write(
+                                cnode as *mut StmtNode,
+                                StmtNode { kind: STMT_CASE, ident_off: 0, ident_len: 0, expr: 0, next: 0, then_body: body, else_body: 0 },
+                            )
+                        };
+                        if cases_head == 0 {
+                            cases_head = cnode;
+                        } else {
+                            unsafe { (*(cases_tail as *mut StmtNode)).next = cnode };
+                        }
+                        cases_tail = cnode;
                     } else {
                         return Err(ParseError::UnexpectedToken(self.pos));
                     }
@@ -9135,11 +9162,14 @@ unsafe fn gen_stmt_list(
                 let mut c = s.then_body;
                 while c != 0 {
                     let cn = unsafe { core::ptr::read(c as *const StmtNode) };
-                    let label = unsafe { core::ptr::read(cn.expr as *const ExprNode) };
-                    unsafe { buf.emit_mov_rax_rbp_off(scratch_off) };
-                    unsafe { buf.emit_cmp_rax_imm32(label.int_val as u32) };
-                    let jz = unsafe { buf.emit_jz_placeholder() };
-                    unsafe { loop_push_cont(jz) }?;
+                    // MILESTONE 167: `default` (expr == 0) has no compare.
+                    if cn.expr != 0 {
+                        let label = unsafe { core::ptr::read(cn.expr as *const ExprNode) };
+                        unsafe { buf.emit_mov_rax_rbp_off(scratch_off) };
+                        unsafe { buf.emit_cmp_rax_imm32(label.int_val as u32) };
+                        let jz = unsafe { buf.emit_jz_placeholder() };
+                        unsafe { loop_push_cont(jz) }?;
+                    }
                     c = cn.next;
                 }
                 // No case matched -> jump to default (or end).
@@ -9150,10 +9180,17 @@ unsafe fn gen_stmt_list(
                 // between them) -- real C switch semantics.
                 let mut idx = cont_base;
                 let mut c2 = s.then_body;
+                let mut default_seen = false;
                 while c2 != 0 {
                     let cn = unsafe { core::ptr::read(c2 as *const StmtNode) };
-                    unsafe { buf.patch_rel32(loop_cont_at(idx)) };
-                    idx += 1;
+                    if cn.expr != 0 {
+                        unsafe { buf.patch_rel32(loop_cont_at(idx)) };
+                        idx += 1;
+                    } else {
+                        // MILESTONE 167: no match lands on `default` wherever it is.
+                        unsafe { buf.patch_rel32(miss_jmp) };
+                        default_seen = true;
+                    }
                     unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, cn.then_body, loop_top, loop_is_for, 1, is_char_return) }?;
                     c2 = cn.next;
                 }
@@ -9172,12 +9209,8 @@ unsafe fn gen_stmt_list(
                 }
                 unsafe { loop_set_cont_n(cont_now - ncases) };
 
-                // Default body (if any) -- the no-match jump lands at
-                // its start; otherwise it lands at `end` below.
-                if s.else_body != 0 {
-                    unsafe { buf.patch_rel32(miss_jmp) };
-                    unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, s.else_body, loop_top, loop_is_for, 1, is_char_return) }?;
-                } else {
+                // No `default`: the no-match jump lands at `end`.
+                if !default_seen {
                     unsafe { buf.patch_rel32(miss_jmp) };
                 }
 
@@ -10553,8 +10586,9 @@ const SK_BREAK_IF: u8 = 13;
 const SK_CONTINUE_IF: u8 = 14;
 // MILESTONE 166: `switch ((E) & 3) { case L: ... [break;] ... [default: ...] }`.
 // Labels are distinct values 0..3 in random order; bodies may be empty;
-// each case ends in `break;` or falls through; `default` (optional) is
-// always last -- this compiler lowers `default` as the last label (M91).
+// each case ends in `break;` or falls through; `default` (optional) sits
+// at a random position since M167 (it was always last before: M91 lowered
+// `default` last whatever its source position).
 const SK_SWITCH: u8 = 15;
 const SK_CASE: u8 = 16; // pool-only: one case of a switch (op = label, 0xFF = default; n = ends in break)
 // coverage-only bits (never a statement kind)
@@ -10563,7 +10597,8 @@ const CV_BREAK_IN_SWITCH: u8 = 18; // a break whose innermost target is a switch
 const CV_BREAK_IN_SWITCH_IN_LOOP: u8 = 19; // ... and a loop encloses that switch
 const CV_CONTINUE_IN_SWITCH: u8 = 20; // continue inside a switch inside a loop
 const CV_FALLTHROUGH: u8 = 21; // a case without break followed by another label
-const SK_COUNT: usize = 22;
+const CV_DEFAULT_NOT_LAST: u8 = 22; // MILESTONE 167
+const SK_COUNT: usize = 23;
 // sabotage bits for the negative controls
 const SAB_POSTFIX_AS_PREFIX: u8 = 1;
 const SAB_SWITCH_BREAK_ESCAPES: u8 = 2; // a switch's break also leaves the enclosing loop/block
@@ -10866,6 +10901,12 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
                 let ncases = 1 + g.rnd(3) as usize;
                 let has_default = g.rnd(2) == 0;
                 let total = ncases + has_default as usize;
+                // MILESTONE 167: `default` may sit anywhere among the labels
+                let default_pos = if has_default { g.rnd(total as u64) as usize } else { usize::MAX };
+                if has_default && default_pos + 1 < total {
+                    *mask |= 1u32 << CV_DEFAULT_NOT_LAST;
+                }
+                let mut li = 0usize;
                 let mut cprev = SF_END;
                 let mut ci = 0usize;
                 while ci < total && *np < SF_MAX {
@@ -10873,8 +10914,9 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
                     *np += 1;
                     let mut c = sf_blank();
                     c.kind = SK_CASE;
-                    if ci < ncases {
-                        c.op = unsafe { *labels.as_ptr().add(ci) };
+                    if ci != default_pos {
+                        c.op = unsafe { *labels.as_ptr().add(li) };
+                        li += 1;
                         fz_put(buf, pl, b"case ");
                         fz_put(buf, pl, &[b'0' + c.op]);
                         fz_put(buf, pl, b": ");
@@ -19080,6 +19122,63 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m166 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
+        // MILESTONE 167: `default` at its source position.
+        w(b"milestone 167: switches with default not last=");
+        write_u64_dec(sc(CV_DEFAULT_NOT_LAST));
+        w(b"\n");
+        // CASE 280: default in the MIDDLE, falling in from case 1 and out into
+        // case 2. Hand-computed per x: 0 -> default +10, case 2 +100 = 110;
+        // 1 -> +1 +10 +100 = 111; 2 -> +100; 3 -> +1000. Sum 1321. Lowering
+        // default last (pre-M167) gives 10 + 101 + 100 + 1010 = 1221.
+        const SRC280: &[u8] = b"int main() { int x; int s; s = 0; for (x = 0; x < 4; x++) { switch (x) { case 1: s += 1; default: s += 10; case 2: s += 100; break; case 3: s += 1000; } } return s; }";
+        let case280_result = compile_and_run_program_callable(SRC280.as_ptr() as u64, SRC280.len() as u64);
+        w(b"  case280 (default in the middle, fall-through both ways) returned=");
+        match case280_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 1321)\n");
+        let case280_ok = case280_result == Some(1321);
+        write_check(b"case280_default_mid_returns_1321=", case280_ok);
+
+        // CASE 281: default FIRST. x = 0 -> default +5, falls into case 7 +50
+        // = 55; x = 7 -> +50. Sum 105. Pre-M167: 5 + (50 + 5) = 60.
+        const SRC281: &[u8] = b"int main() { int x; int s; s = 0; x = 0; switch (x) { default: s += 5; case 7: s += 50; } x = 7; switch (x) { default: s += 5; case 7: s += 50; } return s; }";
+        let case281_result = compile_and_run_program_callable(SRC281.as_ptr() as u64, SRC281.len() as u64);
+        w(b"  case281 (default first) returned=");
+        match case281_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 105)\n");
+        let case281_ok = case281_result == Some(105);
+        write_check(b"case281_default_first_returns_105=", case281_ok);
+
+        // CASE 282: a switch with ONLY a default (zero compares; the no-match
+        // jump must land on its body) -> 9.
+        const SRC282: &[u8] = b"int main() { int x; int s; s = 0; x = 3; switch (x) { default: s = 9; } return s; }";
+        let case282_result = compile_and_run_program_callable(SRC282.as_ptr() as u64, SRC282.len() as u64);
+        w(b"  case282 (default-only switch) returned=");
+        match case282_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 9)\n");
+        let case282_ok = case282_result == Some(9);
+        write_check(b"case282_default_only_returns_9=", case282_ok);
+
+        // CASE 283: two `default`s is now a parse error (pre-M167 the second
+        // silently replaced the first and this returned 2). Parsed directly so
+        // the failure is known to be the parser's, not codegen's.
+        const SRC283: &[u8] = b"int main() { int x; x = 0; switch (x) { default: return 1; default: return 2; } return 0; }";
+        let case283_ok = lex_and_parse_program(SRC283.as_ptr() as u64, SRC283.len() as u64).is_err();
+        write_check(b"case283_duplicate_default_is_parse_error=", case283_ok);
+
+        let overall_m167 = overall_m166 && sc(CV_DEFAULT_NOT_LAST) > 0 && case280_ok && case281_ok && case282_ok && case283_ok;
+        w(b"OVERALL_M167=");
+        w(if overall_m167 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
         // MILESTONE 164: an integer literal that does not fit in 64 bits is a
         // real LexError::IntOverflow at the literal's first byte, not a silent
         // wrap. Each case lexes directly so the error KIND and offset are checked.
@@ -19134,7 +19233,7 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m164 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 { 0 } else { 1 });
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 { 0 } else { 1 });
     }
 }
 

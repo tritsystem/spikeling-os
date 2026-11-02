@@ -5565,7 +5565,26 @@ impl Parser {
                     }
                     if k == TOK_CASE {
                         unsafe { self.advance() };
-                        let val_tok = unsafe { self.expect(TOK_INTLIT) }?;
+                        // MILESTONE 168: an optional leading `-` (negative
+                        // labels), and a duplicate label value -- however it
+                        // is spelled -- is a parse error at the label.
+                        let label_pos = self.pos;
+                        let negative = unsafe { self.peek() }.kind == TOK_MINUS;
+                        if negative {
+                            unsafe { self.advance() };
+                        }
+                        let mut val_tok = unsafe { self.expect(TOK_INTLIT) }?;
+                        if negative {
+                            val_tok.int_val = val_tok.int_val.wrapping_neg();
+                        }
+                        let mut dup = cases_head;
+                        while dup != 0 {
+                            let dn = unsafe { core::ptr::read(dup as *const StmtNode) };
+                            if dn.expr != 0 && unsafe { core::ptr::read(dn.expr as *const ExprNode) }.int_val == val_tok.int_val {
+                                return Err(ParseError::UnexpectedToken(label_pos));
+                            }
+                            dup = dn.next;
+                        }
                         unsafe { self.expect(TOK_COLON) }?;
                         let label = unsafe { alloc_expr() };
                         if label == 0 {
@@ -9165,8 +9184,20 @@ unsafe fn gen_stmt_list(
                     // MILESTONE 167: `default` (expr == 0) has no compare.
                     if cn.expr != 0 {
                         let label = unsafe { core::ptr::read(cn.expr as *const ExprNode) };
-                        unsafe { buf.emit_mov_rax_rbp_off(scratch_off) };
-                        unsafe { buf.emit_cmp_rax_imm32(label.int_val as u32) };
+                        let v = label.int_val as i64;
+                        if v == v as i32 as i64 {
+                            unsafe { buf.emit_mov_rax_rbp_off(scratch_off) };
+                            unsafe { buf.emit_cmp_rax_imm32(label.int_val as u32) };
+                        } else {
+                            // MILESTONE 168: `cmp rax, imm32` sign-extends its
+                            // immediate, so a label outside i32 was compared as
+                            // its low 32 bits sign-extended (case 4294967296
+                            // matched 0). Compare against the full 64-bit value.
+                            unsafe { buf.emit_mov_rax_imm64(label.int_val) };
+                            unsafe { buf.emit_mov_rcx_rax() };
+                            unsafe { buf.emit_mov_rax_rbp_off(scratch_off) };
+                            unsafe { buf.emit_cmp_rax_rcx() };
+                        }
                         let jz = unsafe { buf.emit_jz_placeholder() };
                         unsafe { loop_push_cont(jz) }?;
                     }
@@ -19179,6 +19210,72 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m167 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
+        // MILESTONE 168: case labels -- full 64-bit range, negative labels,
+        // duplicates rejected.
+        // CASE 284: a label above u32::MAX. x = 0 must NOT match 4294967296;
+        // a label truncated to its low 32 bits (0) would match -> 1.
+        const SRC284: &[u8] = b"int main() { int x; int r; x = 0; switch (x) { case 4294967296: r = 1; break; default: r = 2; } return r; }";
+        let case284_result = compile_and_run_program_callable(SRC284.as_ptr() as u64, SRC284.len() as u64);
+        w(b"  case284 (label 2^32 vs x = 0) returned=");
+        match case284_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 2)\n");
+        let case284_ok = case284_result == Some(2);
+        write_check(b"case284_label_2pow32_does_not_match_0_returns_2=", case284_ok);
+
+        // CASE 285: label 2147483648 (just past i32::MAX). An imm32 would
+        // sign-extend it to -2147483648 and miss x = 2147483648 -> 2.
+        const SRC285: &[u8] = b"int main() { int x; int r; x = 2147483648; switch (x) { case 2147483648: r = 1; break; default: r = 2; } return r; }";
+        let case285_result = compile_and_run_program_callable(SRC285.as_ptr() as u64, SRC285.len() as u64);
+        w(b"  case285 (label 2^31 matches x = 2^31) returned=");
+        match case285_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 1)\n");
+        let case285_ok = case285_result == Some(1);
+        write_check(b"case285_label_2pow31_matches_returns_1=", case285_ok);
+
+        // CASE 286: negative labels -> 30.
+        const SRC286: &[u8] = b"int main() { int x; int r; x = -3; r = 0; switch (x) { case 3: r = 3; break; case -3: r = 30; break; } return r; }";
+        let case286_result = compile_and_run_program_callable(SRC286.as_ptr() as u64, SRC286.len() as u64);
+        w(b"  case286 (negative label) returned=");
+        match case286_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 30)\n");
+        let case286_ok = case286_result == Some(30);
+        write_check(b"case286_negative_label_returns_30=", case286_ok);
+
+        // CASE 287: the i32 boundaries still use the short compare and match
+        // exactly: x = -2147483648 -> 2.
+        const SRC287: &[u8] = b"int main() { int x; int r; x = -2147483648; r = 0; switch (x) { case 2147483647: r = 1; break; case -2147483648: r = 2; break; } return r; }";
+        let case287_result = compile_and_run_program_callable(SRC287.as_ptr() as u64, SRC287.len() as u64);
+        w(b"  case287 (i32 boundary labels) returned=");
+        match case287_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 2)\n");
+        let case287_ok = case287_result == Some(2);
+        write_check(b"case287_i32_boundary_labels_return_2=", case287_ok);
+
+        // CASE 288: duplicate labels are a parse error, including the same
+        // value spelled two ways (0x10 and 16). Parsed directly.
+        const SRC288A: &[u8] = b"int main() { int x; x = 1; switch (x) { case 1: return 1; case 1: return 2; } return 0; }";
+        const SRC288B: &[u8] = b"int main() { int x; x = 16; switch (x) { case 0x10: return 1; case 16: return 2; } return 0; }";
+        let case288_ok = lex_and_parse_program(SRC288A.as_ptr() as u64, SRC288A.len() as u64).is_err()
+            && lex_and_parse_program(SRC288B.as_ptr() as u64, SRC288B.len() as u64).is_err();
+        write_check(b"case288_duplicate_labels_are_parse_errors=", case288_ok);
+
+        let overall_m168 = case284_ok && case285_ok && case286_ok && case287_ok && case288_ok;
+        w(b"OVERALL_M168=");
+        w(if overall_m168 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
         // MILESTONE 164: an integer literal that does not fit in 64 bits is a
         // real LexError::IntOverflow at the literal's first byte, not a silent
         // wrap. Each case lexes directly so the error KIND and offset are checked.
@@ -19233,7 +19330,7 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m164 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 { 0 } else { 1 });
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 && overall_m168 { 0 } else { 1 });
     }
 }
 

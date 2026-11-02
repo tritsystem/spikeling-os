@@ -9971,6 +9971,7 @@ struct FuzzGen {
     t: [i64; 2],
     ch: i64, // the value a `char` read yields (already narrowed)
     minimal: bool,
+    no_calls: bool, // MILESTONE 163: the statement fuzz has no helper functions (token budget)
 }
 
 impl FuzzGen {
@@ -10130,7 +10131,7 @@ fn fz_gen(g: &mut FuzzGen, depth: u32) -> FuzzExpr {
         e.level = 12;
         return e;
     }
-    if kind >= 5 && kind <= 7 {
+    if kind >= 5 && kind <= 7 && !g.no_calls {
         // helper calls: f1(x) / f2(x, y) / f3(x, y, z)
         let n = (kind - 4) as usize; // 1, 2 or 3 arguments
         let a0 = fz_gen(g, depth - 1);
@@ -10246,7 +10247,7 @@ fn fz_gen(g: &mut FuzzGen, depth: u32) -> FuzzExpr {
 
 /// Append a decimal integer; a negative one as `-` + the magnitude literal
 /// (the unary minus is the compiler's own).
-fn fz_put_signed(prog: &mut [u8; 1024], pl: &mut usize, val: i64) {
+fn fz_put_signed(prog: &mut [u8], pl: &mut usize, val: i64) {
     let (neg, mag) = if val < 0 { (true, val.wrapping_neg() as u64) } else { (false, val as u64) };
     if neg {
         fz_put(prog, pl, b"-");
@@ -10334,7 +10335,7 @@ fn fz_has(hay: &[u8], needle: &[u8]) -> bool {
     false
 }
 
-fn fz_put(prog: &mut [u8; 1024], pl: &mut usize, s: &[u8]) {
+fn fz_put(prog: &mut [u8], pl: &mut usize, s: &[u8]) {
     let mut i = 0;
     while i < s.len() {
         unsafe { *prog.as_mut_ptr().add(*pl) = *s.as_ptr().add(i) };
@@ -10354,7 +10355,7 @@ unsafe fn fuzz_expr_differential() -> (u32, [u32; 4], u32, [u32; 5]) {
     // coverage: programs whose expression contains a call / a nested call / an array read / *p / ch
     let mut cov = [0u32; 5];
     for mode in 0..2u32 {
-        let mut g = FuzzGen { rng: 0x9E37_79B9_7F4A_7C15 ^ ((mode as u64 + 1).wrapping_mul(0x1234_5678_9ABC_DEF1)), vars: [0; 3], t: [0; 2], ch: 0, minimal: mode == 1 };
+        let mut g = FuzzGen { rng: 0x9E37_79B9_7F4A_7C15 ^ ((mode as u64 + 1).wrapping_mul(0x1234_5678_9ABC_DEF1)), vars: [0; 3], t: [0; 2], ch: 0, minimal: mode == 1, no_calls: false };
         let mut produced = 0u32;
         let mut attempts = 0u32;
         while produced < CASES_PER_MODE && attempts < CASES_PER_MODE * 8 {
@@ -10466,6 +10467,571 @@ unsafe fn fuzz_expr_differential() -> (u32, [u32; 4], u32, [u32; 5]) {
         }
     }
     (ran, counts, skipped, cov)
+}
+// MILESTONE 163: differential fuzzing of STATEMENTS -- the gap Milestone
+// 161 named ("the fuzz covers expressions only -- no statements, loops,
+// assignments-as-expressions, compound assignment, or multi-level
+// pointers"). A seeded generator emits a random statement list over
+// a, b, c, t[2], ch and *p (p = &a, so writes through p alias a):
+//   V = E;  V op= E; (all ten ops)  V++; V--; ++V; --V;
+//   V = W++; / W-- / ++W / --W  (V != W -- ++/-- as an expression, M159)
+//   *p = E;  *p op= E;  t[(I & 1)] = E;  t[(I & 1)] op= E;  ch = E;
+//   if (E) { ... } [else { ... }]
+//   for (k = 0; k < N; k++) { ... }
+//   k = N; while (k > 0) { k--; ... }
+//   k = N; do { k--; ... } while (k > 0);
+//   if (E) { break; }  if (E) { continue; }   (only inside a loop)
+// and a Rust reference interpreter executes the same statement tree.
+// Loops are not nested (one counter, `k`, fits MAX_VARS = 8) and run at
+// most 3 times, so every program terminates. The body decrements `k`
+// FIRST in while/do, so `continue` can never skip the decrement.
+//
+// The reference needs each expression's value under the state at the
+// moment it runs -- different on every loop trip. Instead of a second
+// expression AST, each statement stores the generator's RNG state from
+// just before its expression was generated: fz_gen()'s SHAPE depends only
+// on the RNG stream (never on variable values), so replaying it from the
+// saved seed with the current state rebuilds the identical text and
+// yields its value under that state.
+//
+// Negative control (proves the oracle is not vacuous): a separate run
+// with a deliberately wrong reference -- postfix `V = W++` evaluated as
+// prefix -- must report mismatches.
+const SF_MAX: usize = 48;
+const SF_END: u8 = 0xFF;
+const SF_BUF: usize = 4096;
+
+const SK_ASSIGN: u8 = 0;
+const SK_COMPOUND: u8 = 1;
+const SK_INCDEC: u8 = 2;
+const SK_ASSIGN_INCDEC: u8 = 3;
+const SK_DEREF_ASSIGN: u8 = 4;
+const SK_DEREF_COMPOUND: u8 = 5;
+const SK_ARRAY_ASSIGN: u8 = 6;
+const SK_ARRAY_COMPOUND: u8 = 7;
+const SK_CHAR_ASSIGN: u8 = 8;
+const SK_IF: u8 = 9;
+const SK_FOR: u8 = 10;
+const SK_WHILE: u8 = 11;
+const SK_DO: u8 = 12;
+const SK_BREAK_IF: u8 = 13;
+const SK_CONTINUE_IF: u8 = 14;
+const SK_COUNT: usize = 15;
+
+#[derive(Clone, Copy)]
+struct SfStmt {
+    kind: u8,
+    v: u8,   // target variable 0..2 (a, b, c)
+    w: u8,   // ++/-- source variable for SK_ASSIGN_INCDEC
+    op: u8,  // compound op 0..9, or ++/-- form 0..3 (V++, V--, ++V, --V)
+    n: u8,   // loop trip count
+    ed: u8,  // expression depth of `seed`
+    ed2: u8, // expression depth of `seed2`
+    seed: u64,  // E: value / condition
+    seed2: u64, // I: array index
+    body: u8,
+    els: u8,
+    next: u8,
+}
+
+struct SfState {
+    v: [i64; 3],
+    t: [i64; 2],
+    ch: i64,
+}
+
+fn sf_blank() -> SfStmt {
+    SfStmt { kind: 0, v: 0, w: 0, op: 0, n: 0, ed: 0, ed2: 0, seed: 0, seed2: 0, body: SF_END, els: SF_END, next: SF_END }
+}
+
+/// Generate an expression from the current RNG, returning (seed, expr).
+fn sf_expr(g: &mut FuzzGen, depth: u32) -> (u64, FuzzExpr) {
+    let seed = g.rng;
+    let e = fz_gen(g, depth);
+    (seed, e)
+}
+
+/// Replay the expression generated from `seed` against `st` (see above).
+fn sf_eval(g: &mut FuzzGen, seed: u64, depth: u8, st: &SfState) -> i64 {
+    let saved = g.rng;
+    g.rng = seed;
+    g.vars = st.v;
+    g.t = st.t;
+    g.ch = st.ch;
+    let e = fz_gen(g, depth as u32);
+    g.rng = saved;
+    e.val
+}
+
+fn sf_op_text(op: u8) -> &'static [u8] {
+    match op {
+        0 => b" += ",
+        1 => b" -= ",
+        2 => b" *= ",
+        3 => b" /= ",
+        4 => b" %= ",
+        5 => b" &= ",
+        6 => b" |= ",
+        7 => b" ^= ",
+        8 => b" <<= ",
+        _ => b" >>= ",
+    }
+}
+
+/// `l op= r`, with the same UB guards the text applies to r.
+fn sf_apply(op: u8, l: i64, r: i64) -> i64 {
+    match op {
+        0 => l.wrapping_add(r),
+        1 => l.wrapping_sub(r),
+        2 => l.wrapping_mul(r),
+        3 => fz_div(l, (r & 7) | 1),
+        4 => fz_rem(l, (r & 7) | 1),
+        5 => l & r,
+        6 => l | r,
+        7 => l ^ r,
+        8 => l.wrapping_shl((r & 7) as u32),
+        _ => l.wrapping_shr((r & 7) as u32),
+    }
+}
+
+/// Emit a compound-assignment RHS: `E`, `((E & 7) | 1)` for /= %=, `(E & 7)` for shifts.
+fn sf_put_rhs(buf: &mut [u8], pl: &mut usize, op: u8, e: &FuzzExpr, minimal: bool) {
+    if op == 3 || op == 4 {
+        fz_put(buf, pl, b"((");
+        sf_put_wrapped(buf, pl, e, !minimal || e.level <= 5);
+        fz_put(buf, pl, b" & 7) | 1)");
+    } else if op == 8 || op == 9 {
+        fz_put(buf, pl, b"(");
+        sf_put_wrapped(buf, pl, e, !minimal || e.level <= 5);
+        fz_put(buf, pl, b" & 7)");
+    } else {
+        fz_put(buf, pl, fz_bytes(e));
+    }
+}
+
+fn sf_put_wrapped(buf: &mut [u8], pl: &mut usize, e: &FuzzExpr, wrap: bool) {
+    if wrap {
+        fz_put(buf, pl, b"(");
+    }
+    fz_put(buf, pl, fz_bytes(e));
+    if wrap {
+        fz_put(buf, pl, b")");
+    }
+}
+
+fn sf_var(v: u8) -> &'static [u8] {
+    match v {
+        0 => b"a",
+        1 => b"b",
+        _ => b"c",
+    }
+}
+
+fn sf_get(st: &SfState, v: u8) -> i64 {
+    unsafe { *st.v.as_ptr().add(v as usize) }
+}
+
+fn sf_set(st: &mut SfState, v: u8, val: i64) {
+    unsafe { *st.v.as_mut_ptr().add(v as usize) = val };
+}
+
+/// Generate a statement list into `pool`, emitting its text into `buf`;
+/// returns the head index. `mask` collects which kinds were generated.
+unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: &mut [u8], pl: &mut usize, depth: u32, in_loop: bool, max_stmts: u64, mask: &mut u32) -> u8 {
+    let mut head = SF_END;
+    let mut prev = SF_END;
+    let count = 1 + g.rnd(max_stmts);
+    let mut i = 0u64;
+    while i < count {
+        i += 1;
+        if *np >= SF_MAX || *pl > SF_BUF - 1200 {
+            break;
+        }
+        let idx = *np as u8;
+        *np += 1;
+        let mut s = sf_blank();
+        let r = g.rnd(100);
+        let mut kind = if r < 14 {
+            SK_ASSIGN
+        } else if r < 30 {
+            SK_COMPOUND
+        } else if r < 37 {
+            SK_INCDEC
+        } else if r < 43 {
+            SK_ASSIGN_INCDEC
+        } else if r < 48 {
+            SK_DEREF_ASSIGN
+        } else if r < 53 {
+            SK_DEREF_COMPOUND
+        } else if r < 58 {
+            SK_ARRAY_ASSIGN
+        } else if r < 63 {
+            SK_ARRAY_COMPOUND
+        } else if r < 67 {
+            SK_CHAR_ASSIGN
+        } else if r < 78 {
+            SK_IF
+        } else if r < 90 {
+            SK_FOR + g.rnd(3) as u8
+        } else if g.rnd(2) == 0 {
+            SK_BREAK_IF
+        } else {
+            SK_CONTINUE_IF
+        };
+        if (kind == SK_IF || (kind >= SK_FOR && kind <= SK_DO)) && depth == 0 {
+            kind = SK_COMPOUND;
+        }
+        if kind >= SK_FOR && kind <= SK_DO && in_loop {
+            kind = SK_IF;
+        }
+        if (kind == SK_BREAK_IF || kind == SK_CONTINUE_IF) && !in_loop {
+            kind = SK_ASSIGN;
+        }
+        s.kind = kind;
+        s.v = g.rnd(3) as u8;
+        s.op = g.rnd(10) as u8;
+        s.ed = g.rnd(3) as u8;
+        s.ed2 = g.rnd(2) as u8;
+        let minimal = g.minimal;
+        match kind {
+            SK_ASSIGN | SK_CHAR_ASSIGN | SK_DEREF_ASSIGN => {
+                fz_put(buf, pl, if kind == SK_CHAR_ASSIGN { b"ch" } else if kind == SK_DEREF_ASSIGN { b"*p" } else { sf_var(s.v) });
+                fz_put(buf, pl, b" = ");
+                let (seed, e) = sf_expr(g, s.ed as u32);
+                s.seed = seed;
+                fz_put(buf, pl, fz_bytes(&e));
+                fz_put(buf, pl, b"; ");
+            }
+            SK_COMPOUND | SK_DEREF_COMPOUND => {
+                fz_put(buf, pl, if kind == SK_DEREF_COMPOUND { b"*p" } else { sf_var(s.v) });
+                fz_put(buf, pl, sf_op_text(s.op));
+                let (seed, e) = sf_expr(g, s.ed as u32);
+                s.seed = seed;
+                sf_put_rhs(buf, pl, s.op, &e, minimal);
+                fz_put(buf, pl, b"; ");
+            }
+            SK_INCDEC => {
+                s.op = g.rnd(4) as u8;
+                let vt = sf_var(s.v);
+                match s.op {
+                    0 => { fz_put(buf, pl, vt); fz_put(buf, pl, b"++; "); }
+                    1 => { fz_put(buf, pl, vt); fz_put(buf, pl, b"--; "); }
+                    2 => { fz_put(buf, pl, b"++"); fz_put(buf, pl, vt); fz_put(buf, pl, b"; "); }
+                    _ => { fz_put(buf, pl, b"--"); fz_put(buf, pl, vt); fz_put(buf, pl, b"; "); }
+                }
+            }
+            SK_ASSIGN_INCDEC => {
+                s.op = g.rnd(4) as u8;
+                s.w = ((s.v as u64 + 1 + g.rnd(2)) % 3) as u8;
+                let wt = sf_var(s.w);
+                fz_put(buf, pl, sf_var(s.v));
+                fz_put(buf, pl, b" = ");
+                match s.op {
+                    0 => { fz_put(buf, pl, wt); fz_put(buf, pl, b"++; "); }
+                    1 => { fz_put(buf, pl, wt); fz_put(buf, pl, b"--; "); }
+                    2 => { fz_put(buf, pl, b"++"); fz_put(buf, pl, wt); fz_put(buf, pl, b"; "); }
+                    _ => { fz_put(buf, pl, b"--"); fz_put(buf, pl, wt); fz_put(buf, pl, b"; "); }
+                }
+            }
+            SK_ARRAY_ASSIGN | SK_ARRAY_COMPOUND => {
+                let (seed2, ix) = sf_expr(g, s.ed2 as u32);
+                s.seed2 = seed2;
+                fz_put(buf, pl, b"t[(");
+                sf_put_wrapped(buf, pl, &ix, !minimal || ix.level <= 5);
+                fz_put(buf, pl, b" & 1)]");
+                let (seed, e) = sf_expr(g, s.ed as u32);
+                s.seed = seed;
+                if kind == SK_ARRAY_ASSIGN {
+                    fz_put(buf, pl, b" = ");
+                    fz_put(buf, pl, fz_bytes(&e));
+                } else {
+                    fz_put(buf, pl, sf_op_text(s.op));
+                    sf_put_rhs(buf, pl, s.op, &e, minimal);
+                }
+                fz_put(buf, pl, b"; ");
+            }
+            SK_IF => {
+                fz_put(buf, pl, b"if (");
+                let (seed, e) = sf_expr(g, s.ed as u32);
+                s.seed = seed;
+                fz_put(buf, pl, fz_bytes(&e));
+                fz_put(buf, pl, b") { ");
+                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, 2, mask) };
+                fz_put(buf, pl, b"} ");
+                if g.rnd(2) == 0 {
+                    fz_put(buf, pl, b"else { ");
+                    s.els = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, 2, mask) };
+                    fz_put(buf, pl, b"} ");
+                }
+            }
+            SK_FOR | SK_WHILE | SK_DO => {
+                s.n = if kind == SK_DO { 1 + g.rnd(3) as u8 } else { g.rnd(4) as u8 };
+                let nd = [b'0' + s.n];
+                if kind == SK_FOR {
+                    fz_put(buf, pl, b"for (k = 0; k < ");
+                    fz_put(buf, pl, &nd);
+                    fz_put(buf, pl, b"; k++) { ");
+                } else if kind == SK_WHILE {
+                    fz_put(buf, pl, b"k = ");
+                    fz_put(buf, pl, &nd);
+                    fz_put(buf, pl, b"; while (k > 0) { k--; ");
+                } else {
+                    fz_put(buf, pl, b"k = ");
+                    fz_put(buf, pl, &nd);
+                    fz_put(buf, pl, b"; do { k--; ");
+                }
+                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, true, 3, mask) };
+                fz_put(buf, pl, if kind == SK_DO { b"} while (k > 0); " as &[u8] } else { b"} " });
+            }
+            _ => {
+                // SK_BREAK_IF / SK_CONTINUE_IF
+                fz_put(buf, pl, b"if (");
+                let (seed, e) = sf_expr(g, s.ed as u32);
+                s.seed = seed;
+                fz_put(buf, pl, fz_bytes(&e));
+                fz_put(buf, pl, if kind == SK_BREAK_IF { b") { break; } " as &[u8] } else { b") { continue; } " });
+            }
+        }
+        *mask |= 1u32 << kind;
+        unsafe { *pool.add(idx as usize) = s };
+        if prev == SF_END {
+            head = idx;
+        } else {
+            unsafe { (*pool.add(prev as usize)).next = idx };
+        }
+        prev = idx;
+    }
+    head
+}
+
+/// Reference execution of a statement list. Returns 0 normally, 1 on
+/// `break`, 2 on `continue` (propagated to the enclosing loop).
+/// `sabotage` evaluates `V = W++` / `V = W--` as prefix (negative control).
+unsafe fn sf_exec(g: &mut FuzzGen, pool: *const SfStmt, head: u8, st: &mut SfState, sabotage: bool) -> u8 {
+    let mut idx = head;
+    while idx != SF_END {
+        let s = unsafe { *pool.add(idx as usize) };
+        match s.kind {
+            SK_ASSIGN => {
+                let val = sf_eval(g, s.seed, s.ed, st);
+                sf_set(st, s.v, val);
+            }
+            SK_COMPOUND => {
+                let r = sf_eval(g, s.seed, s.ed, st);
+                let val = sf_apply(s.op, sf_get(st, s.v), r);
+                sf_set(st, s.v, val);
+            }
+            SK_INCDEC => {
+                let d: i64 = if s.op == 0 || s.op == 2 { 1 } else { -1 };
+                let val = sf_get(st, s.v).wrapping_add(d);
+                sf_set(st, s.v, val);
+            }
+            SK_ASSIGN_INCDEC => {
+                let d: i64 = if s.op == 0 || s.op == 2 { 1 } else { -1 };
+                let old = sf_get(st, s.w);
+                let new = old.wrapping_add(d);
+                sf_set(st, s.w, new);
+                let prefix = s.op >= 2 || sabotage;
+                sf_set(st, s.v, if prefix { new } else { old });
+            }
+            SK_DEREF_ASSIGN => {
+                let val = sf_eval(g, s.seed, s.ed, st);
+                sf_set(st, 0, val);
+            }
+            SK_DEREF_COMPOUND => {
+                let r = sf_eval(g, s.seed, s.ed, st);
+                let val = sf_apply(s.op, sf_get(st, 0), r);
+                sf_set(st, 0, val);
+            }
+            SK_ARRAY_ASSIGN | SK_ARRAY_COMPOUND => {
+                let i = (sf_eval(g, s.seed2, s.ed2, st) & 1) as usize;
+                let r = sf_eval(g, s.seed, s.ed, st);
+                let old = unsafe { *st.t.as_ptr().add(i) };
+                let val = if s.kind == SK_ARRAY_ASSIGN { r } else { sf_apply(s.op, old, r) };
+                unsafe { *st.t.as_mut_ptr().add(i) = val };
+            }
+            SK_CHAR_ASSIGN => {
+                let val = sf_eval(g, s.seed, s.ed, st);
+                st.ch = (val as u8) as i8 as i64;
+            }
+            SK_IF => {
+                let c = sf_eval(g, s.seed, s.ed, st);
+                let r = if c != 0 {
+                    unsafe { sf_exec(g, pool, s.body, st, sabotage) }
+                } else if s.els != SF_END {
+                    unsafe { sf_exec(g, pool, s.els, st, sabotage) }
+                } else {
+                    0
+                };
+                if r != 0 {
+                    return r;
+                }
+            }
+            SK_FOR => {
+                let mut k = 0u8;
+                while k < s.n {
+                    if unsafe { sf_exec(g, pool, s.body, st, sabotage) } == 1 {
+                        break;
+                    }
+                    k += 1;
+                }
+            }
+            SK_WHILE => {
+                let mut k = s.n as i64;
+                while k > 0 {
+                    k -= 1;
+                    if unsafe { sf_exec(g, pool, s.body, st, sabotage) } == 1 {
+                        break;
+                    }
+                }
+            }
+            SK_DO => {
+                let mut k = s.n as i64;
+                loop {
+                    k -= 1;
+                    if unsafe { sf_exec(g, pool, s.body, st, sabotage) } == 1 {
+                        break;
+                    }
+                    if k <= 0 {
+                        break;
+                    }
+                }
+            }
+            SK_BREAK_IF => {
+                if sf_eval(g, s.seed, s.ed, st) != 0 {
+                    return 1;
+                }
+            }
+            _ => {
+                if sf_eval(g, s.seed, s.ed, st) != 0 {
+                    return 2;
+                }
+            }
+        }
+        idx = s.next;
+    }
+    0
+}
+
+/// The value `return a * 1000003 ^ b * 7919 ^ c ^ t[0] * 31 ^ t[1] * 37 ^ ch * 41;` yields.
+fn sf_digest(st: &SfState) -> i64 {
+    let v = |i: usize| unsafe { *st.v.as_ptr().add(i) };
+    let t = |i: usize| unsafe { *st.t.as_ptr().add(i) };
+    v(0).wrapping_mul(1000003) ^ v(1).wrapping_mul(7919) ^ v(2) ^ t(0).wrapping_mul(31) ^ t(1).wrapping_mul(37) ^ st.ch.wrapping_mul(41)
+}
+
+/// Returns (cases, [mismatch, compile_fail], skipped, kind coverage, control_cases, control_mismatches).
+unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], u32, u32) {
+    const CASES_PER_MODE: u32 = 400;
+    const CONTROL_CASES: u32 = 60;
+    let mut ran = 0u32;
+    let mut counts = [0u32; 2];
+    let mut reported = 0u32;
+    let mut skipped = 0u32;
+    let mut cov = [0u32; SK_COUNT];
+    let mut control_ran = 0u32;
+    let mut control_mis = 0u32;
+    let mut pool = [sf_blank(); SF_MAX];
+    let mut buf = [0u8; SF_BUF];
+    // modes 0/1 = fully parenthesized / minimal, mode 2 = negative control (minimal, sabotaged reference)
+    for mode in 0..3u32 {
+        let mut g = FuzzGen { rng: 0x5DEE_CE66_D1CE_4E5B ^ ((mode as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D)), vars: [0; 3], t: [0; 2], ch: 0, minimal: mode != 0, no_calls: true };
+        let target = if mode == 2 { CONTROL_CASES } else { CASES_PER_MODE };
+        let mut produced = 0u32;
+        let mut attempts = 0u32;
+        while produced < target && attempts < target * 8 {
+            attempts += 1;
+            let mut st = SfState { v: [0; 3], t: [0; 2], ch: 0 };
+            for v in 0..3u8 {
+                let val = match g.rnd(8) {
+                    0 => 1i64 << 40,
+                    1 => -(1i64 << 33),
+                    _ => g.rnd(101) as i64 - 50,
+                };
+                sf_set(&mut st, v, val);
+            }
+            for i in 0..2usize {
+                unsafe { *st.t.as_mut_ptr().add(i) = g.rnd(41) as i64 - 20 };
+            }
+            let ch_raw = g.rnd(256) as i64;
+            st.ch = (ch_raw as u8) as i8 as i64;
+
+            let mut pl = 0usize;
+            fz_put(&mut buf, &mut pl, b"int main() { int a; int b; int c; int t[2]; char ch; int *p; int k; ");
+            for v in 0..3u8 {
+                fz_put(&mut buf, &mut pl, sf_var(v));
+                fz_put(&mut buf, &mut pl, b" = ");
+                fz_put_signed(&mut buf, &mut pl, sf_get(&st, v));
+                fz_put(&mut buf, &mut pl, b"; ");
+            }
+            for i in 0..2usize {
+                fz_put(&mut buf, &mut pl, b"t[");
+                fz_put(&mut buf, &mut pl, &[b'0' + i as u8]);
+                fz_put(&mut buf, &mut pl, b"] = ");
+                fz_put_signed(&mut buf, &mut pl, unsafe { *st.t.as_ptr().add(i) });
+                fz_put(&mut buf, &mut pl, b"; ");
+            }
+            fz_put(&mut buf, &mut pl, b"ch = ");
+            fz_put_signed(&mut buf, &mut pl, ch_raw);
+            fz_put(&mut buf, &mut pl, b"; p = &a; ");
+            let mut np = 0usize;
+            let mut mask = 0u32;
+            let head = unsafe { sf_gen_block(&mut g, pool.as_mut_ptr(), &mut np, &mut buf, &mut pl, 2, false, 5, &mut mask) };
+            fz_put(&mut buf, &mut pl, b"return a * 1000003 ^ b * 7919 ^ c ^ t[0] * 31 ^ t[1] * 37 ^ ch * 41; }");
+
+            if fz_token_count(unsafe { core::slice::from_raw_parts(buf.as_ptr(), pl) }) > 250 {
+                skipped += 1;
+                continue;
+            }
+            if mode == 2 && mask & (1u32 << SK_ASSIGN_INCDEC) == 0 {
+                // the control only means something on programs that contain `V = W++`
+                continue;
+            }
+            produced += 1;
+            let sabotage = mode == 2;
+            unsafe { sf_exec(&mut g, pool.as_ptr(), head, &mut st, sabotage) };
+            let want = sf_digest(&st) as u64;
+            // compile_and_run resets the heap only; `buf`/`pool` live on this stack
+            let got = unsafe { compile_and_run_program_callable(buf.as_ptr() as u64, pl as u64) };
+            if mode == 2 {
+                control_ran += 1;
+                if got != Some(want) {
+                    control_mis += 1;
+                }
+                continue;
+            }
+            ran += 1;
+            let mut ki = 0usize;
+            while ki < SK_COUNT {
+                if mask & (1u32 << ki) != 0 {
+                    unsafe { *cov.as_mut_ptr().add(ki) += 1 };
+                }
+                ki += 1;
+            }
+            if got != Some(want) {
+                let cat = if got.is_none() { 1 } else { 0 };
+                unsafe { *counts.as_mut_ptr().add(cat) += 1 };
+                if reported < 6 {
+                    reported += 1;
+                    unsafe {
+                        w(if cat == 0 { b"  stmt-fuzz MISMATCH mode " as &[u8] } else { b"  stmt-fuzz COMPILE-FAIL mode " });
+                        write_u64_dec(mode as u64);
+                        w(b": ");
+                        w(core::slice::from_raw_parts(buf.as_ptr(), pl));
+                        w(b"  got=");
+                        match got {
+                            Some(r) => write_u64_dec(r),
+                            None => w(b"(compile failed)"),
+                        }
+                        w(b" want=");
+                        write_u64_dec(want);
+                        w(b"\n");
+                    }
+                }
+            }
+        }
+    }
+    (ran, counts, skipped, cov, control_ran, control_mis)
 }
 #[unsafe(link_section = ".text.start")]
 #[unsafe(no_mangle)]
@@ -18111,7 +18677,119 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m160 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 { 0 } else { 1 });
+        // MILESTONE 163: statement-level differential fuzz + hand-checked cases.
+        // CASE 264: `continue` in a do-while goes to the CONDITION. Hand-computed:
+        // k 3->2 (s=10), 2->1 (s=20), 1->0 then continue -> cond 0 > 0 false -> exit;
+        // 200 + 0 = 200. A continue that skipped the condition and jumped to
+        // the body top would run once more (k=-1, s=30 -> 299).
+        const SRC264: &[u8] = b"int main() { int k; int s; k = 3; s = 0; do { k--; if (k == 0) { continue; } s += 10; } while (k > 0); return s * 10 + k; }";
+        let case264_result = compile_and_run_program_callable(SRC264.as_ptr() as u64, SRC264.len() as u64);
+        w(b"  case264 (do-while continue -> condition) returned=");
+        match case264_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 200)\n");
+        let case264_ok = case264_result == Some(200);
+        write_check(b"case264_do_while_continue_returns_200=", case264_ok);
+
+        // CASE 265: compound assignment to an array element through a computed
+        // index. Hand-computed: t[1] = -3 << 3 = -24; t[0] = 5 - (-24) = 29;
+        // 2900 - 24 = 2876.
+        const SRC265: &[u8] = b"int main() { int t[2]; int i; t[0] = 5; t[1] = -3; i = 7; t[(i & 1)] <<= 3; t[(i - 7)] -= t[1]; return t[0] * 100 + t[1]; }";
+        let case265_result = compile_and_run_program_callable(SRC265.as_ptr() as u64, SRC265.len() as u64);
+        w(b"  case265 (array-element compound assignment) returned=");
+        match case265_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 2876)\n");
+        let case265_ok = case265_result == Some(2876);
+        write_check(b"case265_array_compound_returns_2876=", case265_ok);
+
+        // CASE 266: postfix vs prefix as an expression. Hand-computed: a = b++
+        // gives a=5, b=6; c = --b gives b=5, c=5; 500 + 50 + 5 = 555. Treating
+        // the postfix as prefix would give 655 -- the same confusion the fuzz's
+        // negative control plants in its reference.
+        const SRC266: &[u8] = b"int main() { int a; int b; int c; b = 5; a = b++; c = --b; return a * 100 + b * 10 + c; }";
+        let case266_result = compile_and_run_program_callable(SRC266.as_ptr() as u64, SRC266.len() as u64);
+        w(b"  case266 (a = b++ then c = --b) returned=");
+        match case266_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 555)\n");
+        let case266_ok = case266_result == Some(555);
+        write_check(b"case266_postfix_prefix_returns_555=", case266_ok);
+
+        // CASE 267: `*p +=` writes through to `a`, then a char store narrows.
+        // Hand-computed: a = 200; ch = 201 -> signed byte -55; -55 + 1000 + 200
+        // = 1145. An unsigned char would give 201 + 1200 = 1401.
+        const SRC267: &[u8] = b"int main() { int a; int *p; char ch; a = 100; p = &a; *p += 100; ch = a + 1; return ch + 1000 + a; }";
+        let case267_result = compile_and_run_program_callable(SRC267.as_ptr() as u64, SRC267.len() as u64);
+        w(b"  case267 (*p += then char narrowing) returned=");
+        match case267_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 1145)\n");
+        let case267_ok = case267_result == Some(1145);
+        write_check(b"case267_deref_compound_char_returns_1145=", case267_ok);
+
+        let (sf_ran, sf_counts, sf_skipped, sf_cov, sf_ctl_ran, sf_ctl_mis) = fuzz_stmt_differential();
+        w(b"milestone 163: statement fuzz -- cases=");
+        write_u64_dec(sf_ran as u64);
+        w(b" mismatches=");
+        write_u64_dec(*sf_counts.as_ptr() as u64);
+        w(b" compile_failures=");
+        write_u64_dec(*sf_counts.as_ptr().add(1) as u64);
+        w(b" skipped_over_token_limit=");
+        write_u64_dec(sf_skipped as u64);
+        w(b" | coverage (programs containing): assign=");
+        let sc = |i: u8| *sf_cov.as_ptr().add(i as usize) as u64;
+        write_u64_dec(sc(SK_ASSIGN));
+        w(b" compound=");
+        write_u64_dec(sc(SK_COMPOUND));
+        w(b" incdec=");
+        write_u64_dec(sc(SK_INCDEC));
+        w(b" v=w++=");
+        write_u64_dec(sc(SK_ASSIGN_INCDEC));
+        w(b" *p==");
+        write_u64_dec(sc(SK_DEREF_ASSIGN));
+        w(b" *p-op==");
+        write_u64_dec(sc(SK_DEREF_COMPOUND));
+        w(b" t[]==");
+        write_u64_dec(sc(SK_ARRAY_ASSIGN));
+        w(b" t[]-op==");
+        write_u64_dec(sc(SK_ARRAY_COMPOUND));
+        w(b" ch==");
+        write_u64_dec(sc(SK_CHAR_ASSIGN));
+        w(b" if=");
+        write_u64_dec(sc(SK_IF));
+        w(b" for=");
+        write_u64_dec(sc(SK_FOR));
+        w(b" while=");
+        write_u64_dec(sc(SK_WHILE));
+        w(b" do=");
+        write_u64_dec(sc(SK_DO));
+        w(b" break=");
+        write_u64_dec(sc(SK_BREAK_IF));
+        w(b" continue=");
+        write_u64_dec(sc(SK_CONTINUE_IF));
+        w(b"\n");
+        w(b"milestone 163: negative control (reference evaluates V = W++ as prefix) -- cases=");
+        write_u64_dec(sf_ctl_ran as u64);
+        w(b" detected_mismatches=");
+        write_u64_dec(sf_ctl_mis as u64);
+        w(b"\n");
+        let sf_control_ok = sf_ctl_ran > 0 && sf_ctl_mis > 0;
+        write_check(b"m163_negative_control_detected=", sf_control_ok);
+        let overall_m163 = sf_ran > 0 && *sf_counts.as_ptr() == 0 && *sf_counts.as_ptr().add(1) == 0 && sf_control_ok && case264_ok && case265_ok && case266_ok && case267_ok;
+        w(b"OVERALL_M163=");
+        w(if overall_m163 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 { 0 } else { 1 });
     }
 }
 

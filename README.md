@@ -2713,6 +2713,44 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       are untested: the shipped fs workload's repeats are already absorbed
       by the cache, so the learner would add nothing there today.
 
+- [x] **Milestone 165**: Milestone 77's heterogeneous-ensemble PASS was a
+      false positive -- found, measured and corrected. M77 set each
+      detector's threshold at mean + 3 sigma of only 4 quiet windows and
+      detected on `count >= threshold`. A 32-window measurement
+      (`m165_diag_run2_reused_boot.log`) showed the resonator population
+      fires exactly 3 times on EVERY signal (quiet 32/32, frequency anomaly
+      32/32): sigma = 0, threshold 3.00, so every window -- quiet or not --
+      was a "frequency detection". M77's 16/16 vs 12/16 rested entirely on
+      that. The occasional "flaky" M77 FAIL (M141, M157, M164's first fresh
+      boot: one calibration window read 4, threshold 4.75) was the honest
+      outcome. On this disk signal the frequency anomaly is an activity DROP
+      (Izhikevich/AdEx 54 -> 33), so nothing detects it as an excess.
+      **Fix** (`hetero_ensemble.rs`): 32 calibration windows; threshold =
+      max(mean + 3 sigma, largest calibration count + 1); a held-out
+      false-positive control on 32 quiet windows; old- and new-rule results
+      and a per-type x per-anomaly table printed from the same spike counts.
+      **First attempt failed its own gate, kept on record**
+      (`m165_first_attempt_*`): 16 windows, gate "0/8 held-out false
+      positives"; 12x LIF had 1/8 (its quiet counts have a tail). A zero
+      gate is itself flaky for a tailed count -- a new window beats the max
+      of n calibration windows with probability 1/(n+1) -- so the gate was
+      re-pre-registered as a rate: each ensemble <= 4/32. **Second attempt,
+      all five predictions met in both boots**: heterogeneous false
+      positives 1/32 and 0/32, homogeneous 1/32 and 1/32; M77's OLD rule
+      gives the heterogeneous ensemble 32/32 false positives (the bug,
+      confirmed); frequency 0/4 for both; totals 12/16 vs 12/16, so
+      `OVERALL_M77=FAIL` -- a stable, honest negative: on this kernel's disk
+      signal the heterogeneous typed ensemble does NOT beat same-size
+      homogeneous LIF. `OVERALL_M165=PASS` (the evaluation is sound). Per
+      type: Izhikevich and AdEx catch magnitude, burst and repetition 4/4;
+      LIF x3 magnitude 4/4, burst 2/4, repetition 4/4; the resonator catches
+      nothing. Both boots (`m165_fresh_boot.log`/`m165_reused_boot.log`):
+      103 aggregate markers PASS plus M77's FAIL, fs 0 FAIL / 82 PASS, zero
+      panics or faults. **Still open**: a genuine frequency test on this
+      signal needs a redesigned, pre-registered anomaly (the current one
+      removes reads); the resonator never responds to sparse RDTSC impulses
+      at this scale, which is worth its own measurement before any claim.
+
 ## Building and running
 
 Requires:

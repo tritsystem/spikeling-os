@@ -5585,6 +5585,16 @@ self-test suite, genuinely open for a future pass.
       exact cycle numbers themselves are a property of this emulation,
       not a physical disk.
 
+      **CORRECTED by Milestone 165** (see README.md): the 16/16 vs 12/16
+      result above was a false positive. The resonator fires exactly 3
+      times on every signal, quiet or not, so its 4-window threshold of
+      3.00 with `>=` counted every window as a frequency detection (M77's
+      rule gives the heterogeneous ensemble 32/32 false positives on
+      held-out quiet windows). With sound thresholds both ensembles score
+      12/16 and `OVERALL_M77` is FAIL. The claim above that the win came
+      "specifically on the anomaly type (frequency) that requires a neuron
+      type genuinely different in kind" does not hold.
+
 - [x] **Milestone 78**: does spike-timing-dependent plasticity (STDP)
       -- this kernel's own real learning rule, `network.rs::apply_stdp()`,
       verified since Milestone 17/21 on LIF-only LeftKey/RightKey->Motor

@@ -459,42 +459,110 @@ fn make_population(kind: Kind, n: usize, seed: u64) -> Vec<(Kind, Neuron)> {
     (0..n).map(|_| (kind, make_neuron(kind, &mut rng))).collect()
 }
 
-/// Real measured baseline calibration: run n_windows independent
-/// quiet-baseline windows, calibrate threshold at mean + k*sigma of
-/// the total-spike-count-per-window distribution -- same discipline as
-/// the Python file's own calibrate_threshold(). Floored at 1.0 for the
-/// same reason: a genuinely zero-variance quiet population would
-/// otherwise make any single spike trivially "detected".
-fn calibrate_threshold(kind: Kind, n: usize, seed: u64, n_windows: u32) -> (f32, f32, f32) {
+// MILESTONE 165: Milestone 77's calibration was unsound. It set each
+// threshold at mean + 3 sigma of only 4 quiet windows and detected on
+// `count >= threshold`. A 32-window measurement (m165_diag_run2_reused_boot.log)
+// showed the resonator population fires exactly 3 times on EVERY signal --
+// quiet baseline 3 (32/32), frequency anomaly 3 (32/32) -- so with sigma = 0
+// its threshold was 3.00 and every window, quiet or not, counted as a
+// "frequency detection". M77's 16/16-vs-12/16 PASS rested on that. When one
+// calibration window happened to read 4, sigma became 0.5, the threshold
+// 4.75, and M77 "flaked" to FAIL (M141, M157, M164's first fresh boot): that
+// FAIL was the honest outcome. On this disk signal the frequency anomaly is
+// a DROP in activity (Izhikevich 54 -> 33, AdEx 54 -> 33, LIF x3 ~78 -> ~55,
+// LIF x12 ~300 -> ~210), so nothing here detects it as an excess.
+//
+// Fix: require a detection to exceed every calibration window (threshold
+// >= max + 1, and >= mean + 3 sigma) and measure false positives on
+// held-out quiet windows.
+//
+// First attempt (m165_first_attempt_{fresh,reused}_boot.log): 16 calibration
+// windows, gate "0/8 held-out false positives". Old rule: heterogeneous 8/8
+// false positives in both boots (the bug, confirmed). New rule:
+// heterogeneous 0/8 but homogeneous 1/8 -- 12x LIF's quiet-window counts have
+// a tail past mean + 3 sigma of 16 windows -- so the gate failed. A zero-
+// false-positive gate is itself flaky for a tailed count: by exchangeability
+// a new quiet window exceeds the max of n calibration windows with
+// probability 1/(n+1).
+//
+// Second attempt (this code), re-pre-registered: 32 calibration windows
+// (per-detector false-positive rate <= 1/33 by the argument above), 32
+// held-out windows, gate: each ensemble <= MAX_HELDOUT_FP = 4/32. The
+// heterogeneous decision ORs four detectors, so its worst case is ~4/33 per
+// window. Predictions: (Q1) heterogeneous false positives <= 1/32 (its
+// resonator and AdEx counts are constant on quiet windows, Izhikevich spans
+// 54-56); (Q2) homogeneous <= 2/32; (Q3) old rule heterogeneous 32/32
+// false positives whenever its resonator threshold is 3.00; (Q4) frequency
+// detected <= 1/4 by either ensemble; (Q5) OVERALL_M77 is a tie (FAIL) or
+// a margin of one trial, varying boot to boot.
+/// Total spike count of an `n`-neuron population of `kind` on one quiet
+/// baseline window per `w` in 0..n_windows (Milestone 77's seeding).
+fn calibration_counts(kind: Kind, n: usize, seed: u64, n_windows: u32) -> Vec<f32> {
     let mut counts: Vec<f32> = Vec::new();
     for w in 0..n_windows {
         let mut pop = make_population(kind, n, seed.wrapping_add(w as u64).wrapping_mul(2654435761));
         let fires = run_population(&mut pop, |s, _t, r| baseline_raw(s, r), seed.wrapping_add(w as u64));
         counts.push(fires.iter().sum::<u32>() as f32);
     }
-    let mean = counts.iter().sum::<f32>() / counts.len() as f32;
-    let var = counts.iter().map(|c| (c - mean) * (c - mean)).sum::<f32>() / (counts.len().max(2) - 1) as f32;
-    let std = libm::sqrtf(var);
-    (libm::fmaxf(mean + 3.0 * std, 1.0), mean, std)
+    counts
 }
 
-fn test_type_vs_anomaly(kind: Kind, signal: SignalFn, n: usize, threshold: f32, n_trials: u32, seed_base: u64) -> (u32, u32) {
-    let mut detected = 0;
-    for trial in 0..n_trials {
-        let seed = seed_base.wrapping_add(trial as u64 * 137);
-        let mut pop = make_population(kind, n, seed);
-        let fires = run_population(&mut pop, signal, seed.wrapping_add(999));
-        if fires.iter().sum::<u32>() as f32 >= threshold {
-            detected += 1;
-        }
-    }
-    (detected, n_trials)
+/// (mean, sample std, max) of a set of window counts.
+fn count_stats(counts: &[f32]) -> (f32, f32, f32) {
+    let mean = counts.iter().sum::<f32>() / counts.len() as f32;
+    let var = counts.iter().map(|c| (c - mean) * (c - mean)).sum::<f32>() / (counts.len().max(2) - 1) as f32;
+    let max = counts.iter().fold(0.0f32, |m, c| libm::fmaxf(m, *c));
+    (mean, libm::sqrtf(var), max)
+}
+
+/// Milestone 77's original rule: mean + 3 sigma over the first 4 windows,
+/// floored at 1.0, detection `count >= threshold`.
+fn old_threshold(counts: &[f32]) -> f32 {
+    let (mean, std, _) = count_stats(&counts[..OLD_CALIB_WINDOWS]);
+    libm::fmaxf(mean + 3.0 * std, 1.0)
+}
+
+/// MILESTONE 165: the same mean + 3 sigma over all N_CALIB_WINDOWS, but
+/// never at or below the largest calibration count -- a detection must
+/// exceed every quiet window actually observed.
+fn new_threshold(counts: &[f32]) -> f32 {
+    let (mean, std, max) = count_stats(counts);
+    libm::fmaxf(mean + 3.0 * std, max + 1.0)
 }
 
 const N_PER_TYPE: usize = 3;
 const N_TOTAL_HOMOG: usize = 12; // same total neuron count as the 4 heterogeneous types combined
 const N_TRIALS: u32 = 4;
-const N_CALIB_WINDOWS: u32 = 4;
+const OLD_CALIB_WINDOWS: usize = 4; // Milestone 77's original calibration size
+const N_CALIB_WINDOWS: u32 = 32; // MILESTONE 165
+const N_HELDOUT: u32 = 32; // MILESTONE 165: held-out quiet windows for the false-positive control
+const MAX_HELDOUT_FP: u32 = 4; // MILESTONE 165: gate -- at most 4/32 false positives per ensemble
+
+/// Heterogeneous decision for one trial: which of the four typed
+/// sub-populations reached its threshold (bit k = KINDS[k]), under the old
+/// and the new thresholds, from the SAME spike counts.
+fn het_trial(signal: SignalFn, seed: u64, old_thr: &[f32; 4], new_thr: &[f32; 4]) -> (u8, u8) {
+    let mut old_bits = 0u8;
+    let mut new_bits = 0u8;
+    for (k_idx, kind) in KINDS.iter().enumerate() {
+        let mut pop = make_population(*kind, N_PER_TYPE, seed);
+        let total = run_population(&mut pop, signal, seed.wrapping_add(999)).iter().sum::<u32>() as f32;
+        if total >= old_thr[k_idx] {
+            old_bits |= 1 << k_idx;
+        }
+        if total >= new_thr[k_idx] {
+            new_bits |= 1 << k_idx;
+        }
+    }
+    (old_bits, new_bits)
+}
+
+/// Homogeneous decision for one trial under (old, new) thresholds.
+fn homog_trial(signal: SignalFn, seed: u64, old_thr: f32, new_thr: f32) -> (bool, bool) {
+    let mut pop = make_population(Kind::Lif, N_TOTAL_HOMOG, seed);
+    let total = run_population(&mut pop, signal, seed.wrapping_add(999)).iter().sum::<u32>() as f32;
+    (total >= old_thr, total >= new_thr)
+}
 
 /// MILESTONE 77: runs the full comparison and logs a result line per
 /// anomaly type plus a final OVERALL_M77 verdict, same "PASS"/"FAIL"
@@ -511,45 +579,105 @@ pub fn self_test_hetero_ensemble() {
         "milestone 77: heterogeneous neuron ensemble self-test starting -- real ata.rs disk I/O as the drive signal, real RDTSC timing, {N_PER_TYPE} neurons/type x 4 types vs {N_TOTAL_HOMOG}x homogeneous LIF"
     );
 
-    let mut thresholds = [0.0f32; 4];
+    // MILESTONE 165: calibrate on N_CALIB_WINDOWS; the old rule reuses the
+    // first OLD_CALIB_WINDOWS of the same windows (M77's exact seeds).
+    let mut old_thr = [0.0f32; 4];
+    let mut new_thr = [0.0f32; 4];
     for (idx, kind) in KINDS.iter().enumerate() {
-        let (thr, mean, std) = calibrate_threshold(*kind, N_PER_TYPE, 0x1000 + idx as u64, N_CALIB_WINDOWS);
-        thresholds[idx] = thr;
-        let _ = writeln!(port, "milestone 77: calibrated {} threshold={thr:.2} (baseline mean={mean:.2}, std={std:.2})", kind_name(*kind));
+        let counts = calibration_counts(*kind, N_PER_TYPE, 0x1000 + idx as u64, N_CALIB_WINDOWS);
+        let (mean, std, max) = count_stats(&counts);
+        old_thr[idx] = old_threshold(&counts);
+        new_thr[idx] = new_threshold(&counts);
+        let _ = writeln!(
+            port,
+            "milestone 77: calibrated {} threshold={:.2} (baseline mean={mean:.2}, std={std:.2}, max={max:.0}, {N_CALIB_WINDOWS} windows; M77's old 4-window rule gave {:.2})",
+            kind_name(*kind),
+            new_thr[idx],
+            old_thr[idx]
+        );
     }
-    let (homog_thr, homog_mean, homog_std) = calibrate_threshold(Kind::Lif, N_TOTAL_HOMOG, 0x2000, N_CALIB_WINDOWS);
-    let _ = writeln!(port, "milestone 77: calibrated homogeneous ({N_TOTAL_HOMOG}x LIF) threshold={homog_thr:.2} (baseline mean={homog_mean:.2}, std={homog_std:.2})");
+    let homog_counts = calibration_counts(Kind::Lif, N_TOTAL_HOMOG, 0x2000, N_CALIB_WINDOWS);
+    let (h_mean, h_std, h_max) = count_stats(&homog_counts);
+    let homog_old_thr = old_threshold(&homog_counts);
+    let homog_new_thr = new_threshold(&homog_counts);
+    let _ = writeln!(
+        port,
+        "milestone 77: calibrated homogeneous ({N_TOTAL_HOMOG}x LIF) threshold={homog_new_thr:.2} (baseline mean={h_mean:.2}, std={h_std:.2}, max={h_max:.0}; old rule {homog_old_thr:.2})"
+    );
 
     let mut het_detected: u32 = 0;
+    let mut het_old_detected: u32 = 0;
     let mut het_total: u32 = 0;
     let mut homog_detected: u32 = 0;
+    let mut homog_old_detected: u32 = 0;
     let mut homog_total: u32 = 0;
 
     for (a_idx, (name, signal)) in ANOMALIES.iter().enumerate() {
         let mut het_hits = 0u32;
+        let mut het_old_hits = 0u32;
+        let mut per_type = [0u32; 4];
         for trial in 0..N_TRIALS {
             let seed = 0x3000 + (a_idx as u64) * 1000 + trial as u64 * 137;
-            let mut any_hit = false;
-            for (k_idx, kind) in KINDS.iter().enumerate() {
-                let mut pop = make_population(*kind, N_PER_TYPE, seed);
-                let fires = run_population(&mut pop, *signal, seed.wrapping_add(999));
-                if fires.iter().sum::<u32>() as f32 >= thresholds[k_idx] {
-                    any_hit = true;
-                }
-            }
-            if any_hit {
+            let (old_bits, new_bits) = het_trial(*signal, seed, &old_thr, &new_thr);
+            if new_bits != 0 {
                 het_hits += 1;
+            }
+            if old_bits != 0 {
+                het_old_hits += 1;
+            }
+            for (k, c) in per_type.iter_mut().enumerate() {
+                if new_bits & (1 << k) != 0 {
+                    *c += 1;
+                }
             }
         }
         het_detected += het_hits;
+        het_old_detected += het_old_hits;
         het_total += N_TRIALS;
 
-        let (homog_det, homog_n) = test_type_vs_anomaly(Kind::Lif, *signal, N_TOTAL_HOMOG, homog_thr, N_TRIALS, 0x4000 + a_idx as u64 * 1000);
+        let mut homog_det = 0u32;
+        let mut homog_old_det = 0u32;
+        for trial in 0..N_TRIALS {
+            let seed = 0x4000 + a_idx as u64 * 1000 + trial as u64 * 137;
+            let (o, n) = homog_trial(*signal, seed, homog_old_thr, homog_new_thr);
+            homog_old_det += o as u32;
+            homog_det += n as u32;
+        }
         homog_detected += homog_det;
-        homog_total += homog_n;
+        homog_old_detected += homog_old_det;
+        homog_total += N_TRIALS;
 
-        let _ = writeln!(port, "milestone 77: {name:<12} heterogeneous={het_hits}/{N_TRIALS}  homogeneous({N_TOTAL_HOMOG}xLIF)={homog_det}/{homog_n}");
+        let _ = writeln!(
+            port,
+            "milestone 77: {name:<12} heterogeneous={het_hits}/{N_TRIALS}  homogeneous({N_TOTAL_HOMOG}xLIF)={homog_det}/{N_TRIALS}  | by type: lif={} izhikevich={} adex={} resonator={}  | old rule: het={het_old_hits} homog={homog_old_det}",
+            per_type[0], per_type[1], per_type[2], per_type[3]
+        );
     }
+
+    // MILESTONE 165: false-positive control -- the same decisions on quiet
+    // baseline windows never used for calibration. A detector that fires
+    // here is not detecting the anomaly.
+    let quiet: SignalFn = |s, _t, r| baseline_raw(s, r);
+    let mut het_fp = 0u32;
+    let mut het_old_fp = 0u32;
+    let mut homog_fp = 0u32;
+    let mut homog_old_fp = 0u32;
+    for trial in 0..N_HELDOUT {
+        let (old_bits, new_bits) = het_trial(quiet, 0x5000 + trial as u64 * 137, &old_thr, &new_thr);
+        het_fp += (new_bits != 0) as u32;
+        het_old_fp += (old_bits != 0) as u32;
+        let (o, n) = homog_trial(quiet, 0x6000 + trial as u64 * 137, homog_old_thr, homog_new_thr);
+        homog_fp += n as u32;
+        homog_old_fp += o as u32;
+    }
+    let _ = writeln!(
+        port,
+        "milestone 165: false-positive control ({N_HELDOUT} held-out quiet windows) -- heterogeneous={het_fp}/{N_HELDOUT} homogeneous={homog_fp}/{N_HELDOUT} | M77's old rule: heterogeneous={het_old_fp}/{N_HELDOUT} homogeneous={homog_old_fp}/{N_HELDOUT}"
+    );
+    let _ = writeln!(
+        port,
+        "milestone 165: old rule TOTAL heterogeneous={het_old_detected}/{het_total} homogeneous={homog_old_detected}/{homog_total} (what M77 reported before this fix)"
+    );
 
     let het_pct = 100.0 * het_detected as f32 / het_total as f32;
     let homog_pct = 100.0 * homog_detected as f32 / homog_total as f32;
@@ -561,7 +689,10 @@ pub fn self_test_hetero_ensemble() {
     // Honest verdict, per the Python file's own DISCONFIRM clause: PASS
     // means the heterogeneous ensemble detected strictly more than the
     // homogeneous one on this kernel's own real disk signal, not a
-    // hardcoded expectation.
+    // hardcoded expectation. Since Milestone 165 this uses the corrected
+    // thresholds; before it, the resonator's threshold usually equalled its
+    // constant quiet-window count, so every window -- quiet or not -- was a
+    // "frequency detection".
     let pass = het_detected > homog_detected;
     let _ = writeln!(
         port,
@@ -572,4 +703,9 @@ pub fn self_test_hetero_ensemble() {
             "OVERALL_M77=FAIL (heterogeneous ensemble did NOT beat homogeneous on this real signal -- reported honestly, a real negative result if so)"
         }
     );
+    // MILESTONE 165's own check is that the evaluation is sound: under the
+    // corrected rule neither ensemble fires on more than MAX_HELDOUT_FP of
+    // the held-out quiet windows.
+    let m165 = het_fp <= MAX_HELDOUT_FP && homog_fp <= MAX_HELDOUT_FP;
+    let _ = writeln!(port, "milestone 165: OVERALL_M165={}", if m165 { "PASS" } else { "FAIL" });
 }

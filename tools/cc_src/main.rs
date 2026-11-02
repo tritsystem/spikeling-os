@@ -9157,7 +9157,20 @@ unsafe fn gen_stmt_list(
                     unsafe { gen_stmt_list(buf, src_ptr, vars_ptr, nvars, funcs_ptr, nfuncs, pending_ptr, pending_count_ptr, mode, cn.then_body, loop_top, loop_is_for, 1, is_char_return) }?;
                     c2 = cn.next;
                 }
-                unsafe { loop_set_cont_n(cont_base) };
+                // MILESTONE 166: drop only this switch's own case-jz entries.
+                // A `continue` in a case body inside a `for` or do-while (both
+                // lower `continue` as a forward jmp) pushed it onto this same
+                // arena AFTER them; the old
+                // `loop_set_cont_n(cont_base)` discarded it, leaving `jmp +0`
+                // (a silent fall-through). Slide those pending continues down.
+                let ncases = idx - cont_base;
+                let cont_now = unsafe { loop_cont_n() };
+                let mut j = cont_base + ncases;
+                while j < cont_now {
+                    unsafe { core::ptr::write((core::ptr::addr_of_mut!(LOOP_CONT) as u64 + (j - ncases) * 8) as *mut u64, loop_cont_at(j)) };
+                    j += 1;
+                }
+                unsafe { loop_set_cont_n(cont_now - ncases) };
 
                 // Default body (if any) -- the no-match jump lands at
                 // its start; otherwise it lands at `end` below.
@@ -10538,7 +10551,22 @@ const SK_WHILE: u8 = 11;
 const SK_DO: u8 = 12;
 const SK_BREAK_IF: u8 = 13;
 const SK_CONTINUE_IF: u8 = 14;
-const SK_COUNT: usize = 15;
+// MILESTONE 166: `switch ((E) & 3) { case L: ... [break;] ... [default: ...] }`.
+// Labels are distinct values 0..3 in random order; bodies may be empty;
+// each case ends in `break;` or falls through; `default` (optional) is
+// always last -- this compiler lowers `default` as the last label (M91).
+const SK_SWITCH: u8 = 15;
+const SK_CASE: u8 = 16; // pool-only: one case of a switch (op = label, 0xFF = default; n = ends in break)
+// coverage-only bits (never a statement kind)
+const CV_SWITCH_IN_LOOP: u8 = 17;
+const CV_BREAK_IN_SWITCH: u8 = 18; // a break whose innermost target is a switch
+const CV_BREAK_IN_SWITCH_IN_LOOP: u8 = 19; // ... and a loop encloses that switch
+const CV_CONTINUE_IN_SWITCH: u8 = 20; // continue inside a switch inside a loop
+const CV_FALLTHROUGH: u8 = 21; // a case without break followed by another label
+const SK_COUNT: usize = 22;
+// sabotage bits for the negative controls
+const SAB_POSTFIX_AS_PREFIX: u8 = 1;
+const SAB_SWITCH_BREAK_ESCAPES: u8 = 2; // a switch's break also leaves the enclosing loop/block
 
 #[derive(Clone, Copy)]
 struct SfStmt {
@@ -10659,10 +10687,12 @@ fn sf_set(st: &mut SfState, v: u8, val: i64) {
 
 /// Generate a statement list into `pool`, emitting its text into `buf`;
 /// returns the head index. `mask` collects which kinds were generated.
-unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: &mut [u8], pl: &mut usize, depth: u32, in_loop: bool, max_stmts: u64, mask: &mut u32) -> u8 {
+/// `brk` is the innermost `break` target: 0 none, 1 a loop, 2 a switch.
+/// `min_stmts` is 0 for a case body (which may be empty), else 1.
+unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: &mut [u8], pl: &mut usize, depth: u32, in_loop: bool, brk: u8, min_stmts: u64, max_stmts: u64, mask: &mut u32) -> u8 {
     let mut head = SF_END;
     let mut prev = SF_END;
-    let count = 1 + g.rnd(max_stmts);
+    let count = min_stmts + g.rnd(max_stmts + 1 - min_stmts);
     let mut i = 0u64;
     while i < count {
         i += 1;
@@ -10693,20 +10723,30 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
             SK_CHAR_ASSIGN
         } else if r < 78 {
             SK_IF
-        } else if r < 90 {
+        } else if r < 85 {
             SK_FOR + g.rnd(3) as u8
+        } else if r < 92 {
+            SK_SWITCH
         } else if g.rnd(2) == 0 {
             SK_BREAK_IF
         } else {
             SK_CONTINUE_IF
         };
-        if (kind == SK_IF || (kind >= SK_FOR && kind <= SK_DO)) && depth == 0 {
+        // MILESTONE 166: a switch inside a loop, and break/continue inside that
+        // switch, are rare under the flat mix above (6 of 800 programs in the
+        // first run, 0 with a continue) -- bias toward them where they can occur.
+        if in_loop && depth > 0 && g.rnd(3) == 0 {
+            kind = SK_SWITCH;
+        } else if in_loop && brk == 2 && g.rnd(3) == 0 {
+            kind = if g.rnd(2) == 0 { SK_BREAK_IF } else { SK_CONTINUE_IF };
+        }
+        if (kind == SK_IF || kind == SK_SWITCH || (kind >= SK_FOR && kind <= SK_DO)) && depth == 0 {
             kind = SK_COMPOUND;
         }
         if kind >= SK_FOR && kind <= SK_DO && in_loop {
             kind = SK_IF;
         }
-        if (kind == SK_BREAK_IF || kind == SK_CONTINUE_IF) && !in_loop {
+        if (kind == SK_BREAK_IF && brk == 0) || (kind == SK_CONTINUE_IF && !in_loop) {
             kind = SK_ASSIGN;
         }
         s.kind = kind;
@@ -10778,11 +10818,11 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
                 s.seed = seed;
                 fz_put(buf, pl, fz_bytes(&e));
                 fz_put(buf, pl, b") { ");
-                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, 2, mask) };
+                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, brk, 1, 2, mask) };
                 fz_put(buf, pl, b"} ");
                 if g.rnd(2) == 0 {
                     fz_put(buf, pl, b"else { ");
-                    s.els = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, 2, mask) };
+                    s.els = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, brk, 1, 2, mask) };
                     fz_put(buf, pl, b"} ");
                 }
             }
@@ -10802,11 +10842,79 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
                     fz_put(buf, pl, &nd);
                     fz_put(buf, pl, b"; do { k--; ");
                 }
-                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, true, 3, mask) };
+                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, true, 1, 1, 3, mask) };
                 fz_put(buf, pl, if kind == SK_DO { b"} while (k > 0); " as &[u8] } else { b"} " });
+            }
+            SK_SWITCH => {
+                if in_loop {
+                    *mask |= 1u32 << CV_SWITCH_IN_LOOP;
+                }
+                fz_put(buf, pl, b"switch ((");
+                let (seed, e) = sf_expr(g, s.ed as u32);
+                s.seed = seed;
+                fz_put(buf, pl, fz_bytes(&e));
+                fz_put(buf, pl, b") & 3) { ");
+                // 1..3 distinct labels from 0..3 in random order, then maybe `default`
+                let mut labels = [0u8, 1, 2, 3];
+                let mut j = 3usize;
+                while j > 0 {
+                    let r2 = g.rnd(j as u64 + 1) as usize;
+                    let lp = labels.as_mut_ptr();
+                    unsafe { core::ptr::swap(lp.add(j), lp.add(r2)) };
+                    j -= 1;
+                }
+                let ncases = 1 + g.rnd(3) as usize;
+                let has_default = g.rnd(2) == 0;
+                let total = ncases + has_default as usize;
+                let mut cprev = SF_END;
+                let mut ci = 0usize;
+                while ci < total && *np < SF_MAX {
+                    let cidx = *np as u8;
+                    *np += 1;
+                    let mut c = sf_blank();
+                    c.kind = SK_CASE;
+                    if ci < ncases {
+                        c.op = unsafe { *labels.as_ptr().add(ci) };
+                        fz_put(buf, pl, b"case ");
+                        fz_put(buf, pl, &[b'0' + c.op]);
+                        fz_put(buf, pl, b": ");
+                    } else {
+                        c.op = 0xFF;
+                        fz_put(buf, pl, b"default: ");
+                    }
+                    c.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, 2, 0, 2, mask) };
+                    c.n = (g.rnd(2) == 0) as u8;
+                    if c.n != 0 {
+                        fz_put(buf, pl, b"break; ");
+                        *mask |= 1u32 << CV_BREAK_IN_SWITCH;
+                        if in_loop {
+                            *mask |= 1u32 << CV_BREAK_IN_SWITCH_IN_LOOP;
+                        }
+                    } else if ci + 1 < total {
+                        *mask |= 1u32 << CV_FALLTHROUGH;
+                    }
+                    unsafe { *pool.add(cidx as usize) = c };
+                    if cprev == SF_END {
+                        s.body = cidx;
+                    } else {
+                        unsafe { (*pool.add(cprev as usize)).next = cidx };
+                    }
+                    cprev = cidx;
+                    ci += 1;
+                }
+                fz_put(buf, pl, b"} ");
             }
             _ => {
                 // SK_BREAK_IF / SK_CONTINUE_IF
+                if kind == SK_BREAK_IF && brk == 2 {
+                    *mask |= 1u32 << CV_BREAK_IN_SWITCH;
+                    if in_loop {
+                        *mask |= 1u32 << CV_BREAK_IN_SWITCH_IN_LOOP;
+                    }
+                }
+                if kind == SK_CONTINUE_IF && brk == 2 {
+                    *mask |= 1u32 << CV_CONTINUE_IN_SWITCH;
+                }
                 fz_put(buf, pl, b"if (");
                 let (seed, e) = sf_expr(g, s.ed as u32);
                 s.seed = seed;
@@ -10827,9 +10935,9 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
 }
 
 /// Reference execution of a statement list. Returns 0 normally, 1 on
-/// `break`, 2 on `continue` (propagated to the enclosing loop).
-/// `sabotage` evaluates `V = W++` / `V = W--` as prefix (negative control).
-unsafe fn sf_exec(g: &mut FuzzGen, pool: *const SfStmt, head: u8, st: &mut SfState, sabotage: bool) -> u8 {
+/// `break`, 2 on `continue` (propagated to the enclosing loop or switch).
+/// `sabotage` (SAB_* bits) plants a known-wrong semantic for a negative control.
+unsafe fn sf_exec(g: &mut FuzzGen, pool: *const SfStmt, head: u8, st: &mut SfState, sabotage: u8) -> u8 {
     let mut idx = head;
     while idx != SF_END {
         let s = unsafe { *pool.add(idx as usize) };
@@ -10853,7 +10961,7 @@ unsafe fn sf_exec(g: &mut FuzzGen, pool: *const SfStmt, head: u8, st: &mut SfSta
                 let old = sf_get(st, s.w);
                 let new = old.wrapping_add(d);
                 sf_set(st, s.w, new);
-                let prefix = s.op >= 2 || sabotage;
+                let prefix = s.op >= 2 || sabotage & SAB_POSTFIX_AS_PREFIX != 0;
                 sf_set(st, s.v, if prefix { new } else { old });
             }
             SK_DEREF_ASSIGN => {
@@ -10924,6 +11032,41 @@ unsafe fn sf_exec(g: &mut FuzzGen, pool: *const SfStmt, head: u8, st: &mut SfSta
                     return 1;
                 }
             }
+            SK_SWITCH => {
+                let v = (sf_eval(g, s.seed, s.ed, st) & 3) as u8;
+                // first case whose label matches, else `default`, else nothing
+                let mut start = SF_END;
+                let mut dflt = SF_END;
+                let mut c = s.body;
+                while c != SF_END {
+                    let cs = unsafe { *pool.add(c as usize) };
+                    if cs.op == v && start == SF_END {
+                        start = c;
+                    }
+                    if cs.op == 0xFF {
+                        dflt = c;
+                    }
+                    c = cs.next;
+                }
+                if start == SF_END {
+                    start = dflt;
+                }
+                let mut c = start;
+                while c != SF_END {
+                    let cs = unsafe { *pool.add(c as usize) };
+                    let r = unsafe { sf_exec(g, pool, cs.body, st, sabotage) };
+                    if r == 2 {
+                        return 2;
+                    }
+                    if r == 1 || cs.n != 0 {
+                        if sabotage & SAB_SWITCH_BREAK_ESCAPES != 0 {
+                            return 1;
+                        }
+                        break;
+                    }
+                    c = cs.next;
+                }
+            }
             _ => {
                 if sf_eval(g, s.seed, s.ed, st) != 0 {
                     return 2;
@@ -10942,8 +11085,8 @@ fn sf_digest(st: &SfState) -> i64 {
     v(0).wrapping_mul(1000003) ^ v(1).wrapping_mul(7919) ^ v(2) ^ t(0).wrapping_mul(31) ^ t(1).wrapping_mul(37) ^ st.ch.wrapping_mul(41)
 }
 
-/// Returns (cases, [mismatch, compile_fail], skipped, kind coverage, control_cases, control_mismatches).
-unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], u32, u32) {
+/// Returns (cases, [mismatch, compile_fail], skipped, coverage, [control_cases; 2], [control_mismatches; 2]).
+unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], [u32; 2], [u32; 2]) {
     const CASES_PER_MODE: u32 = 400;
     const CONTROL_CASES: u32 = 60;
     let mut ran = 0u32;
@@ -10951,14 +11094,15 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], u32,
     let mut reported = 0u32;
     let mut skipped = 0u32;
     let mut cov = [0u32; SK_COUNT];
-    let mut control_ran = 0u32;
-    let mut control_mis = 0u32;
+    let mut control_ran = [0u32; 2];
+    let mut control_mis = [0u32; 2];
     let mut pool = [sf_blank(); SF_MAX];
     let mut buf = [0u8; SF_BUF];
-    // modes 0/1 = fully parenthesized / minimal, mode 2 = negative control (minimal, sabotaged reference)
-    for mode in 0..3u32 {
+    // modes 0/1 = fully parenthesized / minimal; modes 2/3 = negative controls
+    // (minimal text, sabotaged reference: postfix-as-prefix / switch break escapes)
+    for mode in 0..4u32 {
         let mut g = FuzzGen { rng: 0x5DEE_CE66_D1CE_4E5B ^ ((mode as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D)), vars: [0; 3], t: [0; 2], ch: 0, minimal: mode != 0, no_calls: true };
-        let target = if mode == 2 { CONTROL_CASES } else { CASES_PER_MODE };
+        let target = if mode >= 2 { CONTROL_CASES } else { CASES_PER_MODE };
         let mut produced = 0u32;
         let mut attempts = 0u32;
         while produced < target && attempts < target * 8 {
@@ -10998,27 +11142,31 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], u32,
             fz_put(&mut buf, &mut pl, b"; p = &a; ");
             let mut np = 0usize;
             let mut mask = 0u32;
-            let head = unsafe { sf_gen_block(&mut g, pool.as_mut_ptr(), &mut np, &mut buf, &mut pl, 2, false, 5, &mut mask) };
+            let head = unsafe { sf_gen_block(&mut g, pool.as_mut_ptr(), &mut np, &mut buf, &mut pl, 2, false, 0, 1, 5, &mut mask) };
             fz_put(&mut buf, &mut pl, b"return a * 1000003 ^ b * 7919 ^ c ^ t[0] * 31 ^ t[1] * 37 ^ ch * 41; }");
 
             if fz_token_count(unsafe { core::slice::from_raw_parts(buf.as_ptr(), pl) }) > 250 {
                 skipped += 1;
                 continue;
             }
+            // each control only means something on programs containing its construct
             if mode == 2 && mask & (1u32 << SK_ASSIGN_INCDEC) == 0 {
-                // the control only means something on programs that contain `V = W++`
+                continue;
+            }
+            if mode == 3 && mask & (1u32 << CV_BREAK_IN_SWITCH) == 0 {
                 continue;
             }
             produced += 1;
-            let sabotage = mode == 2;
+            let sabotage = if mode == 2 { SAB_POSTFIX_AS_PREFIX } else if mode == 3 { SAB_SWITCH_BREAK_ESCAPES } else { 0 };
             unsafe { sf_exec(&mut g, pool.as_ptr(), head, &mut st, sabotage) };
             let want = sf_digest(&st) as u64;
             // compile_and_run resets the heap only; `buf`/`pool` live on this stack
             let got = unsafe { compile_and_run_program_callable(buf.as_ptr() as u64, pl as u64) };
-            if mode == 2 {
-                control_ran += 1;
+            if mode >= 2 {
+                let ci = (mode - 2) as usize;
+                unsafe { *control_ran.as_mut_ptr().add(ci) += 1 };
                 if got != Some(want) {
-                    control_mis += 1;
+                    unsafe { *control_mis.as_mut_ptr().add(ci) += 1 };
                 }
                 continue;
             }
@@ -18758,7 +18906,9 @@ pub extern "C" fn _start() -> ! {
         let case267_ok = case267_result == Some(1145);
         write_check(b"case267_deref_compound_char_returns_1145=", case267_ok);
 
-        let (sf_ran, sf_counts, sf_skipped, sf_cov, sf_ctl_ran, sf_ctl_mis) = fuzz_stmt_differential();
+        let (sf_ran, sf_counts, sf_skipped, sf_cov, sf_ctl_runs, sf_ctl_miss) = fuzz_stmt_differential();
+        let sf_ctl_ran = *sf_ctl_runs.as_ptr();
+        let sf_ctl_mis = *sf_ctl_miss.as_ptr();
         w(b"milestone 163: statement fuzz -- cases=");
         write_u64_dec(sf_ran as u64);
         w(b" mismatches=");
@@ -18809,6 +18959,125 @@ pub extern "C" fn _start() -> ! {
         let overall_m163 = sf_ran > 0 && *sf_counts.as_ptr() == 0 && *sf_counts.as_ptr().add(1) == 0 && sf_control_ok && case264_ok && case265_ok && case266_ok && case267_ok;
         w(b"OVERALL_M163=");
         w(if overall_m163 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
+        // MILESTONE 166: switch in the statement fuzz, plus hand-checked cases.
+        w(b"milestone 166: switch coverage (programs containing): switch=");
+        write_u64_dec(sc(SK_SWITCH));
+        w(b" switch-in-loop=");
+        write_u64_dec(sc(CV_SWITCH_IN_LOOP));
+        w(b" fallthrough=");
+        write_u64_dec(sc(CV_FALLTHROUGH));
+        w(b" break-to-switch=");
+        write_u64_dec(sc(CV_BREAK_IN_SWITCH));
+        w(b" break-to-switch-inside-loop=");
+        write_u64_dec(sc(CV_BREAK_IN_SWITCH_IN_LOOP));
+        w(b" continue-inside-switch=");
+        write_u64_dec(sc(CV_CONTINUE_IN_SWITCH));
+        w(b"\n");
+        let sw_ctl_ran = *sf_ctl_runs.as_ptr().add(1);
+        let sw_ctl_mis = *sf_ctl_miss.as_ptr().add(1);
+        w(b"milestone 166: negative control (reference lets a switch's break escape its loop/block) -- cases=");
+        write_u64_dec(sw_ctl_ran as u64);
+        w(b" detected_mismatches=");
+        write_u64_dec(sw_ctl_mis as u64);
+        w(b"\n");
+        let sw_control_ok = sw_ctl_ran > 0 && sw_ctl_mis > 0;
+        write_check(b"m166_negative_control_detected=", sw_control_ok);
+
+        // CASE 274: break leaves only the switch; continue inside the switch
+        // continues the loop. Hand-computed: k=0 default s=1, +10 -> 11; k=1
+        // continue (no +10); k=2 s=111, break, +10 -> 121; k=3 default 122,
+        // +10 -> 132. A break that left the loop gives 111; a continue that
+        // only left the switch gives 142.
+        const SRC274: &[u8] = b"int main() { int k; int s; s = 0; for (k = 0; k < 4; k++) { switch (k) { case 1: continue; case 2: s += 100; break; default: s += 1; } s += 10; } return s; }";
+        let case274_result = compile_and_run_program_callable(SRC274.as_ptr() as u64, SRC274.len() as u64);
+        w(b"  case274 (break/continue inside switch inside for) returned=");
+        match case274_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 132)\n");
+        let case274_ok = case274_result == Some(132);
+        write_check(b"case274_switch_break_continue_in_loop_returns_132=", case274_ok);
+
+        // CASE 275: out-of-order labels, fall-through, no-match -> default.
+        // Hand-computed per x: 0 -> +2 (break); 1 -> no label, default +8;
+        // 2 -> +4 then falls into default +8 = 12; 3 -> +1, falls into case 0
+        // +2, break = 3. Sum 2 + 8 + 12 + 3 = 25.
+        const SRC275: &[u8] = b"int main() { int x; int s; s = 0; for (x = 0; x < 4; x++) { switch (x) { case 3: s += 1; case 0: s += 2; break; case 2: s += 4; default: s += 8; } } return s; }";
+        let case275_result = compile_and_run_program_callable(SRC275.as_ptr() as u64, SRC275.len() as u64);
+        w(b"  case275 (out-of-order labels, fall-through, default) returned=");
+        match case275_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 25)\n");
+        let case275_ok = case275_result == Some(25);
+        write_check(b"case275_switch_fallthrough_returns_25=", case275_ok);
+
+        // CASE 276: a discriminant from a negative value. -7 & 3 = 1 in two's
+        // complement (...11111001 & 011 = 001), so case 1 -> 11. Comparing a
+        // sign-extended -7 against the labels instead would reach default (99).
+        const SRC276: &[u8] = b"int main() { int a; int r; a = -7; switch (a & 3) { case 1: r = 11; break; case 3: r = 33; break; default: r = 99; } return r; }";
+        let case276_result = compile_and_run_program_callable(SRC276.as_ptr() as u64, SRC276.len() as u64);
+        w(b"  case276 (switch on (-7 & 3)) returned=");
+        match case276_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 11)\n");
+        let case276_ok = case276_result == Some(11);
+        write_check(b"case276_switch_negative_masked_returns_11=", case276_ok);
+
+        // CASE 277: continue inside a switch inside a WHILE (backward jump, no
+        // arena entry -- worked before M166; regression guard). Hand-computed:
+        // k 4->3 s=10, 3->2 s=20, 2->1 continue, 1->0 s=30 -> 30.
+        const SRC277: &[u8] = b"int main() { int k; int s; s = 0; k = 4; while (k > 0) { k--; switch (k) { case 1: continue; } s += 10; } return s; }";
+        let case277_result = compile_and_run_program_callable(SRC277.as_ptr() as u64, SRC277.len() as u64);
+        w(b"  case277 (continue inside switch inside while) returned=");
+        match case277_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 30)\n");
+        let case277_ok = case277_result == Some(30);
+        write_check(b"case277_switch_continue_in_while_returns_30=", case277_ok);
+
+        // CASE 278: a for-continue BEFORE the switch plus one inside it, so the
+        // arena holds a pending continue below the switch's entries and one
+        // above them. Hand-computed: k=0 continue; k=1 continue (in the case);
+        // k=2 default +5, +100 -> 105. With the dropped continue, k=1 falls into
+        // default (+105) and k=2 adds 105 more -> 210.
+        const SRC278: &[u8] = b"int main() { int k; int s; s = 0; for (k = 0; k < 3; k++) { if (k == 0) { continue; } switch (k) { case 1: continue; default: s += 5; } s += 100; } return s; }";
+        let case278_result = compile_and_run_program_callable(SRC278.as_ptr() as u64, SRC278.len() as u64);
+        w(b"  case278 (for-continue below and inside a switch) returned=");
+        match case278_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 105)\n");
+        let case278_ok = case278_result == Some(105);
+        write_check(b"case278_for_continue_around_switch_returns_105=", case278_ok);
+
+        // CASE 279: the same bug in a do-while (its continue is also a forward
+        // jmp). Hand-computed: k 3->2 s=10; 2->1 continue -> condition; 1->0
+        // s=20 -> 20. With the dropped continue, k=1 also adds 10 -> 30.
+        const SRC279: &[u8] = b"int main() { int k; int s; s = 0; k = 3; do { k--; switch (k) { case 1: continue; } s += 10; } while (k > 0); return s; }";
+        let case279_result = compile_and_run_program_callable(SRC279.as_ptr() as u64, SRC279.len() as u64);
+        w(b"  case279 (continue inside switch inside do-while) returned=");
+        match case279_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 20)
+");
+        let case279_ok = case279_result == Some(20);
+        write_check(b"case279_switch_continue_in_do_while_returns_20=", case279_ok);
+
+        let overall_m166 = overall_m163 && sc(SK_SWITCH) > 0 && sc(CV_BREAK_IN_SWITCH_IN_LOOP) > 0 && sc(CV_CONTINUE_IN_SWITCH) > 0 && sw_control_ok && case274_ok && case275_ok && case276_ok && case277_ok && case278_ok && case279_ok;
+        w(b"OVERALL_M166=");
+        w(if overall_m166 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
         // MILESTONE 164: an integer literal that does not fit in 64 bits is a
@@ -18865,7 +19134,7 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m164 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 { 0 } else { 1 });
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 { 0 } else { 1 });
     }
 }
 

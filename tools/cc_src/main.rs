@@ -6374,7 +6374,12 @@ unsafe fn goto_emit(buf: &mut CodeBuf, src_ptr: u64, off: u32, len: u8) -> Resul
     Ok(())
 }
 
-const MAX_VARS: u64 = 8;
+// MILESTONE 170: 8 -> 15. The bound is the disp8 frame addressing every
+// slot access uses (`[rbp + disp8]`): slot i lives at -(i+1)*8 and the
+// switch scratch slot at -(nvars+1)*8, so 15 puts the scratch at exactly
+// -128, the most negative disp8. The prologue switches to `sub rsp,
+// imm32` for the resulting 128-byte frame (see emit_prologue).
+const MAX_VARS: u64 = 15;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -7131,10 +7136,22 @@ impl CodeBuf {
     // byte against the Intel SDM's own encoding tables before being
     // written here -- see README.md's own Milestone 68 entry for the
     // worked-out derivation of each one):
+    /// MILESTONE 170: `sub rsp, imm8` (REX.W 83 /5 ib) SIGN-extends its
+    /// immediate, so it is only correct for frames <= 127 bytes -- a
+    /// 128-byte frame would encode 0x80 = -128 and move rsp UP. Larger
+    /// frames use `sub rsp, imm32`, derived against the Intel SDM (Vol. 2,
+    /// SUB): `REX.W + 81 /5 id  SUB r/m64, imm32`. REX.W = 0x48; opcode
+    /// 0x81; ModRM = mod 11 (register), reg = /5 (101, the SUB extension),
+    /// rm = RSP (100) -> 11 101 100 = 0xEC; then the 4-byte little-endian
+    /// immediate. 7 bytes: 48 81 EC <imm32>. Unreachable before M170
+    /// (MAX_VARS = 8 kept every frame at <= 80 bytes).
     unsafe fn emit_prologue(&mut self, frame_bytes: u8) {
         unsafe { self.push(0x55) }; // push rbp
         unsafe { self.push_bytes(&[0x48, 0x89, 0xE5]) }; // mov rbp, rsp
-        if frame_bytes > 0 {
+        if frame_bytes > 127 {
+            unsafe { self.push_bytes(&[0x48, 0x81, 0xEC]) }; // sub rsp, imm32
+            unsafe { self.push_bytes(&(frame_bytes as u32).to_le_bytes()) };
+        } else if frame_bytes > 0 {
             unsafe { self.push_bytes(&[0x48, 0x83, 0xEC, frame_bytes]) }; // sub rsp, imm8
         }
     }
@@ -10639,7 +10656,8 @@ const CV_CONTINUE_IN_SWITCH: u8 = 20; // continue inside a switch inside a loop
 const CV_FALLTHROUGH: u8 = 21; // a case without break followed by another label
 const CV_DEFAULT_NOT_LAST: u8 = 22; // MILESTONE 167
 const CV_CALLS: u8 = 23; // MILESTONE 169: main's statements call f1/f2/f3
-const SK_COUNT: usize = 24;
+const CV_NESTED_LOOP: u8 = 24; // MILESTONE 170: a loop inside a loop
+const SK_COUNT: usize = 25;
 // sabotage bits for the negative controls
 const SAB_POSTFIX_AS_PREFIX: u8 = 1;
 const SAB_SWITCH_BREAK_ESCAPES: u8 = 2; // a switch's break also leaves the enclosing loop/block
@@ -10765,7 +10783,9 @@ fn sf_set(st: &mut SfState, v: u8, val: i64) {
 /// returns the head index. `mask` collects which kinds were generated.
 /// `brk` is the innermost `break` target: 0 none, 1 a loop, 2 a switch.
 /// `min_stmts` is 0 for a case body (which may be empty), else 1.
-unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: &mut [u8], pl: &mut usize, depth: u32, in_loop: bool, brk: u8, min_stmts: u64, max_stmts: u64, mask: &mut u32) -> u8 {
+unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: &mut [u8], pl: &mut usize, depth: u32, nest: u8, brk: u8, min_stmts: u64, max_stmts: u64, mask: &mut u32) -> u8 {
+    // MILESTONE 170: `nest` = enclosing loop count (0..2); counter k, then j
+    let in_loop = nest > 0;
     let mut head = SF_END;
     let mut prev = SF_END;
     let count = min_stmts + g.rnd(max_stmts + 1 - min_stmts);
@@ -10819,7 +10839,11 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
         if (kind == SK_IF || kind == SK_SWITCH || (kind >= SK_FOR && kind <= SK_DO)) && depth == 0 {
             kind = SK_COMPOUND;
         }
-        if kind >= SK_FOR && kind <= SK_DO && in_loop {
+        // MILESTONE 170: one level of nesting (k outside, j inside)
+        if nest == 1 && depth > 0 && kind != SK_SWITCH && g.rnd(4) == 0 {
+            kind = SK_FOR + g.rnd(3) as u8;
+        }
+        if kind >= SK_FOR && kind <= SK_DO && nest >= 2 {
             kind = SK_IF;
         }
         if (kind == SK_BREAK_IF && brk == 0) || (kind == SK_CONTINUE_IF && !in_loop) {
@@ -10894,32 +10918,51 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
                 s.seed = seed;
                 fz_put(buf, pl, fz_bytes(&e));
                 fz_put(buf, pl, b") { ");
-                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, brk, 1, 2, mask) };
+                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, nest, brk, 1, 2, mask) };
                 fz_put(buf, pl, b"} ");
                 if g.rnd(2) == 0 {
                     fz_put(buf, pl, b"else { ");
-                    s.els = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, brk, 1, 2, mask) };
+                    s.els = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, nest, brk, 1, 2, mask) };
                     fz_put(buf, pl, b"} ");
                 }
             }
             SK_FOR | SK_WHILE | SK_DO => {
                 s.n = if kind == SK_DO { 1 + g.rnd(3) as u8 } else { g.rnd(4) as u8 };
                 let nd = [b'0' + s.n];
-                if kind == SK_FOR {
-                    fz_put(buf, pl, b"for (k = 0; k < ");
-                    fz_put(buf, pl, &nd);
-                    fz_put(buf, pl, b"; k++) { ");
-                } else if kind == SK_WHILE {
-                    fz_put(buf, pl, b"k = ");
-                    fz_put(buf, pl, &nd);
-                    fz_put(buf, pl, b"; while (k > 0) { k--; ");
-                } else {
-                    fz_put(buf, pl, b"k = ");
-                    fz_put(buf, pl, &nd);
-                    fz_put(buf, pl, b"; do { k--; ");
+                let cv: &[u8] = if nest == 0 { b"k" } else { b"j" };
+                if nest > 0 {
+                    *mask |= 1u32 << CV_NESTED_LOOP;
                 }
-                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, true, 1, 1, 3, mask) };
-                fz_put(buf, pl, if kind == SK_DO { b"} while (k > 0); " as &[u8] } else { b"} " });
+                if kind == SK_FOR {
+                    fz_put(buf, pl, b"for (");
+                    fz_put(buf, pl, cv);
+                    fz_put(buf, pl, b" = 0; ");
+                    fz_put(buf, pl, cv);
+                    fz_put(buf, pl, b" < ");
+                    fz_put(buf, pl, &nd);
+                    fz_put(buf, pl, b"; ");
+                    fz_put(buf, pl, cv);
+                    fz_put(buf, pl, b"++) { ");
+                } else {
+                    fz_put(buf, pl, cv);
+                    fz_put(buf, pl, b" = ");
+                    fz_put(buf, pl, &nd);
+                    fz_put(buf, pl, if kind == SK_WHILE { b"; while (" as &[u8] } else { b"; do { " });
+                    if kind == SK_WHILE {
+                        fz_put(buf, pl, cv);
+                        fz_put(buf, pl, b" > 0) { ");
+                    }
+                    fz_put(buf, pl, cv);
+                    fz_put(buf, pl, b"--; ");
+                }
+                s.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, nest + 1, 1, 1, 3, mask) };
+                if kind == SK_DO {
+                    fz_put(buf, pl, b"} while (");
+                    fz_put(buf, pl, cv);
+                    fz_put(buf, pl, b" > 0); ");
+                } else {
+                    fz_put(buf, pl, b"} ");
+                }
             }
             SK_SWITCH => {
                 if in_loop {
@@ -10965,7 +11008,7 @@ unsafe fn sf_gen_block(g: &mut FuzzGen, pool: *mut SfStmt, np: &mut usize, buf: 
                         c.op = 0xFF;
                         fz_put(buf, pl, b"default: ");
                     }
-                    c.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, in_loop, 2, 0, 2, mask) };
+                    c.body = unsafe { sf_gen_block(g, pool, np, buf, pl, depth - 1, nest, 2, 0, 2, mask) };
                     c.n = (g.rnd(2) == 0) as u8;
                     if c.n != 0 {
                         fz_put(buf, pl, b"break; ");
@@ -11209,7 +11252,7 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], [u32
             // MILESTONE 169: M161's helpers, so statement expressions can call them
             fz_put(&mut buf, &mut pl, b"int f1(int x) { return x + 1; } int f2(int x, int y) { return x * 3 - y; } int f3(int x, int y, int z) { return (x ^ y) + z * 2; } ");
             let main_start = pl;
-            fz_put(&mut buf, &mut pl, b"int main() { int a; int b; int c; int t[2]; char ch; int *p; int k; ");
+            fz_put(&mut buf, &mut pl, b"int main() { int a; int b; int c; int t[2]; char ch; int *p; int k; int j; ");
             for v in 0..3u8 {
                 fz_put(&mut buf, &mut pl, sf_var(v));
                 fz_put(&mut buf, &mut pl, b" = ");
@@ -11228,7 +11271,7 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], [u32
             fz_put(&mut buf, &mut pl, b"; p = &a; ");
             let mut np = 0usize;
             let mut mask = 0u32;
-            let head = unsafe { sf_gen_block(&mut g, pool.as_mut_ptr(), &mut np, &mut buf, &mut pl, 2, false, 0, 1, 5, &mut mask) };
+            let head = unsafe { sf_gen_block(&mut g, pool.as_mut_ptr(), &mut np, &mut buf, &mut pl, 3, 0, 0, 1, 5, &mut mask) };
             fz_put(&mut buf, &mut pl, b"return a * 1000003 ^ b * 7919 ^ c ^ t[0] * 31 ^ t[1] * 37 ^ ch * 41; }");
 
             if fz_token_count(unsafe { core::slice::from_raw_parts(buf.as_ptr(), pl) }) > MAX_TOKENS - 6 {
@@ -14387,15 +14430,18 @@ pub extern "C" fn _start() -> ! {
         // exercised by any self-test case in this file until this one.
         //   int main() { int arr[9]; return arr[0]; }
         // -------------------------------------------------------------
-        const SRC90: &[u8] = b"int main() { int arr[9]; return arr[0]; }";
+        // MILESTONE 170 moved the cap to 15, so this now uses arr[16] -- still exactly
+        // MAX_VARS + 1 (this case pinned the old value 8 and failed the first M170
+        // boots, m170_first_run_*).
+        const SRC90: &[u8] = b"int main() { int arr[16]; return arr[0]; }";
         let case90_ok = match lex_and_parse_program(SRC90.as_ptr() as u64, SRC90.len() as u64) {
             Ok(prog90) => match gen_program(SRC90.as_ptr() as u64, prog90, CodegenMode::Callable) {
                 Err(CodeGenError::TooManyVars) => {
-                    w(b"  case90 9-element array (MAX_VARS + 1) rejected (TooManyVars), as expected\n");
+                    w(b"  case90 16-element array (MAX_VARS + 1) rejected (TooManyVars), as expected\n");
                     true
                 }
                 _ => {
-                    w(b"  case90 expected Err(CodeGenError::TooManyVars) for a 9-element array, got something else\n");
+                    w(b"  case90 expected Err(CodeGenError::TooManyVars) for a 16-element array, got something else\n");
                     false
                 }
             },
@@ -14404,7 +14450,7 @@ pub extern "C" fn _start() -> ! {
                 false
             }
         };
-        write_check(b"case90_nine_element_array_is_too_many_vars=", case90_ok);
+        write_check(b"case90_sixteen_element_array_is_too_many_vars=", case90_ok);
 
         w(b"\n");
 
@@ -19359,6 +19405,79 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m169 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
+        // MILESTONE 170: MAX_VARS 8 -> 15, sub rsp imm32 for frames > 127.
+        w(b"milestone 170: statement programs with a nested loop=");
+        write_u64_dec(sc(CV_NESTED_LOOP));
+        w(b"\n");
+        // CASE 291: 15 locals (frame (15+1)*8 = 128 -> the imm32 prologue),
+        // each holding a distinct power of two, then a switch (scratch slot
+        // at rbp-128) on a non-matching value and a call to hf, which has 14
+        // locals plus its parameter (also a 128-byte frame) and returns 0. Any slot
+        // overlap or a scratch slot on top of `o` changes the sum 2^15 - 1 =
+        // 32767. If a prologue moved rsp UP instead of down, hf's frame would
+        // sit on main's saved rbp, return address and first locals (a
+        // smaller callee would not reach them -- see m170_planted_*).
+        const SRC291: &[u8] = b"int hf(int x) { int a; int b; int c; int d; int e; int f; int g; int h; int i; int j; int k; int l; int m; int n; a = x; b = x; c = x; d = x; e = x; f = x; g = x; h = x; i = x; j = x; k = x; l = x; m = x; n = x; return a + b + c + d + e + f + g + h + i + j + k + l + m + n; } int main() { int a; int b; int c; int d; int e; int f; int g; int h; int i; int j; int k; int l; int m; int n; int o; a = 1; b = 2; c = 4; d = 8; e = 16; f = 32; g = 64; h = 128; i = 256; j = 512; k = 1024; l = 2048; m = 4096; n = 8192; o = 16384; switch (a) { case 7: a = 0; } a = a + hf(0); return a + b + c + d + e + f + g + h + i + j + k + l + m + n + o; }";
+        let case291_result = compile_and_run_program_callable(SRC291.as_ptr() as u64, SRC291.len() as u64);
+        w(b"  case291 (15 locals, switch + call) returned=");
+        match case291_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 32767)\n");
+        let case291_ok = case291_result == Some(32767);
+        write_check(b"case291_fifteen_locals_return_32767=", case291_ok);
+
+        // CASE 292: 14 locals -- frame (14+1)*8 = 120 -> rounded to 128, also
+        // the imm32 form. 2^14 - 1 = 16383.
+        const SRC292: &[u8] = b"int hf(int x) { int a; int b; int c; int d; int e; int f; int g; int h; int i; int j; int k; int l; int m; int n; a = x; b = x; c = x; d = x; e = x; f = x; g = x; h = x; i = x; j = x; k = x; l = x; m = x; n = x; return a + b + c + d + e + f + g + h + i + j + k + l + m + n; } int main() { int a; int b; int c; int d; int e; int f; int g; int h; int i; int j; int k; int l; int m; int n; a = 1; b = 2; c = 4; d = 8; e = 16; f = 32; g = 64; h = 128; i = 256; j = 512; k = 1024; l = 2048; m = 4096; n = 8192; switch (a) { case 7: a = 0; } a = a + hf(0); return a + b + c + d + e + f + g + h + i + j + k + l + m + n; }";
+        let case292_result = compile_and_run_program_callable(SRC292.as_ptr() as u64, SRC292.len() as u64);
+        w(b"  case292 (14 locals, switch + call) returned=");
+        match case292_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 16383)\n");
+        let case292_ok = case292_result == Some(16383);
+        write_check(b"case292_fourteen_locals_return_16383=", case292_ok);
+
+        // CASE 293: 13 locals -- frame 112, the imm8 form (regression guard
+        // for the unchanged path). 2^13 - 1 = 8191.
+        const SRC293: &[u8] = b"int hf(int x) { int a; int b; int c; int d; int e; int f; int g; int h; int i; int j; int k; int l; int m; int n; a = x; b = x; c = x; d = x; e = x; f = x; g = x; h = x; i = x; j = x; k = x; l = x; m = x; n = x; return a + b + c + d + e + f + g + h + i + j + k + l + m + n; } int main() { int a; int b; int c; int d; int e; int f; int g; int h; int i; int j; int k; int l; int m; a = 1; b = 2; c = 4; d = 8; e = 16; f = 32; g = 64; h = 128; i = 256; j = 512; k = 1024; l = 2048; m = 4096; switch (a) { case 7: a = 0; } a = a + hf(0); return a + b + c + d + e + f + g + h + i + j + k + l + m; }";
+        let case293_result = compile_and_run_program_callable(SRC293.as_ptr() as u64, SRC293.len() as u64);
+        w(b"  case293 (13 locals, imm8 frame) returned=");
+        match case293_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 8191)\n");
+        let case293_ok = case293_result == Some(8191);
+        write_check(b"case293_thirteen_locals_return_8191=", case293_ok);
+
+        // CASE 294: 16 locals is a real CodeGenError (TooManyVars) -> None.
+        const SRC294: &[u8] = b"int main() { int a; int b; int c; int d; int e; int f; int g; int h; int i; int j; int k; int l; int m; int n; int o; int q; a = 1; b = 2; c = 4; d = 8; e = 16; f = 32; g = 64; h = 128; i = 256; j = 512; k = 1024; l = 2048; m = 4096; n = 8192; o = 16384; q = 0;  return a + b + c + d + e + f + g + h + i + j + k + l + m + n + o; }";
+        let case294_ok = compile_and_run_program_callable(SRC294.as_ptr() as u64, SRC294.len() as u64).is_none();
+        write_check(b"case294_sixteen_locals_is_rejected=", case294_ok);
+
+        // CASE 295: a 15-element array -- the whole budget, so arr[14] sits at
+        // rbp-120 and the switch scratch at rbp-128. arr[14] = 5, arr[0] = 7,
+        // a switch on arr[0] with no match; arr[14] * 10 + arr[0] = 57.
+        const SRC295: &[u8] = b"int main() { int arr[15]; arr[0] = 7; arr[14] = 5; switch (arr[0]) { case 1: arr[14] = 0; } return arr[14] * 10 + arr[0]; }";
+        let case295_result = compile_and_run_program_callable(SRC295.as_ptr() as u64, SRC295.len() as u64);
+        w(b"  case295 (15-element array at the cap) returned=");
+        match case295_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 57)\n");
+        let case295_ok = case295_result == Some(57);
+        write_check(b"case295_fifteen_element_array_returns_57=", case295_ok);
+
+        let overall_m170 = overall_m163 && sc(CV_NESTED_LOOP) > 0 && case291_ok && case292_ok && case293_ok && case294_ok && case295_ok;
+        w(b"OVERALL_M170=");
+        w(if overall_m170 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
         // MILESTONE 164: an integer literal that does not fit in 64 bits is a
         // real LexError::IntOverflow at the literal's first byte, not a silent
         // wrap. Each case lexes directly so the error KIND and offset are checked.
@@ -19413,7 +19532,7 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m164 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 && overall_m168 && overall_m169 { 0 } else { 1 });
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 && overall_m168 && overall_m169 && overall_m170 { 0 } else { 1 });
     }
 }
 

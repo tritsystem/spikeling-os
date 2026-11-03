@@ -1178,6 +1178,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // earlier fs/persistence self-test, so the disk is definitely live.
     hetero_ensemble::self_test_hetero_ensemble();
     hetero_ensemble::self_test_m173_resonator_study(); // MILESTONE 173
+    hetero_ensemble::self_test_m174_ensemble_retest(); // MILESTONE 174
 
     // MILESTONE 78: same reasoning as Milestone 77 immediately above --
     // pure kernel-space computation (network.rs::apply_stdp() plus the

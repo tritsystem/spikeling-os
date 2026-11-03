@@ -2775,6 +2775,28 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       would need its own pre-registered redesign of M77's frequency
       anomaly, which removes reads rather than holding the rate.
 
+- [x] **Milestone 174**: M77's hypothesis re-tested fairly -- sound
+      thresholds (M165), a same-rate frequency anomaly (reads become exactly
+      periodic every 7 steps at the baseline's mean rate), random-gap
+      baseline, paired drive, held-out false-positive gate.
+      **Pre-registered results, identical shape in both boots**: R4 the
+      hypothesis, heterogeneous > homogeneous: 21/32 and 22/32 vs 12/32 --
+      MET; R3 false positives 1/32, 2/32 vs 0/32 -- MET (sound). But R1
+      (frequency >= 6/8 via the resonator) MISSED: 0/8 and 1/8; and R2
+      (each ensemble >= 6/8 on magnitude/burst/repetition) MISSED: the
+      12-LIF ensemble caught burst 1/8 and repetition 3/8. The advantage is
+      real but comes from Izhikevich and AdEx on burst (7/8) and repetition
+      (5/8 each), not from frequency. Why the resonator missed, diagnosed
+      after the run with a host replay of the exact update rule
+      (`tools/analysis/m174_resonator_warp_sim.py`, which reproduces M173's
+      kernel ratio, 5.25 vs 5.05-5.41): symplectic Euler resonates at
+      2*pi/acos(1 - w^2/2), which at a 7-step period is 6.75 steps -- a
+      3.6% detuning, outside a damping-0.01 oscillator's ~1% passband
+      (periodic/random 1.56); at M173's 20 steps it is 0.4% (5.25).
+      Warp-corrected (period_steps 7.241) the replay gives 4.95. Correcting
+      it here would be post hoc, so it is the next milestone's
+      pre-registered test.
+
 ## Building and running
 
 Requires:

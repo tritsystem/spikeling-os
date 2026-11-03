@@ -1,0 +1,4 @@
+M173 design  period_steps=nominal         ps=20.000 resonates at 19.917 steps | periodic/random =  5.25
+M173 design  period_steps=warp-corrected  ps=20.082 resonates at 20.000 steps | periodic/random =  5.40
+M174 design  period_steps=nominal         ps= 7.000 resonates at  6.750 steps | periodic/random =  1.56
+M174 design  period_steps=warp-corrected  ps= 7.241 resonates at  7.000 steps | periodic/random =  4.95

@@ -866,3 +866,246 @@ pub fn self_test_m173_resonator_study() {
     let ok = failed == 0 && norm > 0.0;
     let _ = writeln!(port, "milestone 173: OVERALL_M173={}", if ok { "PASS" } else { "FAIL" });
 }
+
+// =====================================================================
+// MILESTONE 174: M77's hypothesis -- a heterogeneous typed ensemble
+// detects more anomaly kinds than a same-size homogeneous LIF ensemble --
+// re-tested fairly, now that M165 made the thresholds sound and M173
+// showed how to configure a resonator that actually responds.
+//
+// What changes from M77, and why:
+// - Baseline: real timed reads after RANDOM gaps uniform in 4..10 steps
+//   (mean 7), 400-step trials. M77's baseline was a regular period-7 tone.
+// - Frequency anomaly: from step 100 the reads become exactly PERIODIC
+//   (every 7 steps) at the SAME mean rate -- only the timing structure
+//   changes (M77's removed reads, a rate change). Magnitude (a read every
+//   step 100..140), burst (4 groups of 3 reads, 10 apart) and repetition
+//   (10 consecutive reads) are inserted at step 100 as in M77.
+// - Resonator per M173 / the vault lesson: tuned to 7, damping 0.01,
+//   energy_tau 21 (3 periods), drive = read cost / warm-up mean, 1 step
+//   per read (~10% of a period); score = mean sqrt(energy) over steps
+//   100..400 (~43 cycles). LIF, Izhikevich and AdEx keep M77's dynamics,
+//   scales and spike-count scores (3 neurons per type; 12 LIF homogeneous).
+// - Each trial's drive is generated ONCE (real reads) and fed to every
+//   detector (paired).
+// - Thresholds per M165: 32 quiet calibration windows; detect when
+//   score > max(mean + 3 sigma, largest calibration score). False-positive
+//   control on 32 held-out quiet windows; gate <= 4/32 per ensemble.
+//
+// Pre-registered predictions, written before the first run:
+//   R1 frequency: heterogeneous >= 6/8 (through the resonator),
+//      homogeneous <= 2/8 (same rate, so LIF counts cannot move)
+//   R2 magnitude, burst, repetition: each ensemble >= 6/8 on each
+//   R3 held-out false positives <= 4/32 for both ensembles (the gate)
+//   R4 the hypothesis: heterogeneous total > homogeneous total
+// OVERALL_M174 = R3 and every read succeeded (the evaluation is sound);
+// R1, R2, R4 are printed MET or MISSED.
+// =====================================================================
+const M174_STEPS: usize = 400;
+const M174_START: usize = 100;
+const M174_PERIOD: usize = 7;
+const M174_CALIB: u32 = 32;
+const M174_HELDOUT: u32 = 32;
+const M174_TRIALS: u32 = 8;
+
+/// One trial's raw drive (M77 units: read cycles + uniform(-1,1) noise).
+/// kind: 0 quiet, 1 magnitude, 2 burst, 3 repetition, 4 frequency.
+fn m174_signal(kind: u8, rng: &mut Xorshift64, failed: &mut u32) -> Vec<f32> {
+    let mut read_at = alloc::vec![false; M174_STEPS];
+    let mut t = (rng.next_u64() % 7) as usize;
+    while t < M174_STEPS {
+        if kind == 4 && t >= M174_START {
+            // periodic from the anomaly onset, same mean gap
+            let mut p = M174_START;
+            while p < M174_STEPS {
+                read_at[p] = true;
+                p += M174_PERIOD;
+            }
+            break;
+        }
+        read_at[t] = true;
+        t += 4 + (rng.next_u64() % 7) as usize;
+    }
+    match kind {
+        1 => {
+            for s in M174_START..M174_START + 40 {
+                read_at[s] = true;
+            }
+        }
+        2 => {
+            for g in 0..4 {
+                for s in 0..3 {
+                    read_at[M174_START + g * 10 + s] = true;
+                }
+            }
+        }
+        3 => {
+            for s in M174_START..M174_START + 10 {
+                read_at[s] = true;
+            }
+        }
+        _ => {}
+    }
+    let mut raw = alloc::vec![0.0f32; M174_STEPS];
+    for s in 0..M174_STEPS {
+        let mut v = rng.uniform(-1.0, 1.0);
+        if read_at[s] {
+            let c = timed_disk_read(s as u32);
+            if c == 0 {
+                *failed += 1;
+            }
+            v += c as f32;
+        }
+        raw[s] = v;
+    }
+    raw
+}
+
+fn m174_spike_score(kind: Kind, n: usize, raw: &[f32], seed: u64) -> f32 {
+    let mut pop = make_population(kind, n, seed);
+    let mut total = 0u32;
+    for x in raw.iter() {
+        for (k, neuron) in pop.iter_mut() {
+            if neuron.step(*x * scale_for(*k), STEP_DT) {
+                total += 1;
+            }
+        }
+    }
+    total as f32
+}
+
+fn m174_resonator_score(raw: &[f32], norm: f32) -> f32 {
+    let mut r = Resonator {
+        period_steps: M174_PERIOD as f32,
+        damping: 0.01,
+        coupling: 1.0,
+        threshold: f32::MAX,
+        gate_threshold: 0.0,
+        energy_tau: 3.0 * M174_PERIOD as f32,
+        x: 0.0,
+        v: 0.0,
+        energy_ema: 0.0,
+    };
+    let mut acc = 0.0f32;
+    for (s, x) in raw.iter().enumerate() {
+        // reads only; the +-1 dither is far below one read's normalised cost
+        let d = if *x > 2.0 { *x / norm } else { 0.0 };
+        let _ = r.step(d, STEP_DT);
+        if s >= M174_START {
+            acc += libm::sqrtf(r.energy_ema);
+        }
+    }
+    acc / (M174_STEPS - M174_START) as f32
+}
+
+/// Scores for one trial: [lif, izhikevich, adex, resonator, homogeneous].
+fn m174_scores(raw: &[f32], norm: f32, seed: u64) -> [f32; 5] {
+    [
+        m174_spike_score(Kind::Lif, 3, raw, seed),
+        m174_spike_score(Kind::Izhikevich, 3, raw, seed),
+        m174_spike_score(Kind::Adex, 3, raw, seed),
+        m174_resonator_score(raw, norm),
+        m174_spike_score(Kind::Lif, 12, raw, seed ^ 0x55),
+    ]
+}
+
+pub fn self_test_m174_ensemble_retest() {
+    let mut port = serial();
+    let mut failed = 0u32;
+    let mut sum = 0u64;
+    for i in 0..8u32 {
+        let c = timed_disk_read(i);
+        if c == 0 {
+            failed += 1;
+        }
+        sum += c;
+    }
+    let norm = (sum / 8) as f32;
+    let _ = writeln!(port, "milestone 174: ensemble re-test starting -- normaliser {norm:.0} cycles/read, {M174_STEPS}-step trials, anomaly at {M174_START}");
+
+    // calibration on quiet windows
+    let mut cal: [Vec<f32>; 5] = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for w in 0..M174_CALIB {
+        let seed = 0x7400 + w as u64 * 131;
+        let mut rng = Xorshift64::new(seed);
+        let raw = m174_signal(0, &mut rng, &mut failed);
+        let sc = m174_scores(&raw, norm, seed);
+        for d in 0..5 {
+            cal[d].push(sc[d]);
+        }
+    }
+    let mut thr = [0.0f32; 5];
+    for d in 0..5 {
+        let (mean, std, max) = count_stats(&cal[d]);
+        thr[d] = libm::fmaxf(mean + 3.0 * std, max);
+    }
+    let _ = writeln!(
+        port,
+        "milestone 174: thresholds (score must EXCEED) lif={:.1} izhikevich={:.1} adex={:.1} resonator={:.3} homogeneous={:.1}",
+        thr[0], thr[1], thr[2], thr[3], thr[4]
+    );
+    let het_hit = |sc: &[f32; 5]| -> u8 {
+        let mut bits = 0u8;
+        for d in 0..4 {
+            if sc[d] > thr[d] {
+                bits |= 1 << d;
+            }
+        }
+        bits
+    };
+
+    // held-out false positives
+    let mut het_fp = 0u32;
+    let mut homog_fp = 0u32;
+    for w in 0..M174_HELDOUT {
+        let seed = 0x7500 + w as u64 * 137;
+        let mut rng = Xorshift64::new(seed);
+        let raw = m174_signal(0, &mut rng, &mut failed);
+        let sc = m174_scores(&raw, norm, seed);
+        het_fp += (het_hit(&sc) != 0) as u32;
+        homog_fp += (sc[4] > thr[4]) as u32;
+    }
+    let _ = writeln!(port, "milestone 174: held-out false positives heterogeneous={het_fp}/{M174_HELDOUT} homogeneous={homog_fp}/{M174_HELDOUT}");
+
+    let names = ["magnitude", "burst", "repetition", "frequency"];
+    let mut het_tot = 0u32;
+    let mut homog_tot = 0u32;
+    let mut per = [[0u32; 2]; 4];
+    for a in 0..4usize {
+        let mut by_type = [0u32; 4];
+        for tr in 0..M174_TRIALS {
+            let seed = 0x7600 + a as u64 * 1000 + tr as u64 * 139;
+            let mut rng = Xorshift64::new(seed);
+            let raw = m174_signal(a as u8 + 1, &mut rng, &mut failed);
+            let sc = m174_scores(&raw, norm, seed);
+            let bits = het_hit(&sc);
+            if bits != 0 {
+                per[a][0] += 1;
+            }
+            if sc[4] > thr[4] {
+                per[a][1] += 1;
+            }
+            for d in 0..4 {
+                if bits & (1 << d) != 0 {
+                    by_type[d] += 1;
+                }
+            }
+        }
+        het_tot += per[a][0];
+        homog_tot += per[a][1];
+        let _ = writeln!(
+            port,
+            "milestone 174: {:<10} heterogeneous={}/{M174_TRIALS} homogeneous={}/{M174_TRIALS} | by type: lif={} izhikevich={} adex={} resonator={}",
+            names[a], per[a][0], per[a][1], by_type[0], by_type[1], by_type[2], by_type[3]
+        );
+    }
+    let met = |b: bool| if b { "MET" } else { "MISSED" };
+    let r1 = per[3][0] >= 6 && per[3][1] <= 2;
+    let r2 = (0..3).all(|a| per[a][0] >= 6 && per[a][1] >= 6);
+    let r3 = het_fp <= 4 && homog_fp <= 4;
+    let r4 = het_tot > homog_tot;
+    let _ = writeln!(port, "milestone 174: TOTAL heterogeneous={het_tot}/32 homogeneous={homog_tot}/32 | reads failed={failed}");
+    let _ = writeln!(port, "milestone 174: R1 frequency {} | R2 other anomalies {} | R3 false-positive gate {} | R4 hypothesis het>homog {}", met(r1), met(r2), met(r3), met(r4));
+    let ok = r3 && failed == 0 && norm > 0.0;
+    let _ = writeln!(port, "milestone 174: OVERALL_M174={}", if ok { "PASS" } else { "FAIL" });
+}

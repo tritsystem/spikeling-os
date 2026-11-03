@@ -1177,6 +1177,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // after ata.rs has been exercised many times already by every
     // earlier fs/persistence self-test, so the disk is definitely live.
     hetero_ensemble::self_test_hetero_ensemble();
+    hetero_ensemble::self_test_m173_resonator_study(); // MILESTONE 173
 
     // MILESTONE 78: same reasoning as Milestone 77 immediately above --
     // pure kernel-space computation (network.rs::apply_stdp() plus the

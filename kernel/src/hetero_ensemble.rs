@@ -709,3 +709,160 @@ pub fn self_test_hetero_ensemble() {
     let m165 = het_fp <= MAX_HELDOUT_FP && homog_fp <= MAX_HELDOUT_FP;
     let _ = writeln!(port, "milestone 165: OVERALL_M165={}", if m165 { "PASS" } else { "FAIL" });
 }
+
+// =====================================================================
+// MILESTONE 173: does a Resonator configured per the vault lesson
+// ("A Spikeling Resonator needs many real cycles to discriminate
+// periodicity") tell a PERIODIC disk-read train from a RANDOM-interval
+// train with the same mean rate, on this kernel's real disk signal?
+//
+// Why: M165 showed M77's resonator fires 3 times on every signal. Its
+// setup violates every rule in that lesson -- 4 cycles of the target
+// period (lesson: >= 30-50), energy_tau 0.0025 with dt = 1 step (alpha =
+// 1, no averaging; lesson: several periods), damping 0.03-0.08 (lesson:
+// ~0.01), 1-tick impulses of raw ~1e5-cycle counts (lesson: a short
+// sustained burst). M77's frequency anomaly also changes the read RATE,
+// so a rate detector could separate it; this study holds the rate fixed.
+//
+// Design: per seed, two 800-step drive sequences -- P: a real timed disk
+// read every 20 steps (40 reads, 40 cycles of period 20); R: a real read
+// after random gaps drawn uniformly from 10..30 steps (mean 20, same
+// rate). Each read's RDTSC cost is normalised by the mean of 8 warm-up
+// reads (~1.0) and applied for 2 steps (10% of a period). The SAME drive
+// sequence feeds every detector (paired). Detectors: resonator tuned to
+// 20 (damping 0.01, energy_tau 60 = 3 periods); the same resonator tuned
+// to 13 (specificity control); LIF threshold 1.0 leak 0.05 (rate control).
+// Metric: resonator = mean sqrt(energy_ema) over steps 400..800; LIF =
+// spike count. 16 seeds.
+//
+// Pre-registered predictions, written before the first run:
+//   Q1 resonator(20): mean metric on P >= 3.0 x mean on R
+//      (the lesson measured 5-8x off-kernel)
+//   Q2 resonator(20): P beats R in >= 90% of the 16 x 16 (P_i, R_j) pairs
+//   Q3 LIF: |mean count P - mean count R| <= 10% of mean P (rate is equal,
+//      so a rate detector cannot separate them)
+//   Q4 resonator(20) on P >= 2.0 x resonator(13) on P (it is the TUNING,
+//      not just "any oscillator", that responds)
+// OVERALL_M173 only asserts the study ran on real data (every read
+// succeeded, normaliser > 0); each prediction is printed MET or MISSED.
+// =====================================================================
+const M173_STEPS: usize = 800;
+const M173_PERIOD: u32 = 20;
+const M173_SEEDS: u32 = 16;
+
+/// One drive sequence of real timed reads. Returns (drive, reads, failed reads).
+fn m173_drive(periodic: bool, rng: &mut Xorshift64, norm: f32) -> (Vec<f32>, u32, u32) {
+    let mut drive = alloc::vec![0.0f32; M173_STEPS];
+    let mut reads = 0u32;
+    let mut failed = 0u32;
+    let mut t: usize = if periodic { 0 } else { (rng.next_u64() % 20) as usize };
+    while t < M173_STEPS {
+        let c = timed_disk_read(t as u32);
+        if c == 0 {
+            failed += 1;
+        }
+        let v = c as f32 / norm;
+        drive[t] += v;
+        if t + 1 < M173_STEPS {
+            drive[t + 1] += v;
+        }
+        reads += 1;
+        let gap = if periodic { M173_PERIOD as usize } else { 10 + (rng.next_u64() % 21) as usize };
+        t += gap;
+    }
+    (drive, reads, failed)
+}
+
+fn m173_resonator(period: f32, drive: &[f32]) -> f32 {
+    let mut r = Resonator {
+        period_steps: period,
+        damping: 0.01,
+        coupling: 1.0,
+        threshold: f32::MAX,
+        gate_threshold: 0.0,
+        energy_tau: 60.0,
+        x: 0.0,
+        v: 0.0,
+        energy_ema: 0.0,
+    };
+    let mut acc = 0.0f32;
+    for (step, d) in drive.iter().enumerate() {
+        let _ = r.step(*d, STEP_DT);
+        if step >= M173_STEPS / 2 {
+            acc += libm::sqrtf(r.energy_ema);
+        }
+    }
+    acc / (M173_STEPS / 2) as f32
+}
+
+fn m173_lif(drive: &[f32]) -> f32 {
+    let mut n = LifRef::new(1.0, 0.05);
+    let mut spikes = 0u32;
+    for d in drive.iter() {
+        if n.step(*d, STEP_DT) {
+            spikes += 1;
+        }
+    }
+    spikes as f32
+}
+
+pub fn self_test_m173_resonator_study() {
+    let mut port = serial();
+    // normaliser: mean cost of 8 warm-up reads
+    let mut sum = 0u64;
+    let mut warm_failed = 0u32;
+    for i in 0..8u32 {
+        let c = timed_disk_read(i);
+        if c == 0 {
+            warm_failed += 1;
+        }
+        sum += c;
+    }
+    let norm = (sum / 8) as f32;
+    let _ = writeln!(port, "milestone 173: resonator periodicity study -- normaliser {norm:.0} cycles/read, {M173_SEEDS} seeds, {M173_STEPS} steps, period {M173_PERIOD}");
+
+    let mut res_p = Vec::new();
+    let mut res_r = Vec::new();
+    let mut det_p = Vec::new();
+    let mut lif_p = 0.0f32;
+    let mut lif_r = 0.0f32;
+    let mut reads_p = 0u32;
+    let mut reads_r = 0u32;
+    let mut failed = warm_failed;
+    for seed in 0..M173_SEEDS {
+        let mut rng = Xorshift64::new(0x7300 + seed as u64 * 7919);
+        let (dp, np, fp) = m173_drive(true, &mut rng, norm);
+        let (dr, nr, fr) = m173_drive(false, &mut rng, norm);
+        reads_p += np;
+        reads_r += nr;
+        failed += fp + fr;
+        res_p.push(m173_resonator(M173_PERIOD as f32, &dp));
+        res_r.push(m173_resonator(M173_PERIOD as f32, &dr));
+        det_p.push(m173_resonator(13.0, &dp));
+        lif_p += m173_lif(&dp);
+        lif_r += m173_lif(&dr);
+    }
+    let mean = |v: &Vec<f32>| v.iter().sum::<f32>() / v.len() as f32;
+    let (mp, mr, md) = (mean(&res_p), mean(&res_r), mean(&det_p));
+    let mut wins = 0u32;
+    for p in res_p.iter() {
+        for r in res_r.iter() {
+            if p > r {
+                wins += 1;
+            }
+        }
+    }
+    let pairs = M173_SEEDS * M173_SEEDS;
+    let lp = lif_p / M173_SEEDS as f32;
+    let lr = lif_r / M173_SEEDS as f32;
+    let _ = writeln!(port, "milestone 173: reads periodic={reads_p} random={reads_r} failed={failed}");
+    let _ = writeln!(port, "milestone 173: resonator(20) mean metric periodic={mp:.4} random={mr:.4} ratio={:.2} | P>R in {wins}/{pairs} pairs | resonator(13) on periodic={md:.4} (tuned/detuned {:.2}) | LIF spikes periodic={lp:.1} random={lr:.1}", mp / mr, mp / md);
+    let met = |b: bool| if b { "MET" } else { "MISSED" };
+    let q1 = mp >= 3.0 * mr;
+    let q2 = wins * 10 >= pairs * 9;
+    let q3 = libm::fabsf(lp - lr) <= 0.10 * lp;
+    let q4 = mp >= 2.0 * md;
+    let _ = writeln!(port, "milestone 173: Q1 ratio>=3.0 {} | Q2 pairs>=90% {} | Q3 LIF within 10% {} | Q4 tuned>=2x detuned {}", met(q1), met(q2), met(q3), met(q4));
+    let ok = failed == 0 && norm > 0.0;
+    let _ = writeln!(port, "milestone 173: OVERALL_M173={}", if ok { "PASS" } else { "FAIL" });
+}

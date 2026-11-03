@@ -2751,6 +2751,30 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       removes reads); the resonator never responds to sparse RDTSC impulses
       at this scale, which is worth its own measurement before any claim.
 
+- [x] **Milestone 173**: a resonator configured per the vault lesson ("A
+      Spikeling Resonator needs many real cycles to discriminate
+      periodicity") DOES separate a periodic disk-read train from a
+      random-interval train of the same mean rate, on this kernel's real
+      RDTSC-timed reads -- the positive half of M165's finding that M77's
+      resonator was configured against every rule in that lesson (4 cycles,
+      no energy averaging, high damping, 1-tick raw-cycle impulses).
+      **Design** (`hetero_ensemble.rs::self_test_m173_resonator_study()`,
+      every boot): per seed, P = a real read every 20 steps for 800 steps
+      (40 cycles), R = real reads after random 10..30-step gaps (same mean
+      rate); each read's cost normalised by 8 warm-up reads (~1.0) and
+      applied for 2 steps; the same drive feeds every detector. Resonator
+      tuned to 20 (damping 0.01, energy_tau 60 = 3 periods), the same tuned
+      to 13, and an LIF rate control; 16 seeds. **Pre-registered, results
+      (fresh / reused boot)**: Q1 resonator(20) P/R >= 3x: 5.21x / 5.41x,
+      MET (the lesson measured 5-8x off-kernel); Q2 P beats R in >= 90% of
+      pairs: 256/256 both, MET; Q3 LIF within 10%: 40.3 vs 39.2 (2.7%) MET
+      / 42.6 vs 46.9 (10.1%) MISSED by 0.1 point -- per-read timing varies
+      by boot, and R had 624 reads to P's 640; Q4 tuned >= 2x detuned on
+      P: 37.6x / 23.9x, MET. M77 itself is unchanged (still an honest
+      negative); putting this resonator configuration into M77's ensemble
+      would need its own pre-registered redesign of M77's frequency
+      anomaly, which removes reads rather than holding the rate.
+
 ## Building and running
 
 Requires:

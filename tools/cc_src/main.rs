@@ -3159,6 +3159,69 @@ unsafe fn alloc_func() -> u64 {
     unsafe { malloc(core::mem::size_of::<FuncDef>() as u64) }
 }
 
+/// MILESTONE 172: fold an expression made only of literals and operators to
+/// its value, with exactly the semantics the generated code has: 64-bit
+/// wrapping arithmetic, truncating `/` and `%` (as `idiv`), shift counts
+/// masked to 6 bits (as `shl`/`sar` by CL), arithmetic `>>`, signed
+/// comparisons, 0/1 for comparisons and `&&` `||` `!`. None for anything
+/// that is not a constant (variables, calls, indexing, `++`, `&`, `*`) and
+/// for the two divisions `idiv` would trap on (by zero, and MIN / -1).
+unsafe fn const_eval(node: u64) -> Option<u64> {
+    if node == 0 {
+        return None;
+    }
+    let e = unsafe { core::ptr::read(node as *const ExprNode) };
+    match e.kind {
+        EXPR_INTLIT => Some(e.int_val),
+        EXPR_UNARY => {
+            if e.op == OP_ADDR || e.op == OP_DEREF {
+                return None;
+            }
+            let v = unsafe { const_eval(e.left) }? as i64;
+            Some(if e.op == OP_BITNOT {
+                !v
+            } else if e.op == OP_LOGNOT {
+                (v == 0) as i64
+            } else {
+                v.wrapping_neg()
+            } as u64)
+        }
+        EXPR_TERNARY => {
+            let c = unsafe { const_eval(e.left) }?;
+            if c != 0 { unsafe { const_eval(e.right) } } else { unsafe { const_eval(e.call_args_ptr) } }
+        }
+        EXPR_BINARY => {
+            let l = unsafe { const_eval(e.left) }? as i64;
+            let r = unsafe { const_eval(e.right) }? as i64;
+            let v: i64 = match e.op {
+                b'+' => l.wrapping_add(r),
+                b'-' => l.wrapping_sub(r),
+                b'*' => l.wrapping_mul(r),
+                // checked_*: None on the two idiv traps, and no panic path
+                // (a plain `/` would link core's panic/fmt machinery)
+                b'/' => l.checked_div(r)?,
+                b'%' => l.checked_rem(r)?,
+                OP_BITAND => l & r,
+                OP_BITOR => l | r,
+                OP_BITXOR => l ^ r,
+                OP_SHL => l.wrapping_shl((r & 63) as u32),
+                OP_SHR => l.wrapping_shr((r & 63) as u32),
+                OP_EQ => (l == r) as i64,
+                OP_NE => (l != r) as i64,
+                OP_LT => (l < r) as i64,
+                OP_GT => (l > r) as i64,
+                OP_LE => (l <= r) as i64,
+                OP_GE => (l >= r) as i64,
+                OP_LOGAND => (l != 0 && r != 0) as i64,
+                OP_LOGOR => (l != 0 || r != 0) as i64,
+                _ => return None,
+            };
+            Some(v as u64)
+        }
+        _ => None,
+    }
+}
+
 enum ParseError {
     /// Real parse failure -- the token index (into the lexer's own
     /// output) where parsing could not continue.
@@ -5574,14 +5637,17 @@ impl Parser {
                         // labels), and a duplicate label value -- however it
                         // is spelled -- is a parse error at the label.
                         let label_pos = self.pos;
-                        let negative = unsafe { self.peek() }.kind == TOK_MINUS;
-                        if negative {
-                            unsafe { self.advance() };
-                        }
-                        let mut val_tok = unsafe { self.expect(TOK_INTLIT) }?;
-                        if negative {
-                            val_tok.int_val = val_tok.int_val.wrapping_neg();
-                        }
+                        // MILESTONE 172: a label is any expression that folds to a
+                        // constant (`case 1 + 2:`, `case 'a':`, `case -(1 << 4):`,
+                        // `case 3 > 2 ? 7 : 8:`); M168's leading-`-` form is now just
+                        // one such expression. A label that does not fold -- a
+                        // variable, a call, a division by zero -- is a parse error.
+                        let label_expr = unsafe { self.parse_ternary() }?;
+                        let mut val_tok = Token { kind: TOK_INTLIT, int_val: 0, ident_off: 0, ident_len: 0 };
+                        val_tok.int_val = match unsafe { const_eval(label_expr) } {
+                            Some(v) => v,
+                            None => return Err(ParseError::UnexpectedToken(label_pos)),
+                        };
                         let mut dup = cases_head;
                         while dup != 0 {
                             let dn = unsafe { core::ptr::read(dup as *const StmtNode) };
@@ -19639,6 +19705,65 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m171 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
+        // MILESTONE 172: constant-expression case labels.
+        // CASE 300: 1 + 2 = 3, 2 * 3 - 1 = 5, 'a' = 97, -(1 << 4) = -16; x takes
+        // each in turn -> r = 1, 2, 3, 4 -> 1234.
+        const SRC300: &[u8] = b"int main() { int x; int r; int s; x = 3; switch (x) { case 1 + 2: r = 1; break; case 2 * 3 - 1: r = 2; break; case 'a': r = 3; break; case -(1 << 4): r = 4; break; default: r = 9; } s = r * 1000; x = 5; switch (x) { case 1 + 2: r = 1; break; case 2 * 3 - 1: r = 2; break; case 'a': r = 3; break; case -(1 << 4): r = 4; break; default: r = 9; } s += r * 100; x = 97; switch (x) { case 1 + 2: r = 1; break; case 2 * 3 - 1: r = 2; break; case 'a': r = 3; break; case -(1 << 4): r = 4; break; default: r = 9; } s += r * 10; x = -16; switch (x) { case 1 + 2: r = 1; break; case 2 * 3 - 1: r = 2; break; case 'a': r = 3; break; case -(1 << 4): r = 4; break; default: r = 9; } s += r; return s; }";
+        let case300_result = compile_and_run_program_callable(SRC300.as_ptr() as u64, SRC300.len() as u64);
+        w(b"  case300 (arithmetic, char and negated-shift labels) returned=");
+        match case300_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 1234)\n");
+        let case300_ok = case300_result == Some(1234);
+        write_check(b"case300_constant_expr_labels_return_1234=", case300_ok);
+
+        // CASE 301: (3 > 2 ? 7 : 8) = 7, 10 / 3 = 3 (truncating), -7 % 3 = -1
+        // (truncating, sign of the dividend), !0 + ~0 + 5 = 1 - 1 + 5 = 5;
+        // x = 7, 3, -1, 5 -> r = 1, 2, 3, 4 -> 1234.
+        const SRC301: &[u8] = b"int main() { int x; int r; int s; r = 0; x = 7; switch (x) { case 3 > 2 ? 7 : 8: r = 1; break; case 10 / 3: r = 2; break; case -7 % 3: r = 3; break; case !0 + ~0 + 5: r = 4; break; } s = r * 1000; x = 3; switch (x) { case 3 > 2 ? 7 : 8: r = 1; break; case 10 / 3: r = 2; break; case -7 % 3: r = 3; break; case !0 + ~0 + 5: r = 4; break; } s += r * 100; x = -1; switch (x) { case 3 > 2 ? 7 : 8: r = 1; break; case 10 / 3: r = 2; break; case -7 % 3: r = 3; break; case !0 + ~0 + 5: r = 4; break; } s += r * 10; x = 5; switch (x) { case 3 > 2 ? 7 : 8: r = 1; break; case 10 / 3: r = 2; break; case -7 % 3: r = 3; break; case !0 + ~0 + 5: r = 4; break; } s += r; return s; }";
+        let case301_result = compile_and_run_program_callable(SRC301.as_ptr() as u64, SRC301.len() as u64);
+        w(b"  case301 (ternary, / % ! ~ labels) returned=");
+        match case301_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 1234)\n");
+        let case301_ok = case301_result == Some(1234);
+        write_check(b"case301_folded_ternary_div_mod_labels_return_1234=", case301_ok);
+
+        // CASE 302: labels that do not fold are parse errors: a variable, a
+        // division by zero, and MIN / -1 (both trap in idiv).
+        const SRC302A: &[u8] = b"int main() { int x; x = 1; switch (x) { case x: return 1; } return 0; }";
+        const SRC302B: &[u8] = b"int main() { int x; x = 1; switch (x) { case 1 / 0: return 1; } return 0; }";
+        const SRC302C: &[u8] = b"int main() { int x; x = 1; switch (x) { case (-9223372036854775807 - 1) / -1: return 1; } return 0; }";
+        let case302_ok = lex_and_parse_program(SRC302A.as_ptr() as u64, SRC302A.len() as u64).is_err()
+            && lex_and_parse_program(SRC302B.as_ptr() as u64, SRC302B.len() as u64).is_err()
+            && lex_and_parse_program(SRC302C.as_ptr() as u64, SRC302C.len() as u64).is_err();
+        write_check(b"case302_nonconstant_and_trapping_labels_are_parse_errors=", case302_ok);
+        // CASE 303: duplicates are detected on the FOLDED value (2 and 1 + 1).
+        const SRC303: &[u8] = b"int main() { int x; x = 2; switch (x) { case 2: return 1; case 1 + 1: return 2; } return 0; }";
+        let case303_ok = lex_and_parse_program(SRC303.as_ptr() as u64, SRC303.len() as u64).is_err();
+        write_check(b"case303_folded_duplicate_label_is_parse_error=", case303_ok);
+        // CASE 304: a folded label outside i32 uses M168's 64-bit compare:
+        // 1 << 40 matches x = 1099511627776 and not x = 0 -> 1 * 10 + 2 = 12.
+        const SRC304: &[u8] = b"int main() { int x; int r; int s; x = 1099511627776; switch (x) { case 1 << 40: r = 1; break; default: r = 2; } s = r * 10; x = 0; switch (x) { case 1 << 40: r = 1; break; default: r = 2; } return s + r; }";
+        let case304_result = compile_and_run_program_callable(SRC304.as_ptr() as u64, SRC304.len() as u64);
+        w(b"  case304 (folded 64-bit label) returned=");
+        match case304_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 12)\n");
+        let case304_ok = case304_result == Some(12);
+        write_check(b"case304_folded_64bit_label_returns_12=", case304_ok);
+
+        let overall_m172 = case300_ok && case301_ok && case302_ok && case303_ok && case304_ok;
+        w(b"OVERALL_M172=");
+        w(if overall_m172 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
         // MILESTONE 164: an integer literal that does not fit in 64 bits is a
         // real LexError::IntOverflow at the literal's first byte, not a silent
         // wrap. Each case lexes directly so the error KIND and offset are checked.
@@ -19693,7 +19818,7 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m164 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 && overall_m168 && overall_m169 && overall_m170 && overall_m171 { 0 } else { 1 });
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 && overall_m168 && overall_m169 && overall_m170 && overall_m171 && overall_m172 { 0 } else { 1 });
     }
 }
 

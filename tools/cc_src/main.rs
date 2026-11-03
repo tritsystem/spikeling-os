@@ -2225,7 +2225,12 @@ struct Token {
 // six-function program (CASE 61) lexes past 128 tokens. Same "transient
 // malloc()ed scratch, zero effect on cc.elf's linked size" reasoning as
 // the 64 -> 128 bump at Milestone 70.
-const MAX_TOKENS: usize = 256;
+// MILESTONE 169: 256 -> 1024. The driver is the statement fuzz, which had
+// to leave out function calls and skip ~20% of generated programs to stay
+// under 256. Same reasoning as M70/M93's bumps: the token buffer is a
+// transient malloc()ed scratch area (1024 x 24 bytes = 24 KiB of the 256
+// KiB per-process heap), so cc.elf's own size is unaffected.
+const MAX_TOKENS: usize = 1024;
 
 unsafe fn tok_write(toks_ptr: u64, idx: u64, t: Token) {
     unsafe { core::ptr::write((toks_ptr + idx * core::mem::size_of::<Token>() as u64) as *mut Token, t) };
@@ -9279,7 +9284,7 @@ unsafe fn gen_function(src_ptr: u64, func: u64, mode: CodegenMode) -> Result<Cod
     // under fs::MAX_FILE_BYTES once wrapped in an ELF image by
     // build_elf64_standalone() below), and buf.overflowed still catches
     // it for real if any future test ever needs more.
-    let mut buf = unsafe { CodeBuf::new(1024) };
+    let mut buf = unsafe { CodeBuf::new(16384) }; // MILESTONE 169: 1024 -> 16384, same reason as gen_program()
     unsafe { buf.emit_prologue(frame_bytes) };
 
     // MILESTONE 72: `(0, 0)` -- an empty, real function-symbol table --
@@ -9444,7 +9449,11 @@ unsafe fn gen_program(src_ptr: u64, prog_head: u64, mode: CodegenMode) -> Result
     // this buffer now holds potentially MULTIPLE functions' worth of
     // code, not just one, and buf.overflowed still catches it for real if
     // any future test ever needs more.
-    let mut buf = unsafe { CodeBuf::new(2048) };
+    // MILESTONE 169: 2048 -> 16384. With MAX_TOKENS at 1024 a valid program
+    // can need ~4 KiB of code (CASE 290: 200 statements); the overflow was
+    // always caught (BufferFull), never a miscompile, but it capped program
+    // size far below the token limit. Heap scratch, freed at heap_reset().
+    let mut buf = unsafe { CodeBuf::new(16384) };
 
     // MILESTONE 74: real PASS TWO -- the original per-function compile
     // loop, unchanged in shape, now indexing into the already-fully-
@@ -10507,7 +10516,7 @@ unsafe fn fuzz_expr_differential() -> (u32, [u32; 4], u32, [u32; 5]) {
             fz_put(&mut prog, &mut pl, fz_bytes(&e));
             fz_put(&mut prog, &mut pl, b"; }");
 
-            if fz_token_count(unsafe { core::slice::from_raw_parts(prog.as_ptr(), pl) }) > 250 {
+            if fz_token_count(unsafe { core::slice::from_raw_parts(prog.as_ptr(), pl) }) > MAX_TOKENS - 6 {
                 skipped += 1;
                 continue;
             }
@@ -10629,7 +10638,8 @@ const CV_BREAK_IN_SWITCH_IN_LOOP: u8 = 19; // ... and a loop encloses that switc
 const CV_CONTINUE_IN_SWITCH: u8 = 20; // continue inside a switch inside a loop
 const CV_FALLTHROUGH: u8 = 21; // a case without break followed by another label
 const CV_DEFAULT_NOT_LAST: u8 = 22; // MILESTONE 167
-const SK_COUNT: usize = 23;
+const CV_CALLS: u8 = 23; // MILESTONE 169: main's statements call f1/f2/f3
+const SK_COUNT: usize = 24;
 // sabotage bits for the negative controls
 const SAB_POSTFIX_AS_PREFIX: u8 = 1;
 const SAB_SWITCH_BREAK_ESCAPES: u8 = 2; // a switch's break also leaves the enclosing loop/block
@@ -11174,7 +11184,7 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], [u32
     // modes 0/1 = fully parenthesized / minimal; modes 2/3 = negative controls
     // (minimal text, sabotaged reference: postfix-as-prefix / switch break escapes)
     for mode in 0..4u32 {
-        let mut g = FuzzGen { rng: 0x5DEE_CE66_D1CE_4E5B ^ ((mode as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D)), vars: [0; 3], t: [0; 2], ch: 0, minimal: mode != 0, no_calls: true };
+        let mut g = FuzzGen { rng: 0x5DEE_CE66_D1CE_4E5B ^ ((mode as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D)), vars: [0; 3], t: [0; 2], ch: 0, minimal: mode != 0, no_calls: false }; // MILESTONE 169: calls on
         let target = if mode >= 2 { CONTROL_CASES } else { CASES_PER_MODE };
         let mut produced = 0u32;
         let mut attempts = 0u32;
@@ -11196,6 +11206,9 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], [u32
             st.ch = (ch_raw as u8) as i8 as i64;
 
             let mut pl = 0usize;
+            // MILESTONE 169: M161's helpers, so statement expressions can call them
+            fz_put(&mut buf, &mut pl, b"int f1(int x) { return x + 1; } int f2(int x, int y) { return x * 3 - y; } int f3(int x, int y, int z) { return (x ^ y) + z * 2; } ");
+            let main_start = pl;
             fz_put(&mut buf, &mut pl, b"int main() { int a; int b; int c; int t[2]; char ch; int *p; int k; ");
             for v in 0..3u8 {
                 fz_put(&mut buf, &mut pl, sf_var(v));
@@ -11218,7 +11231,7 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], [u32
             let head = unsafe { sf_gen_block(&mut g, pool.as_mut_ptr(), &mut np, &mut buf, &mut pl, 2, false, 0, 1, 5, &mut mask) };
             fz_put(&mut buf, &mut pl, b"return a * 1000003 ^ b * 7919 ^ c ^ t[0] * 31 ^ t[1] * 37 ^ ch * 41; }");
 
-            if fz_token_count(unsafe { core::slice::from_raw_parts(buf.as_ptr(), pl) }) > 250 {
+            if fz_token_count(unsafe { core::slice::from_raw_parts(buf.as_ptr(), pl) }) > MAX_TOKENS - 6 {
                 skipped += 1;
                 continue;
             }
@@ -11228,6 +11241,12 @@ unsafe fn fuzz_stmt_differential() -> (u32, [u32; 2], u32, [u32; SK_COUNT], [u32
             }
             if mode == 3 && mask & (1u32 << CV_BREAK_IN_SWITCH) == 0 {
                 continue;
+            }
+            {
+                let mt = unsafe { core::slice::from_raw_parts(buf.as_ptr().add(main_start), pl - main_start) };
+                if fz_has(mt, b"f1(") || fz_has(mt, b"f2(") || fz_has(mt, b"f3(") {
+                    mask |= 1u32 << CV_CALLS;
+                }
             }
             produced += 1;
             let sabotage = if mode == 2 { SAB_POSTFIX_AS_PREFIX } else if mode == 3 { SAB_SWITCH_BREAK_ESCAPES } else { 0 };
@@ -19276,6 +19295,70 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m168 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
+        // MILESTONE 169: MAX_TOKENS 256 -> 1024, calls in the statement fuzz.
+        // CASE 289: the exact boundary. lex() holds max_toks tokens INCLUDING
+        // EOF, so 1023 `;` -> exactly 1024 tokens -> Ok(1024), and 1024 `;`
+        // -> TooManyTokens. Built at run time in a heap buffer.
+        let semis = malloc(1024);
+        let mut si = 0u64;
+        while si < 1024 {
+            core::ptr::write((semis + si) as *mut u8, b';');
+            si += 1;
+        }
+        let toks169 = malloc((MAX_TOKENS * core::mem::size_of::<Token>()) as u64);
+        let at_cap = matches!(lex(semis, 1023, toks169, MAX_TOKENS as u64), Ok(1024));
+        let over_cap = matches!(lex(semis, 1024, toks169, MAX_TOKENS as u64), Err(LexError::TooManyTokens));
+        let case289_ok = at_cap && over_cap;
+        write_check(b"case289_token_cap_exactly_1024_including_eof=", case289_ok);
+
+        // CASE 290: a whole program far past the old cap. "int main() { int a;
+        // a = 0;" is 12 tokens, each "a += 1;" 4, "return a; }" 4, EOF 1:
+        // 17 + 4 x 200 = 817 tokens. Returns 200. (Pre-M169: TooManyTokens.)
+        let prog290 = malloc(2048);
+        let mut p290 = 0u64;
+        let put290 = |p: &mut u64, bytes: &[u8]| {
+            let mut i = 0usize;
+            while i < bytes.len() {
+                core::ptr::write((prog290 + *p) as *mut u8, *bytes.as_ptr().add(i));
+                *p += 1;
+                i += 1;
+            }
+        };
+        put290(&mut p290, b"int main() { int a; a = 0; ");
+        let mut ri = 0u32;
+        while ri < 200 {
+            put290(&mut p290, b"a += 1; ");
+            ri += 1;
+        }
+        put290(&mut p290, b"return a; }");
+        let toks290 = malloc((MAX_TOKENS * core::mem::size_of::<Token>()) as u64);
+        let ntok290 = match lex(prog290, p290, toks290, MAX_TOKENS as u64) {
+            Ok(n) => n,
+            Err(_) => 0,
+        };
+        // compile_and_run resets the heap; copy the source to a stack buffer first
+        let mut src290 = [0u8; 2048];
+        core::ptr::copy_nonoverlapping(prog290 as *const u8, src290.as_mut_ptr(), p290 as usize);
+        let case290_result = compile_and_run_program_callable(src290.as_ptr() as u64, p290);
+        w(b"  case290 (817-token program) tokens=");
+        write_u64_dec(ntok290);
+        w(b" returned=");
+        match case290_result {
+            Some(r) => write_u64_dec(r),
+            None => w(b"(compile failed)"),
+        }
+        w(b" (expected 817 tokens, 200)\n");
+        let case290_ok = ntok290 == 817 && case290_result == Some(200);
+        write_check(b"case290_817_token_program_returns_200=", case290_ok);
+
+        w(b"milestone 169: statement programs whose main calls a helper=");
+        write_u64_dec(sc(CV_CALLS));
+        w(b"\n");
+        let overall_m169 = overall_m163 && sc(CV_CALLS) > 0 && case289_ok && case290_ok;
+        w(b"OVERALL_M169=");
+        w(if overall_m169 { b"PASS" } else { b"FAIL" });
+        w(b"\n");
+
         // MILESTONE 164: an integer literal that does not fit in 64 bits is a
         // real LexError::IntOverflow at the literal's first byte, not a silent
         // wrap. Each case lexes directly so the error KIND and offset are checked.
@@ -19330,7 +19413,7 @@ pub extern "C" fn _start() -> ! {
         w(if overall_m164 { b"PASS" } else { b"FAIL" });
         w(b"\n");
 
-        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 && overall_m168 { 0 } else { 1 });
+        sys_exit(if overall && overall_m68 && overall_m69 && overall_m70 && overall_m71 && overall_m72 && overall_m73 && overall_m74 && overall_m75 && overall_m76 && overall_m79 && overall_m83 && overall_m84 && overall_m85 && overall_m86 && overall_m87 && overall_m88 && overall_m89 && overall_m90 && overall_m91 && overall_m92 && overall_m93 && overall_m94 && overall_m95 && overall_m96 && overall_m97 && overall_m98 && overall_m99 && overall_m101 && overall_m102 && overall_m103 && overall_m107 && overall_m108 && overall_m109 && overall_m110 && overall_m111 && overall_m112 && overall_m113 && overall_m114 && overall_m115 && overall_m116 && overall_m118 && overall_m119 && overall_m120 && overall_m121 && overall_m122 && overall_m125 && overall_m126 && overall_m127 && overall_m128 && overall_m129 && overall_m130 && overall_m132 && overall_m133 && overall_m134 && overall_m135 && overall_m136 && overall_m137 && overall_m138 && overall_m139 && overall_m140 && overall_m141 && overall_m142 && overall_m143 && overall_m144 && overall_m145 && overall_m146 && overall_m147 && overall_m148 && overall_m149 && overall_m150 && overall_m151 && overall_m153 && overall_m158 && overall_m159 && overall_m160 && overall_m163 && overall_m164 && overall_m166 && overall_m167 && overall_m168 && overall_m169 { 0 } else { 1 });
     }
 }
 

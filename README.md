@@ -2797,6 +2797,22 @@ the rendered README around Milestone 109 for anyone viewing the repo page.
       it here would be post hoc, so it is the next milestone's
       pre-registered test.
 
+- [x] **Milestone 175**: the warp-corrected resonator closes M174's
+      frequency gap. Same trials and same real drive as M174 (paired), one
+      extra score per trial: the resonator at period_steps = 2*pi /
+      sqrt(2(1 - cos(2*pi/7))) = 7.241, whose symplectic-Euler resonance
+      lands on 7 steps. **Pre-registered from the host replay, all met in
+      both boots**: S1 the corrected resonator alone catches frequency
+      8/8 (and 0 of every other anomaly); S2 the ensemble's held-out false
+      positives 1/32; S3 its total 29/32, above M174's 22-23/32 (and
+      all-LIF's 12/32). So, measured on this kernel's disk signal: the
+      heterogeneous typed ensemble beats same-size homogeneous LIF, with
+      each type earning its place -- Izhikevich/AdEx on burst and
+      repetition, the resonator on periodicity -- once the resonator is
+      configured per the vault lesson AND its discrete-time detuning is
+      corrected. M77's original 16/16 claim stays retracted (M165); this
+      is the measured replacement.
+
 ## Building and running
 
 Requires:

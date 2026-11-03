@@ -974,9 +974,9 @@ fn m174_spike_score(kind: Kind, n: usize, raw: &[f32], seed: u64) -> f32 {
     total as f32
 }
 
-fn m174_resonator_score(raw: &[f32], norm: f32) -> f32 {
+fn m174_resonator_score(raw: &[f32], norm: f32, period_steps: f32) -> f32 {
     let mut r = Resonator {
-        period_steps: M174_PERIOD as f32,
+        period_steps,
         damping: 0.01,
         coupling: 1.0,
         threshold: f32::MAX,
@@ -998,14 +998,29 @@ fn m174_resonator_score(raw: &[f32], norm: f32) -> f32 {
     acc / (M174_STEPS - M174_START) as f32
 }
 
-/// Scores for one trial: [lif, izhikevich, adex, resonator, homogeneous].
-fn m174_scores(raw: &[f32], norm: f32, seed: u64) -> [f32; 5] {
+// MILESTONE 175: Resonator::step is symplectic Euler with dt = 1, which
+// resonates at 2*pi / acos(1 - w^2/2), not at 2*pi / w. At a 7-step period
+// that is 6.75 steps -- a 3.6% detuning, outside a damping-0.01
+// oscillator's ~1% passband, which is why M174's resonator missed (host
+// replay: tools/analysis/m174_resonator_warp_sim.py). This is the
+// period_steps whose discrete resonance lands on `true_period`:
+// w = sqrt(2 * (1 - cos(2*pi / true_period))).
+fn m175_warp_corrected_period(true_period: f32) -> f32 {
+    let w_eff = 2.0 * core::f32::consts::PI / true_period;
+    let w = libm::sqrtf(2.0 * (1.0 - libm::cosf(w_eff)));
+    2.0 * core::f32::consts::PI / w
+}
+
+/// Scores for one trial: [lif, izhikevich, adex, resonator (nominal period),
+/// homogeneous, resonator (MILESTONE 175: warp-corrected period)].
+fn m174_scores(raw: &[f32], norm: f32, seed: u64) -> [f32; 6] {
     [
         m174_spike_score(Kind::Lif, 3, raw, seed),
         m174_spike_score(Kind::Izhikevich, 3, raw, seed),
         m174_spike_score(Kind::Adex, 3, raw, seed),
-        m174_resonator_score(raw, norm),
+        m174_resonator_score(raw, norm, M174_PERIOD as f32),
         m174_spike_score(Kind::Lif, 12, raw, seed ^ 0x55),
+        m174_resonator_score(raw, norm, m175_warp_corrected_period(M174_PERIOD as f32)),
     ]
 }
 
@@ -1024,18 +1039,18 @@ pub fn self_test_m174_ensemble_retest() {
     let _ = writeln!(port, "milestone 174: ensemble re-test starting -- normaliser {norm:.0} cycles/read, {M174_STEPS}-step trials, anomaly at {M174_START}");
 
     // calibration on quiet windows
-    let mut cal: [Vec<f32>; 5] = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    let mut cal: [Vec<f32>; 6] = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     for w in 0..M174_CALIB {
         let seed = 0x7400 + w as u64 * 131;
         let mut rng = Xorshift64::new(seed);
         let raw = m174_signal(0, &mut rng, &mut failed);
         let sc = m174_scores(&raw, norm, seed);
-        for d in 0..5 {
+        for d in 0..6 {
             cal[d].push(sc[d]);
         }
     }
-    let mut thr = [0.0f32; 5];
-    for d in 0..5 {
+    let mut thr = [0.0f32; 6];
+    for d in 0..6 {
         let (mean, std, max) = count_stats(&cal[d]);
         thr[d] = libm::fmaxf(mean + 3.0 * std, max);
     }
@@ -1044,7 +1059,7 @@ pub fn self_test_m174_ensemble_retest() {
         "milestone 174: thresholds (score must EXCEED) lif={:.1} izhikevich={:.1} adex={:.1} resonator={:.3} homogeneous={:.1}",
         thr[0], thr[1], thr[2], thr[3], thr[4]
     );
-    let het_hit = |sc: &[f32; 5]| -> u8 {
+    let het_hit = |sc: &[f32; 6]| -> u8 {
         let mut bits = 0u8;
         for d in 0..4 {
             if sc[d] > thr[d] {
@@ -1053,6 +1068,23 @@ pub fn self_test_m174_ensemble_retest() {
         }
         bits
     };
+
+    // MILESTONE 175: the same ensemble with the warp-corrected resonator
+    let het2_hit = |sc: &[f32; 6]| -> u8 {
+        let mut bits = 0u8;
+        for d in 0..3 {
+            if sc[d] > thr[d] {
+                bits |= 1 << d;
+            }
+        }
+        if sc[5] > thr[5] {
+            bits |= 1 << 3;
+        }
+        bits
+    };
+    let mut het2_fp = 0u32;
+    let mut per2 = [0u32; 4];
+    let mut res2 = [0u32; 4];
 
     // held-out false positives
     let mut het_fp = 0u32;
@@ -1064,6 +1096,7 @@ pub fn self_test_m174_ensemble_retest() {
         let sc = m174_scores(&raw, norm, seed);
         het_fp += (het_hit(&sc) != 0) as u32;
         homog_fp += (sc[4] > thr[4]) as u32;
+        het2_fp += (het2_hit(&sc) != 0) as u32;
     }
     let _ = writeln!(port, "milestone 174: held-out false positives heterogeneous={het_fp}/{M174_HELDOUT} homogeneous={homog_fp}/{M174_HELDOUT}");
 
@@ -1081,6 +1114,13 @@ pub fn self_test_m174_ensemble_retest() {
             let bits = het_hit(&sc);
             if bits != 0 {
                 per[a][0] += 1;
+            }
+            let bits2 = het2_hit(&sc);
+            if bits2 != 0 {
+                per2[a] += 1;
+            }
+            if bits2 & (1 << 3) != 0 {
+                res2[a] += 1;
             }
             if sc[4] > thr[4] {
                 per[a][1] += 1;
@@ -1108,4 +1148,22 @@ pub fn self_test_m174_ensemble_retest() {
     let _ = writeln!(port, "milestone 174: R1 frequency {} | R2 other anomalies {} | R3 false-positive gate {} | R4 hypothesis het>homog {}", met(r1), met(r2), met(r3), met(r4));
     let ok = r3 && failed == 0 && norm > 0.0;
     let _ = writeln!(port, "milestone 174: OVERALL_M174={}", if ok { "PASS" } else { "FAIL" });
+
+    // MILESTONE 175: same trials, same drive, warp-corrected resonator.
+    // Pre-registered from the host replay (corrected period: periodic/random
+    // 4.95 vs 1.56 nominal), written before the first run:
+    //   S1 the corrected resonator alone detects frequency in >= 6/8
+    //   S2 held-out false positives of this ensemble <= 4/32
+    //   S3 this ensemble's total > M174's heterogeneous total
+    let het2_tot: u32 = per2.iter().sum();
+    let _ = writeln!(
+        port,
+        "milestone 175: warp-corrected resonator period_steps={:.3} threshold={:.3} | heterogeneous: magnitude={}/8 burst={}/8 repetition={}/8 frequency={}/8 total={het2_tot}/32 | resonator alone: {} {} {} {} | held-out false positives {het2_fp}/32",
+        m175_warp_corrected_period(M174_PERIOD as f32), thr[5], per2[0], per2[1], per2[2], per2[3], res2[0], res2[1], res2[2], res2[3]
+    );
+    let s1 = res2[3] >= 6;
+    let s2 = het2_fp <= 4;
+    let s3 = het2_tot > het_tot;
+    let _ = writeln!(port, "milestone 175: S1 corrected resonator on frequency {} | S2 false-positive gate {} | S3 total above M174's {}", met(s1), met(s2), met(s3));
+    let _ = writeln!(port, "milestone 175: OVERALL_M175={}", if s2 && failed == 0 { "PASS" } else { "FAIL" });
 }
